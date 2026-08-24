@@ -2547,4 +2547,57 @@ mod test {
         let res = client.try_accept_admin(&other);
         assert_eq!(res, Err(Ok(PermissionError::Unauthorized)));
     }
+
+    #[test]
+    fn test_get_permissions_by_owner() {
+        let env = Env::default();
+        env.mock_all_auths();
+        
+        let owner = Address::generate(&env);
+        let delegate1 = Address::generate(&env);
+        let delegate2 = Address::generate(&env);
+        let delegate3 = Address::generate(&env);
+        let merchant = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let mut merchants = Vec::<Address>::new(&env);
+        merchants.push_back(merchant.clone());
+
+        // Grant 3 permissions
+        client.grant(&owner, &delegate1, &1000, &100, &merchants, &10000);
+        client.grant(&owner, &delegate2, &2000, &200, &merchants, &10000);
+        client.grant(&owner, &delegate3, &3000, &300, &merchants, &10000);
+
+        let perms = client.get_permissions_by_owner(&owner);
+        assert_eq!(perms.len(), 3);
+
+        // Revoke one permission
+        client.revoke(&owner, &delegate2);
+        
+        let perms = client.get_permissions_by_owner(&owner);
+        assert_eq!(perms.len(), 2);
+        
+        // Transfer a permission
+        let new_delegate = Address::generate(&env);
+        client.transfer_permission(&owner, &delegate1, &new_delegate);
+        
+        let perms = client.get_permissions_by_owner(&owner);
+        assert_eq!(perms.len(), 2); // Still 2, delegate1 is removed, new_delegate is added.
+        
+        // Verify new_delegate is in the list and delegate1 is not
+        let mut found_new = false;
+        let mut found_old = false;
+        for perm in perms.iter() {
+            if perm.delegate == new_delegate {
+                found_new = true;
+            }
+            if perm.delegate == delegate1 {
+                found_old = true;
+            }
+        }
+        assert!(found_new);
+        assert!(!found_old);
+    }
 }
