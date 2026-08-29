@@ -3302,7 +3302,7 @@ impl EscrowContract {
         }
 
         if new_timeout_ledger <= record.timeout_ledger {
-            return Err(EscrowError::InvalidAmount);
+            return Err(EscrowError::InvalidExtension);
         }
 
         // Authorization: admin can do it alone; otherwise both buyer AND seller must sign.
