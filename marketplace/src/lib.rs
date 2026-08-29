@@ -97,6 +97,7 @@ pub enum MarketplaceError {
     MetadataLockActive = 13,
     InvalidCategory = 14,
     InvalidParam = 15,
+    VerificationCountOverflow = 16,
 }
 
 // --- Events ---
@@ -650,7 +651,9 @@ impl MarketplaceContract {
             .persistent()
             .get(&DataKey::VerifiedCount(merchant_id))
             .unwrap_or(0);
-        let new_count = current_count.saturating_add(1);
+        let new_count = current_count
+            .checked_add(1)
+            .ok_or(MarketplaceError::VerificationCountOverflow)?;
         env.storage()
             .persistent()
             .set(&DataKey::VerifiedCount(merchant_id), &new_count);
@@ -1177,6 +1180,60 @@ impl MarketplaceContract {
             MerchantStatus::Closed => Err(MarketplaceError::MerchantClosed),
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn verify_merchant_count_overflow_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, MarketplaceContract);
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        client.__constructor(&admin).unwrap();
+
+        let owner = Address::generate(&env);
+        let params = RegisterParams {
+            name: String::from_str(&env, "overflow-merchant"),
+            description: String::from_str(&env, "desc"),
+            category: symbol_short!("cate"),
+            image_url: String::from_str(&env, "https://example.com/image.png"),
+            metadata: None,
+            required_verifications: 1,
+        };
+
+        let merchant_id = client.register_merchant(&owner, ¶ms).unwrap();
+
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::VerifiedCount(merchant_id), &u32::MAX);
+        });
+
+        let verifier = Address::generate(&env);
+        let verifier_struct = Verifier {
+            address: verifier.clone(),
+            label: symbol_short!("v"),
+            registered_at: env.ledger().timestamp(),
+        };
+        client.add_verifier(&admin, &verifier_struct).unwrap();
+
+        assert_eq!(
+            client.verify_merchant(&merchant_id, &verifier),
+            Err(MarketplaceError::VerificationCountOverflow)
+        );
+    }
+
+    #[test]
+    fn verification_count_overflow_error_payload() {
+        assert_eq!(MarketplaceError::VerificationCountOverflow as u32, 16);
     }
 }
 
