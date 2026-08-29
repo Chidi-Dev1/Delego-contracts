@@ -189,9 +189,10 @@ mod test {
         let key_limits: soroban_sdk::Val = DataKey::AmountLimits.into_val(&env);
         let key_quorum: soroban_sdk::Val = DataKey::QuorumConfig.into_val(&env);
         let key_votes_0: soroban_sdk::Val = DataKey::DisputeVotes(0u64).into_val(&env);
-        let key_whitelist: soroban_sdk::Val = DataKey::TokenWhitelist.into_val(&env);
-        let key_token_a: soroban_sdk::Val = DataKey::TokenEnabled(addr_a.clone()).into_val(&env);
-        let key_token_b: soroban_sdk::Val = DataKey::TokenEnabled(addr_b.clone()).into_val(&env);
+        let key_whitelist: soroban_sdk::Val = DataKey::AllowedTokenCount.into_val(&env);
+        let key_token_a: soroban_sdk::Val = DataKey::AllowedToken(addr_a.clone()).into_val(&env);
+        let key_token_b: soroban_sdk::Val = DataKey::AllowedToken(addr_b.clone()).into_val(&env);
+        let key_token_at: soroban_sdk::Val = DataKey::AllowedTokenAt(0).into_val(&env);
         let key_pause: soroban_sdk::Val = DataKey::PauseState.into_val(&env);
         let key_metadata_0: soroban_sdk::Val = DataKey::EscrowMetadata(0u64).into_val(&env);
         let key_metadata_1: soroban_sdk::Val = DataKey::EscrowMetadata(1u64).into_val(&env);
@@ -216,6 +217,7 @@ mod test {
             key_whitelist,
             key_token_a,
             key_token_b,
+            key_token_at,
             key_pause,
             key_metadata_0,
             key_metadata_1,
@@ -260,8 +262,8 @@ mod test {
         let env = Env::default();
         let addr_a = Address::generate(&env);
         let addr_b = Address::generate(&env);
-        let ka: soroban_sdk::Val = DataKey::TokenEnabled(addr_a).into_val(&env);
-        let kb: soroban_sdk::Val = DataKey::TokenEnabled(addr_b).into_val(&env);
+        let ka: soroban_sdk::Val = DataKey::AllowedToken(addr_a).into_val(&env);
+        let kb: soroban_sdk::Val = DataKey::AllowedToken(addr_b).into_val(&env);
         assert_ne!(
             soroban_sdk::Val::get_payload(ka),
             soroban_sdk::Val::get_payload(kb)
@@ -325,6 +327,54 @@ mod test {
 
         let res = client.try_get_token(&999u64);
         assert_eq!(res, Err(Ok(EscrowError::NotFound)));
+    }
+
+    // ─── TTL Bumping on Escrow Reads ──────────────────────────────────────────
+
+    // A long-lived, open escrow must not be evicted while it is still being read.
+    // The read paths (e.g. `get_escrow`) are expected to `extend_ttl` on the
+    // `Escrow(id)` persistent key. This test creates an escrow, advances the
+    // ledger toward the TTL boundary, reads it (which should bump the TTL), then
+    // advances further and asserts the record is still live and readable.
+    #[test]
+    fn test_get_escrow_bumps_ttl_across_expiry_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        // Register and whitelist a token, then fund the buyer.
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        client.add_token(&admin, &token);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &1_000_000i128);
+
+        let order_id = BytesN::from_array(&env, &[7u8; 32]);
+        // Amount stays within the [100, 1_000_000] limits configured in setup.
+        let escrow_id = client.create(
+            &buyer, &seller, &token, &1000i128, &order_id, &1000u32, &None, &None,
+        );
+
+        // Advance the ledger close to the persistent TTL boundary, then read the
+        // escrow so the read path refreshes (bumps) its TTL.
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 100_000;
+        });
+        let before = client.get_escrow(&escrow_id);
+
+        // Advance again past what would have been the original expiry. Because the
+        // read above bumped the TTL, the record must still be live and readable.
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 100_000;
+        });
+        let after = client.get_escrow(&escrow_id);
+
+        assert_eq!(before, after);
     }
 
     // ─── Issue #172: Escrow Creation Metadata Hash Tests ─────────────────────
@@ -913,6 +963,57 @@ mod test {
     }
 
     #[test]
+    fn test_set_fee_distribution_rejects_zero_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let mut shares = soroban_sdk::Vec::new(&env);
+        shares.push_back(crate::TreasuryShare {
+            treasury: zero_account(&env),
+            bps: 100,
+        });
+
+        let res = client.try_set_fee_distribution(&admin, &shares);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidAddress)));
+        assert_eq!(client.get_fee_distribution().len(), 0);
+    }
+
+    #[test]
+    fn test_set_fee_distribution_rejects_zero_bps() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let treasury = Address::generate(&env);
+        let mut shares = soroban_sdk::Vec::new(&env);
+        shares.push_back(crate::TreasuryShare { treasury, bps: 0 });
+
+        let res = client.try_set_fee_distribution(&admin, &shares);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
+        assert_eq!(client.get_fee_distribution().len(), 0);
+    }
+
+    #[test]
+    fn test_set_fee_distribution_rejects_max_treasuries_exceeded() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let mut shares = soroban_sdk::Vec::new(&env);
+        for _ in 0..11 {
+            shares.push_back(crate::TreasuryShare {
+                treasury: Address::generate(&env),
+                bps: 1,
+            });
+        }
+
+        let res = client.try_set_fee_distribution(&admin, &shares);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
+        assert_eq!(client.get_fee_distribution().len(), 0);
+    }
+
+    #[test]
     fn test_fee_uses_single_treasury_when_no_distribution_configured() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1278,7 +1379,12 @@ mod test {
     fn setup_disputed_escrow(
         env: &Env,
         threshold: u32,
-    ) -> (EscrowContractClient<'_>, Address, u64, soroban_sdk::Vec<Address>) {
+    ) -> (
+        EscrowContractClient<'_>,
+        Address,
+        u64,
+        soroban_sdk::Vec<Address>,
+    ) {
         env.mock_all_auths();
         let (client, admin, contract_id) = setup_client(env);
 
@@ -1317,8 +1423,7 @@ mod test {
     #[test]
     fn test_vote_dispute_emits_dispute_voted_event() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 2); // threshold = 2
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 2); // threshold = 2
         let arbiter = arbiters.get(0).unwrap();
 
         client.vote_dispute(&escrow_id, &arbiter, &true);
@@ -1349,8 +1454,7 @@ mod test {
     #[test]
     fn test_vote_dispute_emits_zero_votes_for_on_buyer_vote() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 2);
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 2);
         let arbiter = arbiters.get(0).unwrap();
 
         client.vote_dispute(&escrow_id, &arbiter, &false); // vote for buyer
@@ -1381,8 +1485,7 @@ mod test {
     #[test]
     fn test_vote_dispute_quorum_boundary_emits_correct_tally() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 2); // threshold = 2
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 2); // threshold = 2
 
         // First seller vote.
         client.vote_dispute(&escrow_id, &arbiters.get(0).unwrap(), &true);
@@ -1416,8 +1519,7 @@ mod test {
     #[test]
     fn test_vote_dispute_emits_exactly_one_event_per_vote() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 3); // threshold = 3
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 3); // threshold = 3
 
         // Vote 1: verify exactly one DisputeVotedEvent.
         client.vote_dispute(&escrow_id, &arbiters.get(0).unwrap(), &true);
@@ -1433,7 +1535,10 @@ mod test {
                 count += 1;
             }
         }
-        assert_eq!(count, 1, "first vote should emit exactly one DisputeVotedEvent");
+        assert_eq!(
+            count, 1,
+            "first vote should emit exactly one DisputeVotedEvent"
+        );
 
         // Vote 2: verify exactly one more DisputeVotedEvent.
         client.vote_dispute(&escrow_id, &arbiters.get(1).unwrap(), &true);
@@ -1449,7 +1554,10 @@ mod test {
                 count += 1;
             }
         }
-        assert_eq!(count, 1, "second vote should emit exactly one DisputeVotedEvent");
+        assert_eq!(
+            count, 1,
+            "second vote should emit exactly one DisputeVotedEvent"
+        );
 
         // Vote 3: verify exactly one more.
         client.vote_dispute(&escrow_id, &arbiters.get(2).unwrap(), &false);
@@ -1465,7 +1573,10 @@ mod test {
                 count += 1;
             }
         }
-        assert_eq!(count, 1, "third vote should emit exactly one DisputeVotedEvent");
+        assert_eq!(
+            count, 1,
+            "third vote should emit exactly one DisputeVotedEvent"
+        );
     }
 
     // ─── Issue #34: Monotonic YieldView Tests ────────────────────────────────
@@ -1608,7 +1719,7 @@ mod test {
 
         // Advance 100 ledgers.
         env.ledger().with_mut(|li| {
-            li.sequence_number = li.sequence_number + 100;
+            li.sequence_number += 100;
         });
 
         let view_after = client.get_accrued_yield(&escrow_id);
@@ -1792,5 +1903,272 @@ mod test {
             r3.updated_at >= r2.updated_at,
             "updated_at must advance through resolve"
         );
+    }
+
+    // ─── Issue #49: Paginated list_escrows enumeration ───────────────────────
+
+    /// Helper: deposit a single escrow and return its id.
+    fn deposit_one(
+        env: &Env,
+        client: &EscrowContractClient<'_>,
+        admin: &Address,
+        buyer: &Address,
+        seller: &Address,
+        seed: u8,
+    ) -> u64 {
+        let token_admin = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(env, &token).mint(buyer, &10_000i128);
+        client.add_token(admin, &token);
+        let order_id = BytesN::from_array(env, &[seed; 32]);
+        client.deposit(
+            buyer, seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        )
+    }
+
+    #[test]
+    fn test_list_escrows_empty_before_any_deposit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+
+        let page = client.list_escrows(&0u32, &10u32);
+        assert_eq!(page.total, 0);
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_list_escrows_returns_correct_total_and_items() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        let id1 = deposit_one(&env, &client, &admin, &buyer, &seller, 1);
+        let id2 = deposit_one(&env, &client, &admin, &buyer, &seller, 2);
+        let id3 = deposit_one(&env, &client, &admin, &buyer, &seller, 3);
+
+        let page = client.list_escrows(&0u32, &10u32);
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 3);
+        assert!(page.next_offset.is_none());
+
+        // IDs must appear in creation order.
+        assert_eq!(page.items.get(0).unwrap().escrow_id, id1);
+        assert_eq!(page.items.get(1).unwrap().escrow_id, id2);
+        assert_eq!(page.items.get(2).unwrap().escrow_id, id3);
+    }
+
+    #[test]
+    fn test_list_escrows_pagination_first_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        for seed in 1u8..=5 {
+            deposit_one(&env, &client, &admin, &buyer, &seller, seed);
+        }
+
+        // Request page size 2 starting at offset 0.
+        let page = client.list_escrows(&0u32, &2u32);
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.next_offset, Some(2u32));
+    }
+
+    #[test]
+    fn test_list_escrows_pagination_middle_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        for seed in 1u8..=5 {
+            deposit_one(&env, &client, &admin, &buyer, &seller, seed);
+        }
+
+        // Request 2 items starting at offset 2.
+        let page = client.list_escrows(&2u32, &2u32);
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.next_offset, Some(4u32));
+    }
+
+    #[test]
+    fn test_list_escrows_pagination_last_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        for seed in 1u8..=5 {
+            deposit_one(&env, &client, &admin, &buyer, &seller, seed);
+        }
+
+        // Offset 4 → only 1 item left; no next page.
+        let page = client.list_escrows(&4u32, &2u32);
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items.len(), 1);
+        assert!(page.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_list_escrows_offset_beyond_total_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        deposit_one(&env, &client, &admin, &buyer, &seller, 1);
+
+        let page = client.list_escrows(&100u32, &10u32);
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_list_escrows_caps_at_max_page_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        // Deposit 10 escrows — requesting 9999 should be capped at MAX_PAGE_LIMIT (50).
+        for seed in 1u8..=10 {
+            deposit_one(&env, &client, &admin, &buyer, &seller, seed);
+        }
+
+        let page = client.list_escrows(&0u32, &9999u32);
+        // All 10 fit within the cap, so we get all 10 back.
+        assert_eq!(page.total, 10);
+        assert_eq!(page.items.len(), 10);
+        assert!(page.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_list_escrows_by_buyer_empty_for_new_buyer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+
+        let random_buyer = Address::generate(&env);
+        let page = client.list_escrows_by_buyer(&random_buyer, &0u32, &10u32);
+        assert_eq!(page.total, 0);
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_list_escrows_by_buyer_only_returns_that_buyers_escrows() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer_a = Address::generate(&env);
+        let buyer_b = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        let id_a1 = deposit_one(&env, &client, &admin, &buyer_a, &seller, 10);
+        let id_a2 = deposit_one(&env, &client, &admin, &buyer_a, &seller, 11);
+        let _id_b1 = deposit_one(&env, &client, &admin, &buyer_b, &seller, 20);
+
+        let page_a = client.list_escrows_by_buyer(&buyer_a, &0u32, &10u32);
+        assert_eq!(page_a.total, 2, "buyer_a should have exactly 2 escrows");
+        assert_eq!(page_a.items.len(), 2);
+        assert_eq!(page_a.items.get(0).unwrap().escrow_id, id_a1);
+        assert_eq!(page_a.items.get(1).unwrap().escrow_id, id_a2);
+
+        let page_b = client.list_escrows_by_buyer(&buyer_b, &0u32, &10u32);
+        assert_eq!(page_b.total, 1, "buyer_b should have exactly 1 escrow");
+    }
+
+    #[test]
+    fn test_list_escrows_by_buyer_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        for seed in 1u8..=5 {
+            deposit_one(&env, &client, &admin, &buyer, &seller, seed);
+        }
+
+        let page1 = client.list_escrows_by_buyer(&buyer, &0u32, &3u32);
+        assert_eq!(page1.total, 5);
+        assert_eq!(page1.items.len(), 3);
+        assert_eq!(page1.next_offset, Some(3u32));
+
+        let page2 = client.list_escrows_by_buyer(&buyer, &3u32, &3u32);
+        assert_eq!(page2.total, 5);
+        assert_eq!(page2.items.len(), 2);
+        assert!(page2.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_buyer_index_maintained_on_batch_deposit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        // Set up two different tokens (batch_deposit allows multiple tokens).
+        let token_admin1 = Address::generate(&env);
+        let token1 = env
+            .register_stellar_asset_contract_v2(token_admin1.clone())
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token1).mint(&buyer, &100_000i128);
+        client.add_token(&admin, &token1);
+
+        let token_admin2 = Address::generate(&env);
+        let token2 = env
+            .register_stellar_asset_contract_v2(token_admin2.clone())
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token2).mint(&buyer, &100_000i128);
+        client.add_token(&admin, &token2);
+
+        let mut orders = soroban_sdk::Vec::new(&env);
+        orders.push_back(crate::BatchDepositParams {
+            seller: seller.clone(),
+            token: token1.clone(),
+            amount: 1_000i128,
+            order_id: BytesN::from_array(&env, &[30u8; 32]),
+            timeout_ledgers: 1_000u32,
+            order_hash: None,
+            schema: None,
+        });
+        orders.push_back(crate::BatchDepositParams {
+            seller: seller.clone(),
+            token: token2.clone(),
+            amount: 1_000i128,
+            order_id: BytesN::from_array(&env, &[31u8; 32]),
+            timeout_ledgers: 1_000u32,
+            order_hash: None,
+            schema: None,
+        });
+
+        client.batch_deposit(&buyer, &orders);
+
+        // Buyer index should contain both escrows created via batch_deposit.
+        let page = client.list_escrows_by_buyer(&buyer, &0u32, &10u32);
+        assert_eq!(
+            page.total, 2,
+            "batch_deposit should maintain buyer index for each order"
+        );
+        assert_eq!(page.items.len(), 2);
     }
 }
