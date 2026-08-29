@@ -1,38 +1,59 @@
 #![no_std]
+#![warn(missing_docs)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     Symbol, Vec,
 };
 
+/// Represents the lifecycle status of a delegation.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DelegationStatus {
+    /// Delegation is pending activation.
     Pending,
+    /// Delegation is active.
     Active,
+    /// Delegation is paused.
     Paused,
+    /// Delegation was revoked.
     Revoked,
+    /// Delegation has expired.
     Expired,
 }
 
+/// A record representing a single delegation.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DelegationRecord {
+    /// Unique identifier for the delegation.
     pub id: u64,
+    /// Address of the delegation owner.
     pub owner: Address,
+    /// Identifier of the authorized agent.
     pub agent_id: BytesN<32>,
+    /// Contract address for which permissions are delegated.
     pub permissions_contract: Address,
+    /// Current lifecycle status.
     pub status: DelegationStatus,
+    /// Human-readable label for the delegation.
     pub label: Symbol,
+    /// Ledger timestamp when the delegation was created.
     pub created_at: u64,
+    /// Ledger sequence at which the delegation expires.
     pub expires_at_ledger: u32,
+    /// Version number used for history/rollback.
     pub version: u32,
 }
 
+/// A point-in-time snapshot of a delegation.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DelegationSnapshot {
+    /// Snapshot version.
     pub version: u32,
+    /// Ledger sequence at which the snapshot was taken.
     pub snapshot_ledger: u32,
+    /// The delegation record at this version.
     pub record: DelegationRecord,
 }
 
@@ -42,9 +63,13 @@ pub struct DelegationSnapshot {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct DelegationCreatedEvent {
+    /// Unique delegation identifier.
     pub delegation_id: u64,
+    /// Address of the delegation owner.
     pub owner: Address,
+    /// Identifier of the associated agent.
     pub agent: BytesN<32>,
+    /// Ledger timestamp of the event.
     pub timestamp: u64,
 }
 
@@ -52,9 +77,13 @@ pub struct DelegationCreatedEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct DelegationPausedEvent {
+    /// Unique delegation identifier.
     pub delegation_id: u64,
+    /// Address of the delegation owner.
     pub owner: Address,
+    /// Identifier of the associated agent.
     pub agent: BytesN<32>,
+    /// Ledger timestamp of the event.
     pub timestamp: u64,
 }
 
@@ -62,9 +91,13 @@ pub struct DelegationPausedEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct DelegationResumedEvent {
+    /// Unique delegation identifier.
     pub delegation_id: u64,
+    /// Address of the delegation owner.
     pub owner: Address,
+    /// Identifier of the associated agent.
     pub agent: BytesN<32>,
+    /// Ledger timestamp of the event.
     pub timestamp: u64,
 }
 
@@ -72,9 +105,13 @@ pub struct DelegationResumedEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct DelegationRevokedEvent {
+    /// Unique delegation identifier.
     pub delegation_id: u64,
+    /// Address of the delegation owner.
     pub owner: Address,
+    /// Identifier of the associated agent.
     pub agent: BytesN<32>,
+    /// Ledger timestamp of the event.
     pub timestamp: u64,
 }
 
@@ -82,43 +119,65 @@ pub struct DelegationRevokedEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct DelegationExpiredEvent {
+    /// Unique delegation identifier.
     pub delegation_id: u64,
+    /// Address of the delegation owner.
     pub owner: Address,
+    /// Identifier of the associated agent.
     pub agent: BytesN<32>,
+    /// Ledger timestamp of the event.
     pub timestamp: u64,
 }
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
+/// Storage keys used by the delegation registry.
 #[contracttype]
 pub enum DataKey {
+    /// Address of the contract admin.
     Admin,
+    /// Next delegation id to issue.
     NextId,
+    /// Delegation record stored by id.
     Delegation(u64),
+    /// Delegation ids associated with an owner.
     UserDelegations(Address),
+    /// Current version for a delegation.
     DelegationVersion(u64),
+    /// Version history for a delegation.
     DelegationHistory(u64),
 }
 
+/// Errors for delegation registry operations.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum DelegationError {
+    /// The delegation was not found.
     NotFound = 1,
+    /// The delegation is not active.
     NotActive = 2,
+    /// The delegation is not paused.
     NotPaused = 3,
+    /// The delegation has expired.
     Expired = 4,
+    /// The registry has already been initialized.
     AlreadyInitialized = 5,
+    /// The provided version is invalid.
     InvalidVersion = 6,
+    /// The target version is not lower than the current version.
     VersionNotLower = 7,
+    /// The requested snapshot was not found.
     SnapshotNotFound = 8,
 }
 
+/// The delegation registry contract.
 #[contract]
 pub struct DelegationRegistry;
 
 #[contractimpl]
 impl DelegationRegistry {
+    /// Initializes the registry with the admin address.
     pub fn initialize(env: Env, admin: Address) -> Result<bool, DelegationError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(DelegationError::AlreadyInitialized);
@@ -128,6 +187,7 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    /// Returns the configured admin address.
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
@@ -135,6 +195,7 @@ impl DelegationRegistry {
             .expect("Admin not set")
     }
 
+    /// Creates a new delegation and returns its id.
     pub fn create_delegation(
         env: Env,
         owner: Address,
@@ -218,6 +279,7 @@ impl DelegationRegistry {
         id
     }
 
+    /// Pauses an active delegation.
     pub fn pause_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
         let mut record: DelegationRecord = env
             .storage()
@@ -253,6 +315,7 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    /// Resumes a paused delegation.
     pub fn resume_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
         let mut record: DelegationRecord = env
             .storage()
@@ -309,6 +372,7 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    /// Revokes a delegation.
     pub fn revoke_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
         let mut record: DelegationRecord = env
             .storage()
@@ -344,6 +408,7 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    /// Rolls a delegation back to a previous version.
     pub fn rollback_delegation(
         env: Env,
         delegation_id: u64,
@@ -399,6 +464,7 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    /// Returns a delegation record by id.
     pub fn get_delegation(
         env: Env,
         delegation_id: u64,
@@ -409,6 +475,7 @@ impl DelegationRegistry {
             .ok_or(DelegationError::NotFound)
     }
 
+    /// Returns the current version for a delegation.
     pub fn get_delegation_version(env: Env, delegation_id: u64) -> u32 {
         env.storage()
             .persistent()
@@ -416,6 +483,7 @@ impl DelegationRegistry {
             .unwrap_or(1)
     }
 
+    /// Returns the full version history for a delegation.
     pub fn get_delegation_history(env: Env, delegation_id: u64) -> Vec<DelegationSnapshot> {
         env.storage()
             .persistent()
@@ -423,6 +491,7 @@ impl DelegationRegistry {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Returns all delegations owned by the given address.
     pub fn get_delegations_by_owner(env: Env, owner: Address) -> Vec<DelegationRecord> {
         let user_dels = env
             .storage()
@@ -443,6 +512,7 @@ impl DelegationRegistry {
         records
     }
 
+    /// Returns whether the given agent is authorized for a delegation.
     pub fn is_authorized(env: Env, delegation_id: u64, agent_id: BytesN<32>) -> bool {
         let record: DelegationRecord = match env
             .storage()
