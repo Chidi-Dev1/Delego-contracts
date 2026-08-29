@@ -3,7 +3,7 @@
 
 use crate::{
     ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
-    TransactionOutcome,
+    TransactionOutcome, SCORE_WINDOW,
 };
 use soroban_sdk::{
     symbol_short,
@@ -84,6 +84,114 @@ fn test_constructor_rejects_zero_freeze_threshold() {
     env.register(ReputationContract, (admin, bad));
 }
 
+// --- min_transactions_threshold vs SCORE_WINDOW ---
+
+#[test]
+#[should_panic]
+fn test_constructor_rejects_threshold_over_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut bad = default_config();
+    bad.min_transactions_threshold = SCORE_WINDOW as u64 + 1;
+    env.register(ReputationContract, (admin, bad));
+}
+
+#[test]
+fn test_constructor_accepts_threshold_equal_to_window() {
+    // A threshold exactly equal to SCORE_WINDOW is the largest reachable
+    // value and must be accepted (the masking gate compares the lifetime
+    // counter, so hitting it is still possible).
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = SCORE_WINDOW as u64;
+    let contract_id = env.register(ReputationContract, (admin, cfg.clone()));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    assert_eq!(client.get_config(), cfg);
+}
+
+#[test]
+fn test_update_config_rejects_threshold_over_window() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let mut bad = default_config();
+    bad.min_transactions_threshold = SCORE_WINDOW as u64 + 1;
+    let res = client.try_update_config(&admin, &bad);
+    assert_eq!(res, Err(Ok(ReputationError::InvalidParam)));
+}
+
+// The masking gate in get_reputation compares the entity's *lifetime*
+// `total_transactions` (window-independent) against the threshold — not the
+// `SCORE_WINDOW` sample feeding the score recompute. Setting the threshold
+// equal to SCORE_WINDOW and recording exactly SCORE_WINDOW lifetime
+// transactions unmasks the score even though the score itself is computed
+// over the same-sized window, pinning that the gate is driven by lifetime
+// counts.
+#[test]
+fn test_masking_uses_lifetime_counts_not_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = SCORE_WINDOW as u64;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Record exactly SCORE_WINDOW lifetime transactions. Remaining just below
+    // the threshold would keep the score masked; at the threshold it unmasks.
+    for i in 0..SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    // Lifetime count is exact, and the fresh all-Released run scores full.
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64);
+    assert_eq!(rep.score, 10_000);
+}
+
+#[test]
+fn test_masking_keeps_score_hidden_below_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = SCORE_WINDOW as u64;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // SCORE_WINDOW - 1 lifetime transactions: still below the threshold, so
+    // the score/avg_rating must stay masked even though the recompute
+    // samples the same window size.
+    for i in 0..(SCORE_WINDOW as u64 - 1) {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64 - 1);
+    assert_eq!(rep.score, 0);
+}
+
 // --- record_transaction ---
 
 #[test]
@@ -108,6 +216,30 @@ fn test_record_transaction_released_scores_full() {
     assert_eq!(rep.total_transactions, 1);
     assert_eq!(rep.successful_transactions, 1);
     assert_eq!(rep.disputed_transactions, 0);
+}
+
+#[test]
+fn test_record_transaction_records_relation_in_both_directions() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+
+    assert!(client.has_relation(&entity, &counterparty, &false));
+    assert!(client.has_relation(&counterparty, &entity, &false));
+    assert!(client.has_relation(&entity, &counterparty, &true));
+    assert!(client.has_relation(&counterparty, &entity, &true));
+    let stranger = Address::generate(&env);
+    assert!(!client.has_relation(&entity, &stranger, &false));
 }
 
 #[test]
@@ -215,6 +347,53 @@ fn test_record_transaction_allows_lifecycle_update_while_frozen() {
         &TransactionOutcome::Released,
     );
     assert_eq!(res, Err(Ok(ReputationError::EntityFrozen)));
+}
+
+#[test]
+fn test_record_transaction_extends_ttl_across_churn() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    let record_key = crate::DataKey::TransactionRecord(1);
+
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+    let initial_ttl = env.storage().persistent().get_ttl(&record_key);
+    assert!(initial_ttl > 17_280);
+
+    env.ledger().set_sequence_number(initial_ttl - 17_280 + 1);
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::ResolvedSeller,
+    );
+    let refreshed_ttl = env.storage().persistent().get_ttl(&record_key);
+    assert!(refreshed_ttl > 17_280);
+
+    env.ledger().set_sequence_number(refreshed_ttl - 17_280 + 1);
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+    let final_ttl = env.storage().persistent().get_ttl(&record_key);
+    assert!(final_ttl > 17_280);
+
+    env.ledger().set_sequence_number(final_ttl - 1);
+    assert!(client.get_reputation_breakdown(&entity, &0u32, &10u32).len() > 0);
 }
 
 #[test]
@@ -729,6 +908,34 @@ fn test_resolve_flag_missing() {
     assert_eq!(res, Err(Ok(ReputationError::EntityNotFound)));
 }
 
+#[test]
+fn test_resolve_flag_no_active_flag() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
+
+    let res = client.try_resolve_flag(&admin, &reporter, &entity);
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
+}
+
+#[test]
+fn test_resolve_flag_not_flag_reporter() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let other_reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
+    make_transacting_counterparty(&client, &admin, &entity, &other_reporter, 2u64);
+
+    client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
+
+    let res = client.try_resolve_flag(&admin, &other_reporter, &entity);
+    assert_eq!(res, Err(Ok(ReputationError::NotFlagReporter)));
+}
+
 // --- freeze / unfreeze ---
 
 #[test]
@@ -764,6 +971,18 @@ fn test_update_config_happy_path() {
 
     let mut new_config = default_config();
     new_config.min_transactions_threshold = 1;
+    client.update_config(&admin, &new_config);
+
+    assert_eq!(client.get_config(), new_config);
+}
+
+#[test]
+fn test_get_config_parity() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let mut new_config = default_config();
+    new_config.freeze_threshold_flags = 1;
     client.update_config(&admin, &new_config);
 
     assert_eq!(client.get_config(), new_config);
@@ -843,4 +1062,71 @@ fn test_accept_admin_no_pending_transfer() {
 
     let res = client.try_accept_admin(&stranger);
     assert_eq!(res, Err(Ok(ReputationError::Unauthorized)));
+}
+
+// --- recency_weight_bps decay curve ---
+
+/// Invariant: `BPS_SCALE >> MAX_HALVINGS` must be non-zero.
+///
+/// If this fails it means `MAX_HALVINGS` has drifted past the point where the
+/// shift can produce any non-zero base, making the guard in
+/// `recency_weight_bps` fire *after* the shift already rounds to zero —
+/// i.e. the documented cutoff is later than the actual one.
+#[test]
+fn test_max_halvings_invariant() {
+    assert!(
+        crate::BPS_SCALE >> crate::MAX_HALVINGS != 0,
+        "BPS_SCALE ({}) >> MAX_HALVINGS ({}) == 0: \
+         MAX_HALVINGS must be lowered (or BPS_SCALE raised) so that \
+         the shift still produces a non-zero base at the declared cutoff",
+        crate::BPS_SCALE,
+        crate::MAX_HALVINGS,
+    );
+}
+
+/// Decay-curve smoke test: checks expected outputs for every full half-life
+/// from 0 through MAX_HALVINGS (inclusive), using a decay window of exactly
+/// 1 second so that `elapsed = k` implies exactly `k` full halvings and
+/// zero remainder seconds.
+///
+/// At k = 0          : weight == BPS_SCALE (no decay).
+/// At k = MAX_HALVINGS: weight == 0 (early-exit guard fires).
+///
+/// The test verifies:
+///   1. weight == BPS_SCALE at k == 0.
+///   2. Strict monotone decrease for k in 0..MAX_HALVINGS.
+///   3. weight == 0 at k == MAX_HALVINGS (guard's documented semantics).
+#[test]
+fn test_recency_weight_decay_curve() {
+    // decay_window = 1 s so that elapsed = k  =>  full_halvings = k,
+    // remainder_secs = 0, no linear interpolation term.
+    let decay_window: u64 = 1;
+    let max = crate::MAX_HALVINGS;
+
+    // k=0: full weight.
+    assert_eq!(
+        crate::recency_weight_bps(0, decay_window),
+        crate::BPS_SCALE,
+        "weight at 0 half-lives should equal BPS_SCALE"
+    );
+
+    // k=MAX_HALVINGS: guard fires, weight must be 0.
+    assert_eq!(
+        crate::recency_weight_bps(max, decay_window),
+        0,
+        "weight at MAX_HALVINGS ({max}) half-lives should be 0"
+    );
+
+    // Strict monotone decrease across 0..MAX_HALVINGS.
+    let mut prev = crate::recency_weight_bps(0, decay_window);
+    for k in 1..max {
+        let curr = crate::recency_weight_bps(k, decay_window);
+        assert!(
+            curr < prev,
+            "decay curve not strictly decreasing at half-life {k}: \
+             weight[{k}]={curr} is not less than weight[{}]={prev}",
+            k - 1,
+        );
+        prev = curr;
+    }
 }

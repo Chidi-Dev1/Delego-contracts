@@ -472,8 +472,9 @@ pub enum DataKey {
     QuorumConfig,
     DisputeVotes(u64),
     TimeoutExtensionVotes(u64),
-    TokenWhitelist,
-    TokenEnabled(Address),
+    AllowedToken(Address),
+    AllowedTokenAt(u32),
+    AllowedTokenCount,
     PauseState,
     EscrowMetadata(u64),
     LiquidityPool(Address),
@@ -488,11 +489,83 @@ pub enum DataKey {
     /// Admin flag: when `true`, buyer-originated releases on the escrow must
     /// pass `get_release_eligibility` (issue #48).
     RequireReleaseCondition(u64),
+    /// Append-only list of all escrow IDs, used for paginated enumeration (issue #49).
+    EscrowIds,
+    /// Per-buyer append-only list of escrow IDs (issue #49).
+    BuyerEscrowIds(Address),
 }
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
+/// Canonical ABI numbering for `EscrowError`.
+///
+/// Error codes are part of the contract ABI. They are frozen for the 0.x
+/// deployment line; do not renumber, remove, or reuse existing codes. The
+/// declaration order below is not meaningful — the `#[repr(u32)]` values are.
+///
+/// # Registry
+///
+/// `First version` records the first contract version in which a code is
+/// known to be present. Legacy variants are marked `≤0.2.0` because they
+/// predate this audit; exact pre-0.2.0 introduction releases are not
+/// tracked.
+///
+/// | Code | Variant | First version |
+/// |------|---------|---------------|
+/// | 1 | AlreadyInitialized | ≤0.2.0 |
+/// | 2 | NotFound | ≤0.2.0 |
+/// | 3 | Unauthorized | ≤0.2.0 |
+/// | 4 | AlreadyReleased | ≤0.2.0 |
+/// | 5 | AlreadyRefunded | ≤0.2.0 |
+/// | 6 | InvalidStatus | ≤0.2.0 |
+/// | 7 | TimeoutNotReached | ≤0.2.0 |
+/// | 8 | NotDisputed | ≤0.2.0 |
+/// | 9 | InvalidAmount | ≤0.2.0 |
+/// | 10 | TokenNotWhitelisted | ≤0.2.0 |
+/// | 11 | InsufficientEscrowBalance | ≤0.2.0 |
+/// | 12 | ZeroAmount | ≤0.2.0 |
+/// | 13 | NoPendingTransfer | ≤0.2.0 |
+/// | 14 | InvalidPendingAdmin | ≤0.2.0 |
+/// | 15 | AdminAlreadyExists | ≤0.2.0 |
+/// | 16 | InvalidFeeBps | ≤0.2.0 |
+/// | 17 | AmountBelowMin | ≤0.2.0 |
+/// | 18 | AmountAboveMax | ≤0.2.0 |
+/// | 19 | InvalidLimits | ≤0.2.0 |
+/// | 20 | NotAnArbiter | ≤0.2.0 |
+/// | 21 | AlreadyVoted | ≤0.2.0 |
+/// | 22 | InvalidQuorum | ≤0.2.0 |
+/// | 23 | QuorumNotReached | ≤0.2.0 |
+/// | 24 | QuorumConfigNotSet | ≤0.2.0 |
+/// | 25 | ConflictingQuorum | ≤0.2.0 |
+/// | 26 | CreationPaused | ≤0.2.0 |
+/// | 27 | AlreadyCancelled | ≤0.2.0 |
+/// | 28 | AlreadyFunded | ≤0.2.0 |
+/// | 29 | InvalidExtension | ≤0.2.0 |
+/// | 30 | PoolNotFound | ≤0.2.0 |
+/// | 31 | InsufficientPoolBalance | ≤0.2.0 |
+/// | 32 | InvalidAddress | ≤0.2.0 |
+/// | 33 | InvalidEscrowParticipants | ≤0.2.0 |
+/// | 36 | ReleaseConditionNotSet | ≤0.2.0 |
+/// | 37 | OracleCallFailed | ≤0.2.0 |
+/// | 38 | ConditionNotMet | ≤0.2.0 |
+/// | 39 | InvalidYieldConfig | ≤0.2.0 |
+/// | 40 | AmountLimitsNotSet | ≤0.2.0 |
+/// | 41 | FeeConfigNotSet | ≤0.2.0 |
+/// | 201 | InvalidReleaseRecipient | ≤0.2.0 |
+/// | 400+ | Reserved for new variants | next major |
+///
+/// # Allocating new variants
+///
+/// New variants MUST use codes in the reserved contiguous range starting at
+/// 400. Do not fill historical gaps or reuse codes from the registry above.
+///
+/// # Renumber plan
+///
+/// The next `ContractVersion` major bump (1.0.0) is the planned breaking
+/// release for renumbering `EscrowError` contiguously from 1 to N, removing
+/// gaps and sorting declaration order by code. Until that release, the codes
+/// in the registry above are stable.
 pub enum EscrowError {
     /// Contract already initialized
     AlreadyInitialized = 1,
@@ -710,9 +783,31 @@ pub struct EscrowSummary {
     pub status: EscrowStatus,
 }
 
+/// Paginated result returned by `list_escrows` and `list_escrows_by_buyer`
+/// (issue #49). `items` contains up to `limit` escrow records starting at
+/// `offset`. `total` is the total number of escrows in the queried index.
+/// `next_offset` is `Some(offset + items.len())` when more records follow,
+/// or `None` when the last page has been reached.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowListPage {
+    pub items: soroban_sdk::Vec<EscrowRecord>,
+    pub total: u32,
+    pub next_offset: Option<u32>,
+}
+
+/// Maximum number of escrows returned in a single page from `list_escrows`
+/// or `list_escrows_by_buyer`. Callers requesting a larger `limit` will
+/// silently receive at most this many records.
+pub const MAX_PAGE_LIMIT: u32 = 50;
+
 /// Seconds in a 365-day year, used to prorate `YieldConfig::apr_bps` down to
 /// the actual holding period of an escrow.
 const SECONDS_PER_YEAR: i128 = 31_536_000;
+
+/// Maximum number of treasury rows accepted by `set_fee_distribution`.
+/// Keeps the fee-splitting loop bounded and prevents unbounded config growth.
+const MAX_TREASURIES: u32 = 10;
 
 fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
     match record.status {
@@ -972,10 +1067,7 @@ impl EscrowContract {
         env.storage().persistent().set(&votes_key, &votes);
 
         // Compute live tallies so the event reflects the state *after* this vote.
-        let votes_for = votes
-            .iter()
-            .filter(|v| v.release_to_seller)
-            .count() as u32;
+        let votes_for = votes.iter().filter(|v| v.release_to_seller).count() as u32;
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("vote")),
@@ -1228,8 +1320,18 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
+        if shares.len() > MAX_TREASURIES {
+            return Err(EscrowError::InvalidFeeBps);
+        }
+
         let mut total_bps: u32 = 0;
         for share in shares.iter() {
+            if is_zero_address(&env, &share.treasury) {
+                return Err(EscrowError::InvalidAddress);
+            }
+            if share.bps == 0 {
+                return Err(EscrowError::InvalidFeeBps);
+            }
             total_bps = total_bps
                 .checked_add(share.bps)
                 .ok_or(EscrowError::InvalidFeeBps)?;
@@ -1356,18 +1458,21 @@ impl EscrowContract {
             return Ok(true);
         }
 
-        let mut whitelist: soroban_sdk::Vec<Address> = env
+        let count: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::TokenWhitelist)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        whitelist.push_back(token_address.clone());
+            .get(&DataKey::AllowedTokenCount)
+            .unwrap_or(0);
+
         env.storage()
             .instance()
-            .set(&DataKey::TokenWhitelist, &whitelist);
+            .set(&DataKey::AllowedToken(token_address.clone()), &count);
         env.storage()
             .instance()
-            .set(&DataKey::TokenEnabled(token_address), &true);
+            .set(&DataKey::AllowedTokenAt(count), &token_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedTokenCount, &(count + 1));
 
         Ok(true)
     }
@@ -1383,20 +1488,47 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
-        let mut whitelist: soroban_sdk::Vec<Address> = env
+        let index_opt: Option<u32> = env
             .storage()
             .instance()
-            .get(&DataKey::TokenWhitelist)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        if let Some(index) = whitelist.first_index_of(&token_address) {
-            whitelist.remove(index);
-            env.storage()
+            .get(&DataKey::AllowedToken(token_address.clone()));
+
+        if let Some(idx) = index_opt {
+            let count: u32 = env
+                .storage()
                 .instance()
-                .set(&DataKey::TokenWhitelist, &whitelist);
+                .get(&DataKey::AllowedTokenCount)
+                .unwrap_or(0);
+            
+            if count > 0 {
+                let last_idx = count - 1;
+                if idx != last_idx {
+                    // Swap with the last element
+                    let last_token: Address = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::AllowedTokenAt(last_idx))
+                        .unwrap();
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::AllowedTokenAt(idx), &last_token);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::AllowedToken(last_token), &idx);
+                }
+                
+                // Remove the target token from mappings
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::AllowedToken(token_address));
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::AllowedTokenAt(last_idx));
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AllowedTokenCount, &last_idx);
+            }
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::TokenEnabled(token_address), &false);
 
         Ok(true)
     }
@@ -1405,16 +1537,37 @@ impl EscrowContract {
     pub fn is_token_allowed(env: Env, token_address: Address) -> bool {
         env.storage()
             .instance()
-            .get(&DataKey::TokenEnabled(token_address))
-            .unwrap_or(false)
+            .has(&DataKey::AllowedToken(token_address))
     }
 
     /// List all tokens currently approved for escrow deposits.
     pub fn list_tokens(env: Env) -> soroban_sdk::Vec<Address> {
-        env.storage()
+        let count: u32 = env
+            .storage()
             .instance()
-            .get(&DataKey::TokenWhitelist)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+            .get(&DataKey::AllowedTokenCount)
+            .unwrap_or(0);
+            
+        Self::list_tokens_paginated(env, 0, count)
+    }
+
+    /// List tokens currently approved for escrow deposits with pagination.
+    pub fn list_tokens_paginated(env: Env, offset: u32, limit: u32) -> soroban_sdk::Vec<Address> {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokenCount)
+            .unwrap_or(0);
+        
+        let mut tokens = soroban_sdk::Vec::new(&env);
+        let end = count.min(offset.saturating_add(limit));
+        
+        for i in offset..end {
+            if let Some(token) = env.storage().instance().get(&DataKey::AllowedTokenAt(i)) {
+                tokens.push_back(token);
+            }
+        }
+        tokens
     }
 
     /// Fund the shared liquidity pool for a token so it can back instant
@@ -1703,6 +1856,27 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(last_id), &record);
+
+        // Maintain global escrow ID index for list_escrows (issue #49).
+        let mut all_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowIds)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        all_ids.push_back(last_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowIds, &all_ids);
+
+        // Maintain per-buyer index for list_escrows_by_buyer (issue #49).
+        let buyer_ids_key = DataKey::BuyerEscrowIds(buyer.clone());
+        let mut buyer_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&buyer_ids_key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        buyer_ids.push_back(last_id);
+        env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
 
         if let (Some(hash), Some(sch)) = (order_hash, schema) {
             let metadata = EscrowMetadata {
@@ -2674,8 +2848,7 @@ impl EscrowContract {
             .get(&DataKey::EscrowYieldConfig(escrow_id));
         let apy_bps = yield_config.as_ref().map(|c| c.apr_bps).unwrap_or(0);
         let snapshot_ledger = env.ledger().sequence();
-        let (accrued, held_seconds) =
-            Self::compute_yield(&record, yield_config.as_ref(), &env);
+        let (accrued, held_seconds) = Self::compute_yield(&record, yield_config.as_ref(), &env);
 
         let remaining = record.amount - record.released_amount;
 
@@ -3263,7 +3436,7 @@ impl EscrowContract {
         }
 
         if new_timeout_ledger <= record.timeout_ledger {
-            return Err(EscrowError::InvalidAmount);
+            return Err(EscrowError::InvalidExtension);
         }
 
         // Authorization: admin can do it alone; otherwise both buyer AND seller must sign.
@@ -3292,6 +3465,105 @@ impl EscrowContract {
         );
 
         Ok(true)
+    }
+
+    /// Paginated enumeration of all escrows (issue #49).
+    ///
+    /// Returns up to `min(limit, MAX_PAGE_LIMIT)` [`EscrowRecord`]s starting
+    /// at zero-based `offset`. The global escrow ID list is maintained by
+    /// `create_internal`, so records are returned in creation order.
+    ///
+    /// `page.total`       — total number of escrows ever created.
+    /// `page.next_offset` — `Some(next)` when another page follows; `None` on
+    ///                      the last page.
+    pub fn list_escrows(env: Env, offset: u32, limit: u32) -> EscrowListPage {
+        let all_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowIds)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let total = all_ids.len();
+        let capped_limit = limit.min(MAX_PAGE_LIMIT);
+        let start = offset.min(total);
+        let end = (start + capped_limit).min(total);
+
+        let mut items = soroban_sdk::Vec::new(&env);
+        for i in start..end {
+            let escrow_id = all_ids.get(i).unwrap();
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, EscrowRecord>(&DataKey::Escrow(escrow_id))
+            {
+                items.push_back(record);
+            }
+        }
+
+        let count = (end - start) as u32;
+        let next_offset = if end < total {
+            Some(start + count)
+        } else {
+            None
+        };
+
+        EscrowListPage {
+            items,
+            total,
+            next_offset,
+        }
+    }
+
+    /// Paginated enumeration of escrows for a specific buyer (issue #49).
+    ///
+    /// Returns up to `min(limit, MAX_PAGE_LIMIT)` [`EscrowRecord`]s belonging
+    /// to `buyer`, starting at zero-based `offset` within that buyer's index.
+    /// The per-buyer index is maintained by `create_internal` in creation order.
+    ///
+    /// `page.total`       — total number of escrows created by this buyer.
+    /// `page.next_offset` — `Some(next)` when another page follows; `None` on
+    ///                      the last page.
+    pub fn list_escrows_by_buyer(
+        env: Env,
+        buyer: Address,
+        offset: u32,
+        limit: u32,
+    ) -> EscrowListPage {
+        let buyer_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BuyerEscrowIds(buyer))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let total = buyer_ids.len();
+        let capped_limit = limit.min(MAX_PAGE_LIMIT);
+        let start = offset.min(total);
+        let end = (start + capped_limit).min(total);
+
+        let mut items = soroban_sdk::Vec::new(&env);
+        for i in start..end {
+            let escrow_id = buyer_ids.get(i).unwrap();
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, EscrowRecord>(&DataKey::Escrow(escrow_id))
+            {
+                items.push_back(record);
+            }
+        }
+
+        let count = (end - start) as u32;
+        let next_offset = if end < total {
+            Some(start + count)
+        } else {
+            None
+        };
+
+        EscrowListPage {
+            items,
+            total,
+            next_offset,
+        }
     }
 
     pub fn is_admin(env: Env, address: Address) -> bool {
@@ -3420,6 +3692,108 @@ impl EscrowContract {
     /// storage.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+}
+
+#[cfg(test)]
+mod fee_distribution_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Env as _};
+
+    fn setup(env: &Env) -> Address {
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        env.mock_all_auths();
+        EscrowContract::initialize(
+            env.clone(),
+            admin.clone(),
+            250,
+            treasury,
+            1,
+            1_000_000,
+        )
+        .unwrap();
+        admin
+    }
+
+    #[test]
+    fn rejects_zero_address_treasury() {
+        let env = Env::default();
+        let admin = setup(&env);
+        let shares = soroban_sdk::vec![
+            &env,
+            TreasuryShare {
+                treasury: Address::from_str(&env, ZERO_ACCOUNT_STRKEY),
+                bps: 100,
+            }
+        ];
+
+        assert_eq!(
+            EscrowContract::set_fee_distribution(env.clone(), admin, shares),
+            Err(EscrowError::InvalidAddress)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_bps_share() {
+        let env = Env::default();
+        let admin = setup(&env);
+        let treasury = Address::generate(&env);
+        let shares = soroban_sdk::vec![
+            &env,
+            TreasuryShare {
+                treasury,
+                bps: 0,
+            }
+        ];
+
+        assert_eq!(
+            EscrowContract::set_fee_distribution(env.clone(), admin, shares),
+            Err(EscrowError::InvalidFeeBps)
+        );
+    }
+
+    #[test]
+    fn rejects_too_many_treasuries() {
+        let env = Env::default();
+        let admin = setup(&env);
+        let mut shares = Vec::new(&env);
+        for _ in 0..=MAX_TREASURIES {
+            shares.push_back(TreasuryShare {
+                treasury: Address::generate(&env),
+                bps: 1,
+            });
+        }
+
+        assert_eq!(
+            EscrowContract::set_fee_distribution(env.clone(), admin, shares),
+            Err(EscrowError::InvalidFeeBps)
+        );
+    }
+
+    #[test]
+    fn accepts_multi_treasury_distribution() {
+        let env = Env::default();
+        let admin = setup(&env);
+        let treasury1 = Address::generate(&env);
+        let treasury2 = Address::generate(&env);
+        let shares = soroban_sdk::vec![
+            &env,
+            TreasuryShare {
+                treasury: treasury1.clone(),
+                bps: 300,
+            },
+            TreasuryShare {
+                treasury: treasury2.clone(),
+                bps: 200,
+            },
+        ];
+
+        assert_eq!(
+            EscrowContract::set_fee_distribution(env.clone(), admin, shares.clone()),
+            Ok(true)
+        );
+        assert_eq!(EscrowContract::get_fee_distribution(env), shares);
     }
 }
 

@@ -68,9 +68,26 @@ pub struct Flag {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReputationConfig {
     pub decay_window_seconds: u64,
+    /// Minimum number of lifetime transactions (window-independent) an
+    /// entity must accumulate before [`ReputationContract::get_reputation`]
+    /// stops masking its `score`/`avg_rating` to `0`. The masking gate
+    /// compares against the exact lifetime `total_transactions` counter —
+    /// **not** the `SCORE_WINDOW` sample that feeds the score recompute — so
+    /// it is always satisfiable regardless of the window. A valid threshold
+    /// must not exceed `SCORE_WINDOW`, however: anything larger would describe
+    /// a gate that never unmasks within the scoring-relevant window the
+    /// contract's behavior is documented against, so `validate_config`
+    /// rejects it with [`ReputationError::InvalidParam`].
     pub min_transactions_threshold: u64,
     pub dispute_penalty_bps: u32,
     pub freeze_threshold_flags: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractVersion {
+    pub name: Symbol,
+    pub semver: Symbol,
 }
 
 #[contracterror]
@@ -161,9 +178,9 @@ pub enum DataKey {
     Flags(Address),
     FrozenStatus(Address),
     RatedEscrows(Address),
-    /// `true` once `.1` has appeared as a `counterparty` on one of `.0`'s
-    /// recorded transactions. Backs an O(1) [`ReputationContract::has_transacted_with`]
-    /// check instead of scanning `TransactionHistory`.
+    /// `true` once `.1` has appeared in a recorded transaction with `.0`.
+    /// Stored in both directions so the relationship reads symmetrically while
+    /// still supporting a directed lookup when needed.
     Transacted(Address, Address),
 }
 
@@ -171,16 +188,28 @@ pub enum DataKey {
 /// for the recency-weight scale in [`recency_weight_bps`].
 const BPS_SCALE: i128 = 10_000;
 
-/// Once this many half-lives have elapsed, the recency weight is close
-/// enough to zero (< 1 / 2^20 of full weight) to treat as zero outright and
-/// avoid needless iteration.
-const MAX_HALVINGS: u64 = 20;
+/// The maximum number of full half-lives after which the recency weight is
+/// treated as zero.  With `BPS_SCALE = 10_000`, the right-shift
+/// `BPS_SCALE >> full_halvings` yields 1 at `full_halvings = 13`
+/// (2^13 = 8 192 < 10 000) and 0 at `full_halvings = 14`
+/// (2^14 = 16 384 > 10 000).  Setting `MAX_HALVINGS = 13` therefore makes
+/// the early-exit guard reachable *and* precise: it fires exactly when the
+/// shift-based computation would produce a non-zero base for the last time.
+///
+/// Invariant (enforced by the `test_max_halvings_invariant` unit test):
+///   `BPS_SCALE >> MAX_HALVINGS != 0`
+const MAX_HALVINGS: u64 = 13;
 
 /// Caps how many of an entity's most recent transactions feed the
 /// time-decayed score/avg_rating computation in [`ReputationContract::recompute_score`],
 /// so `record_transaction` and `rate_entity` stay bounded-cost regardless of
 /// how large an entity's lifetime history grows.
 const SCORE_WINDOW: u32 = 200;
+
+/// Persistent entries are bumped when they approach expiry and kept alive
+/// for roughly 30 days, matching the repository's persistent-storage policy.
+const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
+const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
 
 /// Maps a transaction outcome to its contribution toward `score`, in basis
 /// points, per the reputation score formula.
@@ -253,6 +282,13 @@ impl ReputationContract {
         Ok(())
     }
 
+    pub fn version(env: Env) -> ContractVersion {
+        ContractVersion {
+            name: symbol_short!("reput"),
+            semver: Symbol::new(&env, env!("CARGO_PKG_VERSION")),
+        }
+    }
+
     // --- Core Recording ---
 
     /// Record a transaction outcome for `entity`. Called by the authorized
@@ -305,6 +341,11 @@ impl ReputationContract {
             recorded_at: env.ledger().timestamp(),
         };
         env.storage().persistent().set(&record_key, &record);
+        env.storage().persistent().extend_ttl(
+            &record_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         if existing.is_none() {
             let hist_key = DataKey::TransactionHistory(entity.clone());
@@ -315,8 +356,16 @@ impl ReputationContract {
                 .unwrap_or_else(|| Vec::new(&env));
             history.push_back(escrow_id);
             env.storage().persistent().set(&hist_key, &history);
+
+            // Record the symmetric counterpart relationship in both directions so
+            // a transaction between A and B reads as transacted for both A->B and
+            // B->A when callers need a bidirectional relationship check.
             env.storage().persistent().set(
                 &DataKey::Transacted(entity.clone(), record.counterparty.clone()),
+                &true,
+            );
+            env.storage().persistent().set(
+                &DataKey::Transacted(record.counterparty.clone(), entity.clone()),
                 &true,
             );
             Self::apply_new_transaction_counts(&env, &entity, &outcome);
@@ -476,6 +525,28 @@ impl ReputationContract {
             .persistent()
             .get(&DataKey::FrozenStatus(entity))
             .unwrap_or(false)
+    }
+
+    /// Returns whether two entities have a transaction relationship.
+    ///
+    /// When `directed` is `false`, the check is symmetric: it returns true if
+    /// either direction has been recorded. When `directed` is `true`, it checks
+    /// only the exact `(entity_a, entity_b)` direction.
+    pub fn has_relation(env: Env, entity_a: Address, entity_b: Address, directed: bool) -> bool {
+        let forward = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Transacted(entity_a.clone(), entity_b.clone()))
+            .unwrap_or(false);
+        if directed {
+            return forward;
+        }
+        forward
+            || env
+                .storage()
+                .persistent()
+                .get(&DataKey::Transacted(entity_b, entity_a))
+                .unwrap_or(false)
     }
 
     pub fn get_config(env: Env) -> Result<ReputationConfig, ReputationError> {
@@ -713,6 +784,14 @@ impl ReputationContract {
         if config.freeze_threshold_flags == 0 {
             return Err(ReputationError::InvalidParam);
         }
+        // The masking gate compares lifetime `total_transactions` (see
+        // [`Self::get_reputation`]), so a threshold above `SCORE_WINDOW` can
+        // only ever unmask after the recompute window has already slid past
+        // the score-relevant records — the gate then silently samples a
+        // stale subset instead of unlocking as documented. Reject it.
+        if config.min_transactions_threshold > SCORE_WINDOW as u64 {
+            return Err(ReputationError::InvalidParam);
+        }
         Ok(())
     }
 
@@ -726,10 +805,7 @@ impl ReputationContract {
     /// the entity's lifetime transaction count (the same unbounded-growth
     /// problem `SCORE_WINDOW` guards against in `recompute_score`).
     fn has_transacted_with(env: &Env, entity: &Address, counterparty: &Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Transacted(entity.clone(), counterparty.clone()))
-            .unwrap_or(false)
+        Self::has_relation(env.clone(), entity.clone(), counterparty.clone(), false)
     }
 
     fn load_or_default_reputation(env: &Env, entity: &Address) -> ReputationScore {
@@ -895,3 +971,31 @@ impl ReputationContract {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod config_parity_test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn get_config_matches_constructor_config() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let config = ReputationConfig {
+            decay_window_seconds: 86_400,
+            min_transactions_threshold: 5,
+            dispute_penalty_bps: 250,
+            freeze_threshold_flags: 3,
+        };
+
+        let contract_id = env.register(ReputationContract, (admin, config.clone()));
+
+        let stored: ReputationConfig = env.invoke_contract(
+            &contract_id,
+            &Symbol::new(&env, "get_config"),
+            (),
+        );
+
+        assert_eq!(stored, config);
+    }
+}

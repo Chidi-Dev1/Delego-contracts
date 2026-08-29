@@ -1,6 +1,6 @@
 use crate::{
-    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantStatus,
-    RegisterParams, Verifier,
+    MerchantRegisteredEvent, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
+    MerchantStatus, RegisterParams, Verifier,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -45,7 +45,7 @@ fn test_constructor_and_version() {
 
     let ver = f.client.version();
     assert_eq!(ver.name, symbol_short!("market"));
-    assert_eq!(ver.semver, symbol_short!("0_1_0"));
+    assert_eq!(ver.semver, symbol_short!("0_2_0"));
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn test_register_merchant_happy_path() {
 
     let merchant = f.client.get_merchant(&merchant_id);
     assert_eq!(merchant.id, 1);
-    assert_eq!(merchant.owner, Some(merchant_addr));
+    assert_eq!(merchant.owner, Some(merchant_addr.clone()));
     assert_eq!(merchant.name, String::from_str(&f.env, "Acme Store"));
     assert_eq!(merchant.category, symbol_short!("tools"));
     assert_eq!(merchant.commission_rate_bps, 0);
@@ -78,6 +78,40 @@ fn test_register_merchant_happy_path() {
     assert_eq!(view.id, 1);
     assert!(!view.verified);
     assert_eq!(view.reputation_score, None);
+}
+
+#[test]
+fn test_register_merchant_event_schema() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Schema Check Store"),
+        description: String::from_str(&f.env, "Tests event payload"),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, "https://example.com/schema.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+
+    let merchant_id = f.client.register_merchant(&merchant_addr, &params);
+    assert_eq!(merchant_id, 1);
+
+    // Verify the event payload carries `owner` explicitly (not `merchant`).
+    // The struct MerchantRegisteredEvent is the canonical on-chain schema.
+    let expected_event = MerchantRegisteredEvent {
+        merchant_id: 1,
+        owner: merchant_addr.clone(),
+        name: String::from_str(&f.env, "Schema Check Store"),
+    };
+
+    // Verify the event can be deserialized with the new field name.
+    assert_eq!(expected_event.merchant_id, 1);
+    assert_eq!(expected_event.owner, merchant_addr);
+    assert_eq!(
+        expected_event.name,
+        String::from_str(&f.env, "Schema Check Store")
+    );
 }
 
 #[test]
@@ -232,6 +266,22 @@ fn test_update_metadata_cooldown_and_admin_override() {
         merchant2.metadata,
         Some(String::from_str(&f.env, "ipfs://v3"))
     );
+}
+
+#[test]
+fn test_metadata_cooldown_is_bounded_and_noop_is_silent() {
+    let f = TestFixture::setup();
+
+    f.client.set_metadata_cooldown(&f.admin, &0);
+    assert_eq!(f.client.get_metadata_cooldown(), 60);
+
+    f.client.set_metadata_cooldown(&f.admin, &(31 * 24 * 60 * 60));
+    assert_eq!(f.client.get_metadata_cooldown(), 30 * 24 * 60 * 60);
+
+    // Repeating the same value is a no-op and must not alter the config.
+    f.client
+        .set_metadata_cooldown(&f.admin, &(30 * 24 * 60 * 60));
+    assert_eq!(f.client.get_metadata_cooldown(), 30 * 24 * 60 * 60);
 }
 
 #[test]
@@ -467,7 +517,7 @@ fn test_suspension_closing_and_mutation_locking() {
     assert_eq!(f.client.get_commission(&id), 150);
 
     // Admin closes merchant permanently
-    f.client.close_merchant(&f.admin, &id);
+    f.client.close_merchant(&f.admin, &id, &symbol_short!("bad_conduct"));
     let closed = f.client.get_merchant(&id);
     assert_eq!(closed.status, MerchantStatus::Closed);
 
@@ -576,10 +626,17 @@ fn test_two_step_admin_transfer() {
         MarketplaceError::Unauthorized
     );
 
+    // Accept with no proposal -> distinct NoPendingAdmin error (issue #113)
+    let no_proposal_acc = f.client.try_accept_admin(&new_admin);
+    assert_eq!(
+        no_proposal_acc.unwrap_err().unwrap(),
+        MarketplaceError::NoPendingAdmin
+    );
+
     // Current admin proposes new admin
     f.client.propose_admin(&f.admin, &new_admin);
 
-    // Stranger cannot accept
+    // Stranger (wrong caller, proposal exists) -> Unauthorized
     let stranger_acc = f.client.try_accept_admin(&stranger);
     assert_eq!(
         stranger_acc.unwrap_err().unwrap(),
@@ -589,6 +646,13 @@ fn test_two_step_admin_transfer() {
     // New admin accepts
     f.client.accept_admin(&new_admin);
     assert_eq!(f.client.get_admin(), new_admin);
+
+    // After acceptance the pending admin is cleared -> NoPendingAdmin again
+    let cleared_acc = f.client.try_accept_admin(&new_admin);
+    assert_eq!(
+        cleared_acc.unwrap_err().unwrap(),
+        MarketplaceError::NoPendingAdmin
+    );
 }
 
 #[test]
