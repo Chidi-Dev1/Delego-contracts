@@ -1305,23 +1305,7 @@ impl PermissionsContract {
             }
         }
 
-        let key = DataKey::Permission(owner.clone(), delegate.clone());
-        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
-
-        record.spent += amount;
-        let mut next_parent = match (record.parent_owner.clone(), record.parent_delegate.clone()) {
-            (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
-            _ => None,
-        };
-        env.storage().persistent().set(&key, &record);
-        Self::record_spend_stats(&env, &owner, &delegate, amount);
-
-        // Record the current ledger as the last spend ledger for velocity tracking.
-        env.storage()
-            .persistent()
-            .set(&velocity_key, &env.ledger().sequence());
-
-        let remaining = record.limit_total - record.spent;
+        let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         // Emit after successful spend only (issue #99).
         env.events().publish(
@@ -1335,9 +1319,50 @@ impl PermissionsContract {
             },
         );
 
-        // Walk the parent chain, deducting the same amount from each
-        // ancestor's allowance so a child's spend is also reflected against
-        // the allowance it was carved out of (issue #332).
+        Ok(())
+    }
+
+    /// Shared helper that applies a validated spend to the child permission
+    /// record and then walks the parent chain, decrementing each ancestor's
+    /// allowance by the same `amount` (issue #55 / #332).
+    ///
+    /// Callers **must** have already run all validation (`can_spend`,
+    /// velocity checks, nonce checks, …) before calling this function.
+    /// `apply_spend` only mutates storage — it does **not** re-validate.
+    ///
+    /// Returns the remaining allowance on the child permission after the spend.
+    fn apply_spend(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+        amount: i128,
+    ) -> Result<i128, PermissionError> {
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+
+        record.spent += amount;
+        let remaining = record.limit_total - record.spent;
+
+        // Capture the parent link before writing the updated record so we can
+        // walk the chain without holding an immutable borrow.
+        let mut next_parent = match (record.parent_owner.clone(), record.parent_delegate.clone()) {
+            (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+            _ => None,
+        };
+        env.storage().persistent().set(&key, &record);
+
+        Self::record_spend_stats(env, owner, delegate, amount);
+
+        // Record the current ledger for velocity tracking.
+        env.storage().persistent().set(
+            &DataKey::LastSpendLedger(owner.clone(), delegate.clone()),
+            &env.ledger().sequence(),
+        );
+
+        // Walk the parent chain, deducting the same amount from each ancestor's
+        // allowance so a child's spend is also reflected against the allowance
+        // it was carved out of (issue #332). This path is now shared between
+        // execute_spend and execute_spend_via_relayer (issue #55).
         while let Some((p_owner, p_delegate)) = next_parent {
             let parent_key = DataKey::Permission(p_owner, p_delegate);
             let mut parent_record: PermissionRecord = env
@@ -1356,13 +1381,13 @@ impl PermissionsContract {
                 parent_record.parent_owner.clone(),
                 parent_record.parent_delegate.clone(),
             ) {
-                (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+                (Some(pp_owner), Some(pp_delegate)) => Some((pp_owner, pp_delegate)),
                 _ => None,
             };
             env.storage().persistent().set(&parent_key, &parent_record);
         }
 
-        Ok(())
+        Ok(remaining)
     }
 
     /// Register (or rotate) the ed25519 public key used to verify this
@@ -1484,19 +1509,15 @@ impl PermissionsContract {
             merchant.clone(),
         )?;
 
-        let perm_key = DataKey::Permission(owner.clone(), delegate.clone());
-        let mut record: PermissionRecord = env.storage().persistent().get(&perm_key).unwrap();
-        record.spent += amount;
-        env.storage().persistent().set(&perm_key, &record);
+        // Advance the nonce before mutating spend state so a replay attempt
+        // within the same ledger is rejected even if apply_spend panics.
         env.storage().persistent().set(&nonce_key, &(nonce + 1));
-        Self::record_spend_stats(&env, &owner, &delegate, amount);
 
-        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
-        env.storage()
-            .persistent()
-            .set(&velocity_key, &env.ledger().sequence());
+        // apply_spend increments the child record, walks the full parent chain,
+        // updates usage stats, and records the last spend ledger — identical to
+        // the direct execute_spend path (issue #55).
+        let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
-        let remaining = record.limit_total - record.spent;
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("relayed")),
             PermissionSpendEvent {
