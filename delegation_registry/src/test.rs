@@ -391,6 +391,65 @@ fn test_rollback_restores_previous_state() {
 }
 
 #[test]
+fn test_updated_at_advances_across_lifecycle() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_timestamp(1_000);
+    let label = Symbol::new(&env, "Updated_At_Test");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    let record = client.get_delegation(&id);
+    assert_eq!(record.created_at, 1_000);
+    assert_eq!(record.updated_at, 1_000);
+
+    env.ledger().set_timestamp(2_000);
+    client.pause_delegation(&id);
+    let record = client.get_delegation(&id);
+    assert_eq!(record.updated_at, 2_000);
+    assert_eq!(record.created_at, 1_000);
+
+    env.ledger().set_timestamp(3_000);
+    client.resume_delegation(&id);
+    let record = client.get_delegation(&id);
+    assert_eq!(record.updated_at, 3_000);
+
+    env.ledger().set_timestamp(4_000);
+    client.rollback_delegation(&id, &1u32);
+    let record = client.get_delegation(&id);
+    assert_eq!(record.updated_at, 4_000);
+
+    env.ledger().set_timestamp(5_000);
+    client.revoke_delegation(&id);
+    let record = client.get_delegation(&id);
+    assert_eq!(record.updated_at, 5_000);
+    assert_eq!(record.created_at, 1_000);
+}
+
+#[test]
+fn test_updated_at_advances_on_sweep() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    env.ledger().set_timestamp(1_000);
+    let label = Symbol::new(&env, "Sweep_Updated_At");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+
+    env.ledger().set_sequence_number(300);
+    env.ledger().set_timestamp(9_000);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+    client.sweep_expired(&ids);
+
+    let record = client.get_delegation(&id);
+    assert_eq!(record.status, DelegationStatus::Expired);
+    assert_eq!(record.updated_at, 9_000);
+    assert_eq!(record.created_at, 1_000);
+}
+
+#[test]
 fn test_version_history_is_stored() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
