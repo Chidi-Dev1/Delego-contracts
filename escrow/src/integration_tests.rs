@@ -16,7 +16,6 @@ struct TestEnv {
     buyer: Address,
     seller: Address,
     agent: Address,
-    treasury: Address,
     token_contract_id: Address,
     escrow_contract_id: Address,
 }
@@ -57,7 +56,6 @@ impl TestEnv {
             buyer,
             seller,
             agent,
-            treasury,
             token_contract_id,
             escrow_contract_id,
         }

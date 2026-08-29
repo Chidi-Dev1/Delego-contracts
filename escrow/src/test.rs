@@ -1278,7 +1278,12 @@ mod test {
     fn setup_disputed_escrow(
         env: &Env,
         threshold: u32,
-    ) -> (EscrowContractClient<'_>, Address, u64, soroban_sdk::Vec<Address>) {
+    ) -> (
+        EscrowContractClient<'_>,
+        Address,
+        u64,
+        soroban_sdk::Vec<Address>,
+    ) {
         env.mock_all_auths();
         let (client, admin, contract_id) = setup_client(env);
 
@@ -1317,8 +1322,7 @@ mod test {
     #[test]
     fn test_vote_dispute_emits_dispute_voted_event() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 2); // threshold = 2
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 2); // threshold = 2
         let arbiter = arbiters.get(0).unwrap();
 
         client.vote_dispute(&escrow_id, &arbiter, &true);
@@ -1349,8 +1353,7 @@ mod test {
     #[test]
     fn test_vote_dispute_emits_zero_votes_for_on_buyer_vote() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 2);
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 2);
         let arbiter = arbiters.get(0).unwrap();
 
         client.vote_dispute(&escrow_id, &arbiter, &false); // vote for buyer
@@ -1381,8 +1384,7 @@ mod test {
     #[test]
     fn test_vote_dispute_quorum_boundary_emits_correct_tally() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 2); // threshold = 2
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 2); // threshold = 2
 
         // First seller vote.
         client.vote_dispute(&escrow_id, &arbiters.get(0).unwrap(), &true);
@@ -1416,8 +1418,7 @@ mod test {
     #[test]
     fn test_vote_dispute_emits_exactly_one_event_per_vote() {
         let env = Env::default();
-        let (client, contract_id, escrow_id, arbiters) =
-            setup_disputed_escrow(&env, 3); // threshold = 3
+        let (client, contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 3); // threshold = 3
 
         // Vote 1: verify exactly one DisputeVotedEvent.
         client.vote_dispute(&escrow_id, &arbiters.get(0).unwrap(), &true);
@@ -1433,7 +1434,10 @@ mod test {
                 count += 1;
             }
         }
-        assert_eq!(count, 1, "first vote should emit exactly one DisputeVotedEvent");
+        assert_eq!(
+            count, 1,
+            "first vote should emit exactly one DisputeVotedEvent"
+        );
 
         // Vote 2: verify exactly one more DisputeVotedEvent.
         client.vote_dispute(&escrow_id, &arbiters.get(1).unwrap(), &true);
@@ -1449,7 +1453,10 @@ mod test {
                 count += 1;
             }
         }
-        assert_eq!(count, 1, "second vote should emit exactly one DisputeVotedEvent");
+        assert_eq!(
+            count, 1,
+            "second vote should emit exactly one DisputeVotedEvent"
+        );
 
         // Vote 3: verify exactly one more.
         client.vote_dispute(&escrow_id, &arbiters.get(2).unwrap(), &false);
@@ -1465,7 +1472,10 @@ mod test {
                 count += 1;
             }
         }
-        assert_eq!(count, 1, "third vote should emit exactly one DisputeVotedEvent");
+        assert_eq!(
+            count, 1,
+            "third vote should emit exactly one DisputeVotedEvent"
+        );
     }
 
     // ─── Issue #34: Monotonic YieldView Tests ────────────────────────────────
@@ -1608,7 +1618,7 @@ mod test {
 
         // Advance 100 ledgers.
         env.ledger().with_mut(|li| {
-            li.sequence_number = li.sequence_number + 100;
+            li.sequence_number += 100;
         });
 
         let view_after = client.get_accrued_yield(&escrow_id);
