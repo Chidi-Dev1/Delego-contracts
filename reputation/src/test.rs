@@ -218,6 +218,53 @@ fn test_record_transaction_allows_lifecycle_update_while_frozen() {
 }
 
 #[test]
+fn test_record_transaction_extends_ttl_across_churn() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    let record_key = crate::DataKey::TransactionRecord(1);
+
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+    let initial_ttl = env.storage().persistent().get_ttl(&record_key);
+    assert!(initial_ttl > 17_280);
+
+    env.ledger().set_sequence_number(initial_ttl - 17_280 + 1);
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::ResolvedSeller,
+    );
+    let refreshed_ttl = env.storage().persistent().get_ttl(&record_key);
+    assert!(refreshed_ttl > 17_280);
+
+    env.ledger().set_sequence_number(refreshed_ttl - 17_280 + 1);
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+    let final_ttl = env.storage().persistent().get_ttl(&record_key);
+    assert!(final_ttl > 17_280);
+
+    env.ledger().set_sequence_number(final_ttl - 1);
+    assert!(client.get_reputation_breakdown(&entity, &0u32, &10u32).len() > 0);
+}
+
+#[test]
 fn test_record_transaction_same_escrow_updates_in_place() {
     let env = Env::default();
     let (client, admin) = setup(&env);
