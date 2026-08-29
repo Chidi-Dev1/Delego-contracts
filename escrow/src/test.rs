@@ -913,6 +913,60 @@ mod test {
     }
 
     #[test]
+    fn test_set_fee_distribution_rejects_zero_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let mut shares = soroban_sdk::Vec::new(&env);
+        shares.push_back(crate::TreasuryShare {
+            treasury: zero_account(&env),
+            bps: 100,
+        });
+
+        let res = client.try_set_fee_distribution(&admin, &shares);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidAddress)));
+        assert_eq!(client.get_fee_distribution().len(), 0);
+    }
+
+    #[test]
+    fn test_set_fee_distribution_rejects_zero_bps() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let treasury = Address::generate(&env);
+        let mut shares = soroban_sdk::Vec::new(&env);
+        shares.push_back(crate::TreasuryShare {
+            treasury,
+            bps: 0,
+        });
+
+        let res = client.try_set_fee_distribution(&admin, &shares);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
+        assert_eq!(client.get_fee_distribution().len(), 0);
+    }
+
+    #[test]
+    fn test_set_fee_distribution_rejects_max_treasuries_exceeded() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let mut shares = soroban_sdk::Vec::new(&env);
+        for _ in 0..11 {
+            shares.push_back(crate::TreasuryShare {
+                treasury: Address::generate(&env),
+                bps: 1,
+            });
+        }
+
+        let res = client.try_set_fee_distribution(&admin, &shares);
+        assert_eq!(res, Err(Ok(EscrowError::MaxTreasuriesExceeded)));
+        assert_eq!(client.get_fee_distribution().len(), 0);
+    }
+
+    #[test]
     fn test_fee_uses_single_treasury_when_no_distribution_configured() {
         let env = Env::default();
         env.mock_all_auths();
