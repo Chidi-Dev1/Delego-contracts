@@ -2547,4 +2547,74 @@ mod test {
         let res = client.try_accept_admin(&other);
         assert_eq!(res, Err(Ok(PermissionError::Unauthorized)));
     }
+
+    // --- grant expiry overflow (issue #52) -------------------------------------
+
+    #[test]
+    fn test_grant_expiry_at_u32_max_boundary_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let merchants = Vec::<Address>::new(&env);
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1_000;
+        });
+
+        // ttl_ledgers that lands the expiry exactly on u32::MAX must still succeed.
+        let ttl = u32::MAX - 1_000;
+        assert_eq!(
+            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &ttl),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            client.get_permission(&owner, &delegate).expires_at_ledger,
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn test_grant_expiry_overflow_returns_typed_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let merchants = Vec::<Address>::new(&env);
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1_000;
+        });
+
+        // Just past the boundary: sequence + ttl == u32::MAX + 1.
+        // Must return a typed error instead of overflow-panicking.
+        let ttl = u32::MAX - 999;
+        assert_eq!(
+            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &ttl),
+            Err(Ok(PermissionError::InvalidExpiry))
+        );
+
+        // Extreme ttl is handled the same way.
+        assert_eq!(
+            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &u32::MAX),
+            Err(Ok(PermissionError::InvalidExpiry))
+        );
+
+        // A subsequent in-range grant for the same pair still succeeds,
+        // confirming the rejected calls left no half-written state.
+        assert_eq!(
+            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &10_000),
+            Ok(Ok(()))
+        );
+        assert_eq!(
+            client.get_permission(&owner, &delegate).expires_at_ledger,
+            11_000
+        );
+    }
 }
