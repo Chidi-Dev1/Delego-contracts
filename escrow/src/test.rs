@@ -327,6 +327,58 @@ mod test {
         assert_eq!(res, Err(Ok(EscrowError::NotFound)));
     }
 
+    #[test]
+    fn test_dispute_votes_removed_after_quorum_resolution() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        client.add_token(&admin, &token);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let order_id = BytesN::from_array(&env, &[7u8; 32]);
+
+        let escrow_id = client.create(
+            &buyer,
+            &seller,
+            &token,
+            &1000i128,
+            &order_id,
+            &100u32,
+            &None,
+            &None,
+        );
+
+        client.deposit(&escrow_id, &1000i128);
+
+        let arbiter1 = Address::generate(&env);
+        let arbiter2 = Address::generate(&env);
+        client.set_quorum_config(
+            &admin,
+            &crate::QuorumConfig {
+                arbiters: soroban_sdk::vec![arbiter1.clone(), arbiter2.clone()],
+                threshold: 2,
+            },
+        );
+
+        client.dispute(&escrow_id);
+        client.vote(&escrow_id, &arbiter1, &true);
+        client.vote(&escrow_id, &arbiter2, &true);
+
+        client.resolve_dispute_quorum(&escrow_id);
+
+        assert!(
+            !env.storage()
+                .persistent()
+                .has(&DataKey::DisputeVotes(escrow_id))
+        );
+    }
+
     // ─── Issue #172: Escrow Creation Metadata Hash Tests ─────────────────────
 
     #[test]
