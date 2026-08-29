@@ -54,6 +54,8 @@ pub enum PermissionError {
     InvalidNonce = 13,
     /// Relayer-submitted signature has expired
     SignatureExpired = 14,
+    /// A live permission already exists; use `re_grant` to replace it explicitly (issue #51)
+    AlreadyGranted = 15,
     /// Owner and delegate cannot be the same address
     SelfDelegationNotAllowed = 401,
     /// Fewer valid owner signatures were provided than the configured threshold
@@ -169,6 +171,14 @@ pub struct PermissionGrantedEvent {
     pub delegate: Address,
     pub per_tx_limit: i128,
     pub total_limit: i128,
+    /// Amount the previous record for `(owner, delegate)` had already spent
+    /// before this (re-)grant. `0` for a first grant with no prior record.
+    /// Lets consumers see that a re-grant reset spend accounting (issue #51).
+    pub previous_spent: i128,
+    /// Change in remaining allowance caused by this (re-)grant, i.e. the new
+    /// total limit minus the previous remaining allowance. Positive when more
+    /// spending power was added, negative when it was reduced (issue #51).
+    pub remaining_delta: i128,
     pub expires_at_ledger: u32,
     pub merchant_count: u32,
 }
@@ -469,6 +479,13 @@ pub struct PermissionsContract;
 
 #[contractimpl]
 impl PermissionsContract {
+    /// Records a (owner, delegate) delegation as a **first grant**.
+    ///
+    /// A plain `grant` refuses to silently overwrite a live permission
+    /// (issue #51): if an Active/Paused record already exists for this
+    /// `(owner, delegate)` pair, it returns [`PermissionError::AlreadyGranted`]
+    /// instead of resetting its spend accounting. Callers that deliberately
+    /// want to replace an existing delegation must use [`Self::re_grant`].
     pub fn grant(
         env: Env,
         owner: Address,
@@ -477,6 +494,64 @@ impl PermissionsContract {
         limit_per_tx: i128,
         allowed_merchants: Vec<Address>,
         ttl_ledgers: u32,
+    ) -> Result<(), PermissionError> {
+        Self::grant_impl(
+            env,
+            owner,
+            delegate,
+            limit_total,
+            limit_per_tx,
+            allowed_merchants,
+            ttl_ledgers,
+            false,
+        )
+    }
+
+    /// Explicitly replaces an existing delegation's terms (issue #51).
+    ///
+    /// Unlike [`Self::grant`], this is permitted on a live (Active/Paused)
+    /// permission. The emitted [`PermissionGrantedEvent`] carries the previous
+    /// record's `spent` (as `previous_spent`) and the resulting change in
+    /// remaining allowance (as `remaining_delta`), so spend accounting is
+    /// never erased without a distinguishable signal.
+    ///
+    /// Fails with [`PermissionError::PermissionNotFound`] if no permission
+    /// exists yet for `(owner, delegate)` — use `grant` for a first grant.
+    pub fn re_grant(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        limit_total: i128,
+        limit_per_tx: i128,
+        allowed_merchants: Vec<Address>,
+        ttl_ledgers: u32,
+    ) -> Result<(), PermissionError> {
+        Self::grant_impl(
+            env,
+            owner,
+            delegate,
+            limit_total,
+            limit_per_tx,
+            allowed_merchants,
+            ttl_ledgers,
+            true,
+        )
+    }
+
+    /// Shared implementation for `grant` / `re_grant`.
+    ///
+    /// `re_grant` opts the caller into replacing an existing live permission
+    /// and reports the previous spent / remaining delta on the event so spend
+    /// accounting is never silently discarded.
+    fn grant_impl(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        limit_total: i128,
+        limit_per_tx: i128,
+        allowed_merchants: Vec<Address>,
+        ttl_ledgers: u32,
+        re_grant: bool,
     ) -> Result<(), PermissionError> {
         owner.require_auth();
 
@@ -510,6 +585,32 @@ impl PermissionsContract {
         // Validate merchant whitelist bounds and uniqueness.
         Self::validate_merchant_list(&env, &allowed_merchants)?;
 
+        // Issue #51: distinguish a first grant from a re-grant. A plain grant
+        // must not silently overwrite a live delegation and reset its spend
+        // accounting; only an explicit re-grant replaces it, and it reports
+        // the previous spent amount and the remaining-allowance delta.
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let existing: Option<PermissionRecord> = env.storage().persistent().get(&key);
+        let (previous_spent, old_remaining) = match &existing {
+            Some(r) => (r.spent, r.limit_total - r.spent),
+            None => (0, 0),
+        };
+        match &existing {
+            Some(r)
+                if !re_grant
+                    && matches!(
+                        r.status,
+                        PermissionStatus::Active | PermissionStatus::Paused
+                    ) =>
+            {
+                return Err(PermissionError::AlreadyGranted);
+            }
+            None if re_grant => {
+                return Err(PermissionError::PermissionNotFound);
+            }
+            _ => {}
+        }
+
         let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
 
         let record = PermissionRecord {
@@ -526,10 +627,13 @@ impl PermissionsContract {
             parent_delegate: None,
         };
 
-        env.storage().persistent().set(
-            &DataKey::Permission(owner.clone(), delegate.clone()),
-            &record,
-        );
+        env.storage().persistent().set(&key, &record);
+
+        // Change in usable allowance caused by this (re-)grant. For a first
+        // grant `old_remaining` is 0 so this equals the new total limit; for a
+        // re-grant it reflects how much more (or less) the delegate can spend
+        // than before.
+        let remaining_delta = limit_total - old_remaining;
 
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("granted")),
@@ -538,6 +642,8 @@ impl PermissionsContract {
                 delegate: delegate.clone(),
                 per_tx_limit: limit_per_tx,
                 total_limit: limit_total,
+                previous_spent,
+                remaining_delta,
                 expires_at_ledger,
                 merchant_count: allowed_merchants.len(),
             },
@@ -552,13 +658,12 @@ impl PermissionsContract {
             },
         );
 
-        Self::append_audit_log(
-            &env,
-            &owner,
-            &delegate,
-            owner.clone(),
-            symbol_short!("granted"),
-        );
+        let action = if re_grant {
+            symbol_short!("regranted")
+        } else {
+            symbol_short!("granted")
+        };
+        Self::append_audit_log(&env, &owner, &delegate, owner.clone(), action);
 
         Ok(())
     }
@@ -676,6 +781,8 @@ impl PermissionsContract {
                 delegate: child_delegate,
                 per_tx_limit: limit_per_tx,
                 total_limit: limit_total,
+                previous_spent: 0,
+                remaining_delta: limit_total,
                 expires_at_ledger,
                 merchant_count: allowed_merchants.len(),
             },
@@ -2091,9 +2198,15 @@ impl PermissionsContract {
 
     /// Grants a permission and stores optional metadata hash (issue #181).
     ///
+    /// Grants a permission and stores optional metadata hash (issue #181).
+    ///
     /// When `metadata` is provided, its `schema` must already be registered
     /// via `register_schema` — unregistered schemas are rejected with
     /// `PermissionError::UnknownSchema` and no grant is recorded (issue #328).
+    ///
+    /// This is a **first grant**: like [`Self::grant`], it rejects a live
+    /// (Active/Paused) existing permission with `PermissionError::AlreadyGranted`
+    /// (issue #51). Use [`Self::re_grant_with_metadata`] to replace one.
     pub fn grant_with_metadata(
         env: Env,
         owner: Address,
@@ -2104,18 +2217,8 @@ impl PermissionsContract {
         ttl_ledgers: u32,
         metadata: Option<PermissionMetadata>,
     ) -> Result<(), PermissionError> {
-        if let Some(ref m) = metadata {
-            let registry: Vec<Symbol> = env
-                .storage()
-                .instance()
-                .get(&DataKey::SchemaRegistry)
-                .unwrap_or_else(|| Vec::new(&env));
-            if !registry.contains(&m.schema) {
-                return Err(PermissionError::UnknownSchema);
-            }
-        }
-
-        Self::grant(
+        Self::validate_metadata_schema(&env, &metadata)?;
+        Self::grant_impl(
             env.clone(),
             owner.clone(),
             delegate.clone(),
@@ -2123,21 +2226,78 @@ impl PermissionsContract {
             limit_per_tx,
             allowed_merchants,
             ttl_ledgers,
+            false,
         )?;
+        Self::store_metadata(&env, &owner, &delegate, metadata);
+        Ok(())
+    }
 
-        let meta_key = DataKey::Metadata(owner, delegate);
+    /// Explicitly replaces an existing permission while storing optional
+    /// metadata (issue #51). Semantics mirror [`Self::re_grant`] combined with
+    /// the metadata handling of [`Self::grant_with_metadata`]: permitted on a
+    /// live permission, fails with `PermissionError::PermissionNotFound` if no
+    /// record exists, and the granted event reports the previous spent amount.
+    pub fn re_grant_with_metadata(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        limit_total: i128,
+        limit_per_tx: i128,
+        allowed_merchants: Vec<Address>,
+        ttl_ledgers: u32,
+        metadata: Option<PermissionMetadata>,
+    ) -> Result<(), PermissionError> {
+        Self::validate_metadata_schema(&env, &metadata)?;
+        Self::grant_impl(
+            env.clone(),
+            owner.clone(),
+            delegate.clone(),
+            limit_total,
+            limit_per_tx,
+            allowed_merchants,
+            ttl_ledgers,
+            true,
+        )?;
+        Self::store_metadata(&env, &owner, &delegate, metadata);
+        Ok(())
+    }
+
+    /// Rejects metadata whose `schema` is not in the approved registry (issue #328).
+    fn validate_metadata_schema(
+        env: &Env,
+        metadata: &Option<PermissionMetadata>,
+    ) -> Result<(), PermissionError> {
+        if let Some(ref m) = metadata {
+            let registry: Vec<Symbol> = env
+                .storage()
+                .instance()
+                .get(&DataKey::SchemaRegistry)
+                .unwrap_or_else(|| Vec::new(env));
+            if !registry.contains(&m.schema) {
+                return Err(PermissionError::UnknownSchema);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores provided metadata, or clears any stale metadata from a previous
+    /// grant so `get_metadata` never returns a hash that belongs to an older
+    /// policy.
+    fn store_metadata(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+        metadata: Option<PermissionMetadata>,
+    ) {
+        let meta_key = DataKey::Metadata(owner.clone(), delegate.clone());
         match metadata {
             Some(m) => env.storage().persistent().set(&meta_key, &m),
             None => {
-                // Clear any stale metadata from a previous grant so
-                // get_metadata cannot return a hash that belongs to an older policy.
                 if env.storage().persistent().has(&meta_key) {
                     env.storage().persistent().remove(&meta_key);
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Returns optional metadata for a permission grant (issue #181).
