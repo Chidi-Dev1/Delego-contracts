@@ -132,6 +132,22 @@ pub struct MerchantMetadataUpdatedEvent {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CooldownConfig {
+    pub value_seconds: u64,
+    pub min_seconds: u64,
+    pub max_seconds: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataCooldownSetEvent {
+    pub previous: Option<u64>,
+    pub current: u64,
+    pub set_by: Address,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct MerchantCommissionSetEvent {
     pub merchant_id: u64,
@@ -217,6 +233,7 @@ pub enum DataKey {
     MerchantIds,
     CategoryIndex(Symbol),
     MetadataCooldown,
+    MetadataCooldownConfig,
     MerchantVerifier(u64, Address),
     MerchantVerifierList(u64),
     RequiredVerifications(u64),
@@ -239,6 +256,8 @@ pub struct ExternalReputationScore {
 
 const MAX_COMMISSION_BPS: u32 = 10_000;
 const DEFAULT_METADATA_COOLDOWN_SECS: u64 = 86_400; // 24 hours
+const MIN_METADATA_COOLDOWN_SECS: u64 = 60;
+const MAX_METADATA_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_PAGE_LIMIT: u32 = 50;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
@@ -269,6 +288,14 @@ impl MarketplaceContract {
         env.storage()
             .instance()
             .set(&DataKey::MetadataCooldown, &DEFAULT_METADATA_COOLDOWN_SECS);
+        env.storage().instance().set(
+            &DataKey::MetadataCooldownConfig,
+            &CooldownConfig {
+                value_seconds: DEFAULT_METADATA_COOLDOWN_SECS,
+                min_seconds: MIN_METADATA_COOLDOWN_SECS,
+                max_seconds: MAX_METADATA_COOLDOWN_SECS,
+            },
+        );
 
         Ok(())
     }
@@ -1134,9 +1161,31 @@ impl MarketplaceContract {
             return Err(MarketplaceError::Unauthorized);
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::MetadataCooldown, &cooldown_seconds);
+        let previous = Self::get_metadata_cooldown(env.clone());
+        let current = cooldown_seconds.clamp(MIN_METADATA_COOLDOWN_SECS, MAX_METADATA_COOLDOWN_SECS);
+        if previous == current {
+            return Ok(());
+        }
+
+        env.storage().instance().set(
+            &DataKey::MetadataCooldownConfig,
+            &CooldownConfig {
+                value_seconds: current,
+                min_seconds: MIN_METADATA_COOLDOWN_SECS,
+                max_seconds: MAX_METADATA_COOLDOWN_SECS,
+            },
+        );
+        // Keep the original key populated for deployments upgraded from the
+        // pre-config format and older readers.
+        env.storage().instance().set(&DataKey::MetadataCooldown, &current);
+        env.events().publish(
+            (symbol_short!("mkplc"), Symbol::new(&env, "cooldown_set")),
+            MetadataCooldownSetEvent {
+                previous: Some(previous),
+                current,
+                set_by: admin,
+            },
+        );
 
         Ok(())
     }
@@ -1144,7 +1193,9 @@ impl MarketplaceContract {
     pub fn get_metadata_cooldown(env: Env) -> u64 {
         env.storage()
             .instance()
-            .get(&DataKey::MetadataCooldown)
+            .get::<_, CooldownConfig>(&DataKey::MetadataCooldownConfig)
+            .map(|config| config.value_seconds)
+            .or_else(|| env.storage().instance().get(&DataKey::MetadataCooldown))
             .unwrap_or(DEFAULT_METADATA_COOLDOWN_SECS)
     }
 
