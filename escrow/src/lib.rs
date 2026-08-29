@@ -2,7 +2,10 @@
 //!
 //! Holds funds in escrow until order fulfillment is confirmed.
 
-#![no_std]
+// Contract crates compile as no_std for release and wasm builds, but keep std
+// enabled during testing so dev-dependencies and test assertions operate normally.
+// This exact conditional form must be consistent across all workspace contract crates.
+#![cfg_attr(not(test), no_std)]
 // `create` and `deposit` have 9 parameters — more than clippy's default limit of 7.
 // These are Soroban contract entry points whose signatures are part of the
 // published on-chain ABI; restructuring them would be a breaking change.
