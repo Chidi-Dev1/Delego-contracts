@@ -4,6 +4,7 @@
 //! platform, driven by escrow transaction outcomes and counterparty ratings.
 
 #![no_std]
+#![warn(missing_docs)]
 // Several entry points mirror escrow/permissions call shapes and exceed
 // clippy's default 7-argument limit; restructuring them would break the
 // published ABI these contracts are reviewed against.
