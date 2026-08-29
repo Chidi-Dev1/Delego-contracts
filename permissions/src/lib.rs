@@ -2069,6 +2069,10 @@ impl PermissionsContract {
     ) -> Result<(), PermissionError> {
         owner.require_auth();
 
+        if amount <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
+
         let perm_key = DataKey::Permission(owner.clone(), delegate.clone());
         let record: PermissionRecord = env.storage().persistent().get(&perm_key).unwrap();
 
@@ -2102,6 +2106,10 @@ impl PermissionsContract {
 
         let pend_key = DataKey::PendingDecrement(owner.clone(), delegate.clone());
         let pending: PendingAllowanceDecrement = env.storage().persistent().get(&pend_key).unwrap();
+
+        if pending.amount <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
 
         if env.ledger().timestamp() < pending.execution_time {
             return Err(PermissionError::TimeLockActive);

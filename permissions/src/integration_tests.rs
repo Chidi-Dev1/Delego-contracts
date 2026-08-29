@@ -421,6 +421,34 @@ fn test_decrease_allowance_timelock_blocked() {
 }
 
 #[test]
+fn test_decrease_allowance_rejects_non_positive_amounts() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+
+    for amount in [-1i128, 0i128] {
+        assert_eq!(
+            client.try_decrease_allowance(&t.buyer, &t.agent, &amount),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+    }
+
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
+}
+
+#[test]
+fn test_decrease_allowance_accepts_positive_amount() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+    client.decrease_allowance(&t.buyer, &t.agent, &1);
+}
+
+#[test]
 fn test_decrease_allowance_rejects_pending_decrease() {
     let t = TestEnv::setup();
     let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
