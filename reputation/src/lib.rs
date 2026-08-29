@@ -171,10 +171,17 @@ pub enum DataKey {
 /// for the recency-weight scale in [`recency_weight_bps`].
 const BPS_SCALE: i128 = 10_000;
 
-/// Once this many half-lives have elapsed, the recency weight is close
-/// enough to zero (< 1 / 2^20 of full weight) to treat as zero outright and
-/// avoid needless iteration.
-const MAX_HALVINGS: u64 = 20;
+/// The maximum number of full half-lives after which the recency weight is
+/// treated as zero.  With `BPS_SCALE = 10_000`, the right-shift
+/// `BPS_SCALE >> full_halvings` yields 1 at `full_halvings = 13`
+/// (2^13 = 8 192 < 10 000) and 0 at `full_halvings = 14`
+/// (2^14 = 16 384 > 10 000).  Setting `MAX_HALVINGS = 13` therefore makes
+/// the early-exit guard reachable *and* precise: it fires exactly when the
+/// shift-based computation would produce a non-zero base for the last time.
+///
+/// Invariant (enforced by the `test_max_halvings_invariant` unit test):
+///   `BPS_SCALE >> MAX_HALVINGS != 0`
+const MAX_HALVINGS: u64 = 13;
 
 /// Caps how many of an entity's most recent transactions feed the
 /// time-decayed score/avg_rating computation in [`ReputationContract::recompute_score`],
