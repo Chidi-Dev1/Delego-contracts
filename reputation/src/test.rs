@@ -7,7 +7,7 @@ use crate::{
 };
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger},
+    testutils::{storage::Persistent, Address as _, Ledger},
     Address, Env, String,
 };
 
@@ -365,7 +365,9 @@ fn test_record_transaction_extends_ttl_across_churn() {
         &1000i128,
         &TransactionOutcome::Disputed,
     );
-    let initial_ttl = env.storage().persistent().get_ttl(&record_key);
+    let initial_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&record_key)
+    });
     assert!(initial_ttl > 17_280);
 
     env.ledger().set_sequence_number(initial_ttl - 17_280 + 1);
@@ -377,7 +379,9 @@ fn test_record_transaction_extends_ttl_across_churn() {
         &1000i128,
         &TransactionOutcome::ResolvedSeller,
     );
-    let refreshed_ttl = env.storage().persistent().get_ttl(&record_key);
+    let refreshed_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&record_key)
+    });
     assert!(refreshed_ttl > 17_280);
 
     env.ledger().set_sequence_number(refreshed_ttl - 17_280 + 1);
@@ -389,11 +393,15 @@ fn test_record_transaction_extends_ttl_across_churn() {
         &1000i128,
         &TransactionOutcome::Released,
     );
-    let final_ttl = env.storage().persistent().get_ttl(&record_key);
+    let final_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&record_key)
+    });
     assert!(final_ttl > 17_280);
 
     env.ledger().set_sequence_number(final_ttl - 1);
-    assert!(client.get_reputation_breakdown(&entity, &0u32, &10u32).len() > 0);
+    assert!(!client
+        .get_reputation_breakdown(&entity, &0u32, &10u32)
+        .is_empty());
 }
 
 #[test]
@@ -1074,14 +1082,16 @@ fn test_accept_admin_no_pending_transfer() {
 /// i.e. the documented cutoff is later than the actual one.
 #[test]
 fn test_max_halvings_invariant() {
-    assert!(
-        crate::BPS_SCALE >> crate::MAX_HALVINGS != 0,
-        "BPS_SCALE ({}) >> MAX_HALVINGS ({}) == 0: \
-         MAX_HALVINGS must be lowered (or BPS_SCALE raised) so that \
-         the shift still produces a non-zero base at the declared cutoff",
-        crate::BPS_SCALE,
-        crate::MAX_HALVINGS,
-    );
+    // Compile-time invariant check: the half-life shift must still produce a
+    // non-zero base at the declared cutoff (see doc comment above).
+    const {
+        assert!(
+            crate::BPS_SCALE >> crate::MAX_HALVINGS != 0,
+            "BPS_SCALE >> MAX_HALVINGS == 0: MAX_HALVINGS must be lowered \
+         (or BPS_SCALE raised) so that the shift still produces a non-zero \
+         base at the declared cutoff",
+        )
+    }
 }
 
 /// Decay-curve smoke test: checks expected outputs for every full half-life

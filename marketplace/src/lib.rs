@@ -5,7 +5,6 @@
 //! status lifecycle controls, and reputation score snapshot integration.
 
 #![no_std]
-#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, InvokeError,
@@ -54,7 +53,11 @@ pub struct MerchantView {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
-pub struct NameRelease { pub name: String, pub released_at: u64, pub previous_merchant: u64 }
+pub struct NameRelease {
+    pub name: String,
+    pub released_at: u64,
+    pub previous_merchant: u64,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -1234,7 +1237,8 @@ impl MarketplaceContract {
         }
 
         let previous = Self::get_metadata_cooldown(env.clone());
-        let current = cooldown_seconds.clamp(MIN_METADATA_COOLDOWN_SECS, MAX_METADATA_COOLDOWN_SECS);
+        let current =
+            cooldown_seconds.clamp(MIN_METADATA_COOLDOWN_SECS, MAX_METADATA_COOLDOWN_SECS);
         if previous == current {
             return Ok(());
         }
@@ -1249,7 +1253,9 @@ impl MarketplaceContract {
         );
         // Keep the original key populated for deployments upgraded from the
         // pre-config format and older readers.
-        env.storage().instance().set(&DataKey::MetadataCooldown, &current);
+        env.storage()
+            .instance()
+            .set(&DataKey::MetadataCooldown, &current);
         env.events().publish(
             (symbol_short!("mkplc"), Symbol::new(&env, "cooldown_set")),
             MetadataCooldownSetEvent {

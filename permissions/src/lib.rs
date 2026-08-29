@@ -2,7 +2,6 @@
 //! Spending limits, delegated authority, and time-locked allowance decrements
 
 #![cfg_attr(not(test), no_std)]
-#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, BytesN,
     Env, Symbol, Vec,
@@ -364,6 +363,8 @@ pub struct RelayerKeyChangedEvent {
     pub delegate: Address,
     pub old_key: Option<BytesN<32>>,
     pub new_key: BytesN<32>,
+}
+
 /// Emitted by `renew_permission` when a renewal's requested extension would
 /// overflow `u32` and is instead capped at `u32::MAX`, so callers get an
 /// explicit signal rather than a silently saturated expiry.
@@ -373,6 +374,8 @@ pub struct PermissionExpiryCappedEvent {
     pub owner: Address,
     pub delegate: Address,
     pub capped_at: u32,
+}
+
 /// Emitted by `propose_admin` when the current admin proposes a successor
 /// as part of the two-step admin transfer.
 #[contracttype]
@@ -577,6 +580,11 @@ pub enum DataKey {
 #[contract]
 pub struct PermissionsContract;
 
+// The `#[contractimpl]` macro generates client/wrapper functions that mirror
+// the ABI entry-point signatures above; they cannot be annotated individually
+// from user code, so the allow lives on the impl block for those generated
+// wrappers only. User-defined functions carry their own scoped allows.
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl PermissionsContract {
     /// Records a (owner, delegate) delegation as a **first grant**.
@@ -1532,8 +1540,8 @@ impl PermissionsContract {
         Self::append_audit_log(
             &env,
             &delegate,
-            &delegate.clone(),
-            delegate,
+            &delegate,
+            delegate.clone(),
             symbol_short!("relaykey"),
         );
 
@@ -1565,6 +1573,9 @@ impl PermissionsContract {
     /// delegate's registered public key, the `nonce` must match the
     /// delegate's next expected nonce (preventing replay), and
     /// `expiration_ledger` must not yet have been reached.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_spend_via_relayer(
         env: Env,
         relayer: Address,
@@ -1645,6 +1656,9 @@ impl PermissionsContract {
     /// the minimum number of owner signatures required to authorize a spend
     /// (1 <= threshold <= owners.len()). The caller must be one of `owners`.
     /// Stored keyed by `(owners[0], delegate)`.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_multi_owner(
         env: Env,
         caller: Address,
@@ -2117,7 +2131,7 @@ impl PermissionsContract {
             &DataKey::PauseMetadata(owner.clone(), delegate.clone()),
             &PauseMetadata {
                 paused_by: owner.clone(),
-                reason_code,
+                reason_code: reason_code.clone(),
                 paused_at_ledger: env.ledger().sequence(),
             },
         );
