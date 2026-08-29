@@ -656,7 +656,7 @@ impl ReputationContract {
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
         env.events().publish(
-            (symbol_short!("admin"), symbol_short!("proposed")),
+            (symbol_short!("reput"), soroban_sdk::Symbol::new(&env, "admin_prop")),
             AdminProposedEvent {
                 current_admin,
                 new_admin,
@@ -680,7 +680,7 @@ impl ReputationContract {
         env.storage().instance().set(&DataKey::Admin, &caller);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish(
-            (symbol_short!("admin"), symbol_short!("accepted")),
+            (symbol_short!("reput"), symbol_short!("admin_acc")),
             AdminAcceptedEvent { new_admin: caller },
         );
         Ok(())
