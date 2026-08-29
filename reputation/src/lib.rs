@@ -68,6 +68,16 @@ pub struct Flag {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReputationConfig {
     pub decay_window_seconds: u64,
+    /// Minimum number of lifetime transactions (window-independent) an
+    /// entity must accumulate before [`ReputationContract::get_reputation`]
+    /// stops masking its `score`/`avg_rating` to `0`. The masking gate
+    /// compares against the exact lifetime `total_transactions` counter —
+    /// **not** the `SCORE_WINDOW` sample that feeds the score recompute — so
+    /// it is always satisfiable regardless of the window. A valid threshold
+    /// must not exceed `SCORE_WINDOW`, however: anything larger would describe
+    /// a gate that never unmasks within the scoring-relevant window the
+    /// contract's behavior is documented against, so `validate_config`
+    /// rejects it with [`ReputationError::InvalidParam`].
     pub min_transactions_threshold: u64,
     pub dispute_penalty_bps: u32,
     pub freeze_threshold_flags: u32,
@@ -711,6 +721,14 @@ impl ReputationContract {
             return Err(ReputationError::InvalidParam);
         }
         if config.freeze_threshold_flags == 0 {
+            return Err(ReputationError::InvalidParam);
+        }
+        // The masking gate compares lifetime `total_transactions` (see
+        // [`Self::get_reputation`]), so a threshold above `SCORE_WINDOW` can
+        // only ever unmask after the recompute window has already slid past
+        // the score-relevant records — the gate then silently samples a
+        // stale subset instead of unlocking as documented. Reject it.
+        if config.min_transactions_threshold > SCORE_WINDOW as u64 {
             return Err(ReputationError::InvalidParam);
         }
         Ok(())

@@ -3,7 +3,7 @@
 
 use crate::{
     ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
-    TransactionOutcome,
+    TransactionOutcome, SCORE_WINDOW,
 };
 use soroban_sdk::{
     symbol_short,
@@ -82,6 +82,114 @@ fn test_constructor_rejects_zero_freeze_threshold() {
     let mut bad = default_config();
     bad.freeze_threshold_flags = 0;
     env.register(ReputationContract, (admin, bad));
+}
+
+// --- min_transactions_threshold vs SCORE_WINDOW ---
+
+#[test]
+#[should_panic]
+fn test_constructor_rejects_threshold_over_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut bad = default_config();
+    bad.min_transactions_threshold = SCORE_WINDOW as u64 + 1;
+    env.register(ReputationContract, (admin, bad));
+}
+
+#[test]
+fn test_constructor_accepts_threshold_equal_to_window() {
+    // A threshold exactly equal to SCORE_WINDOW is the largest reachable
+    // value and must be accepted (the masking gate compares the lifetime
+    // counter, so hitting it is still possible).
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = SCORE_WINDOW as u64;
+    let contract_id = env.register(ReputationContract, (admin, cfg.clone()));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    assert_eq!(client.get_config(), cfg);
+}
+
+#[test]
+fn test_update_config_rejects_threshold_over_window() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let mut bad = default_config();
+    bad.min_transactions_threshold = SCORE_WINDOW as u64 + 1;
+    let res = client.try_update_config(&admin, &bad);
+    assert_eq!(res, Err(Ok(ReputationError::InvalidParam)));
+}
+
+// The masking gate in get_reputation compares the entity's *lifetime*
+// `total_transactions` (window-independent) against the threshold — not the
+// `SCORE_WINDOW` sample feeding the score recompute. Setting the threshold
+// equal to SCORE_WINDOW and recording exactly SCORE_WINDOW lifetime
+// transactions unmasks the score even though the score itself is computed
+// over the same-sized window, pinning that the gate is driven by lifetime
+// counts.
+#[test]
+fn test_masking_uses_lifetime_counts_not_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = SCORE_WINDOW as u64;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Record exactly SCORE_WINDOW lifetime transactions. Remaining just below
+    // the threshold would keep the score masked; at the threshold it unmasks.
+    for i in 0..SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    // Lifetime count is exact, and the fresh all-Released run scores full.
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64);
+    assert_eq!(rep.score, 10_000);
+}
+
+#[test]
+fn test_masking_keeps_score_hidden_below_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = SCORE_WINDOW as u64;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // SCORE_WINDOW - 1 lifetime transactions: still below the threshold, so
+    // the score/avg_rating must stay masked even though the recompute
+    // samples the same window size.
+    for i in 0..(SCORE_WINDOW as u64 - 1) {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64 - 1);
+    assert_eq!(rep.score, 0);
 }
 
 // --- record_transaction ---
