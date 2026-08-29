@@ -105,7 +105,7 @@ pub enum MarketplaceError {
 #[derive(Clone, Debug)]
 pub struct MerchantRegisteredEvent {
     pub merchant_id: u64,
-    pub merchant: Address,
+    pub owner: Address,
     pub name: String,
 }
 
@@ -408,7 +408,7 @@ impl MarketplaceContract {
             (symbol_short!("mkplc"), symbol_short!("reg")),
             MerchantRegisteredEvent {
                 merchant_id: next_id,
-                merchant,
+                owner: merchant,
                 name: params.name,
             },
         );
@@ -1165,7 +1165,7 @@ impl MarketplaceContract {
     pub fn version(_env: Env) -> ContractVersion {
         ContractVersion {
             name: symbol_short!("market"),
-            semver: symbol_short!("0_1_0"),
+            semver: symbol_short!("0_2_0"),
         }
     }
 
