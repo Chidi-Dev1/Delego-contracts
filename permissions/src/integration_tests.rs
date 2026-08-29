@@ -973,12 +973,9 @@ fn test_relayed_child_spend_decrements_parent_budget() {
     let mut merchants = Vec::<Address>::new(&t.env);
     merchants.push_back(t.seller.clone());
     client.grant(
-        &t.buyer,
-        &t.agent,
-        &200i128, // parent total
+        &t.buyer, &t.agent, &200i128, // parent total
         &100i128, // parent per-tx
-        &merchants,
-        &3600u32,
+        &merchants, &3600u32,
     );
 
     // ── Set up child permission: agent → child_delegate, total 100 ──────────
@@ -1007,7 +1004,7 @@ fn test_relayed_child_spend_decrements_parent_budget() {
     // ── Build and sign a relayed spend of 75 on the child permission ─────────
     let expiration_ledger = t.env.ledger().sequence() + 200;
     let message = RelayedSpendMessage {
-        owner: t.agent.clone(),      // child's owner == parent delegate
+        owner: t.agent.clone(), // child's owner == parent delegate
         delegate: child_delegate.clone(),
         merchant: t.seller.clone(),
         amount: 75,
@@ -1018,7 +1015,7 @@ fn test_relayed_child_spend_decrements_parent_budget() {
 
     client.execute_spend_via_relayer(
         &relayer,
-        &t.agent,       // owner of child permission
+        &t.agent, // owner of child permission
         &child_delegate,
         &75i128,
         &t.seller,
@@ -1057,14 +1054,7 @@ fn test_relayed_spend_respects_parent_budget_cap() {
     merchants.push_back(t.seller.clone());
 
     // Parent: 100 total; child: 100 total.
-    client.grant(
-        &t.buyer,
-        &t.agent,
-        &100i128,
-        &100i128,
-        &merchants,
-        &3600u32,
-    );
+    client.grant(&t.buyer, &t.agent, &100i128, &100i128, &merchants, &3600u32);
     client.grant_child(
         &t.buyer,
         &t.agent,

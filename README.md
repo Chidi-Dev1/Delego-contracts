@@ -92,6 +92,24 @@ cargo build -p delego-escrow --target wasm32-unknown-unknown --release
 
 Build artifacts land in `target/wasm32-unknown-unknown/release/`.
 
+## 🛠️ Tooling
+
+All five contract crates expose the same script set via `package.json`
+(`build-wasm`, `test`, `lint`) and via a root [`justfile`](./justfile), so
+building, testing, and linting any contract is a single command:
+
+```bash
+# Inside any contract directory
+npm run build-wasm   # cargo build --target wasm32-unknown-unknown --release
+npm test             # cargo test
+npm run lint         # cargo clippy --all-targets -- -D warnings
+
+# Or from the repo root with just installed
+just build-wasm
+just test
+just lint
+```
+
 ## 🚀 Deployment
 
 ### Testnet
