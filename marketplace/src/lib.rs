@@ -104,6 +104,7 @@ pub enum MarketplaceError {
     MetadataLockActive = 13,
     InvalidCategory = 14,
     InvalidParam = 15,
+    NoPendingAdmin = 16,
 }
 
 // --- Events ---
@@ -1146,6 +1147,12 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::PendingAdmin)
             .unwrap_or(None);
+
+        // No proposal exists: distinct error so callers can tell this apart
+        // from "not the proposed successor" (Unauthorized).
+        if pending.is_none() {
+            return Err(MarketplaceError::NoPendingAdmin);
+        }
 
         if pending != Some(caller.clone()) {
             return Err(MarketplaceError::Unauthorized);
