@@ -269,6 +269,188 @@ fn test_update_metadata_cooldown_and_admin_override() {
 }
 
 #[test]
+fn test_update_metadata_change_detection_noop() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    // Set cooldown to 1000 seconds to make cooldown detection difficult
+    f.client.set_metadata_cooldown(&f.admin, &1000);
+    f.env.ledger().set_timestamp(10_000);
+
+    let initial_metadata = Some(String::from_str(&f.env, "ipfs://original"));
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "NoOp Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: initial_metadata.clone(),
+            required_verifications: 1,
+        },
+    );
+
+    let merchant_before = f.client.get_merchant(&id);
+    assert_eq!(merchant_before.metadata, initial_metadata);
+    let updated_at_before = merchant_before.updated_at;
+
+    // Attempt to update with identical metadata (no-op)
+    // Even though cooldown would normally block owner, change-detection should allow this
+    // because no actual change occurs
+    f.client.update_metadata(&id, &owner, &initial_metadata);
+
+    let merchant_after = f.client.get_merchant(&id);
+    // Verify metadata is unchanged
+    assert_eq!(merchant_after.metadata, initial_metadata);
+    // Verify updated_at timestamp was NOT updated (no write occurred)
+    assert_eq!(merchant_after.updated_at, updated_at_before);
+}
+
+#[test]
+fn test_update_metadata_change_detection_with_change() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    // Set cooldown to 0 to focus on change-detection behavior
+    f.client.set_metadata_cooldown(&f.admin, &60);
+    f.env.ledger().set_timestamp(10_000);
+
+    let initial_metadata = Some(String::from_str(&f.env, "ipfs://v1"));
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Change Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: initial_metadata.clone(),
+            required_verifications: 1,
+        },
+    );
+
+    let merchant_before = f.client.get_merchant(&id);
+    assert_eq!(merchant_before.metadata, initial_metadata);
+
+    // Advance time beyond cooldown
+    f.env.ledger().set_timestamp(10_100);
+
+    // Update with different metadata
+    let new_metadata = Some(String::from_str(&f.env, "ipfs://v2"));
+    f.client.update_metadata(&id, &owner, &new_metadata);
+
+    let merchant_after = f.client.get_merchant(&id);
+    // Verify metadata changed
+    assert_eq!(merchant_after.metadata, new_metadata);
+    // Verify updated_at was updated
+    assert_eq!(merchant_after.updated_at, 10_100);
+}
+
+#[test]
+fn test_update_metadata_noop_with_none_values() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    f.client.set_metadata_cooldown(&f.admin, &1000);
+    f.env.ledger().set_timestamp(10_000);
+
+    // Register merchant with no metadata
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "NoMeta Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+
+    let merchant_before = f.client.get_merchant(&id);
+    assert_eq!(merchant_before.metadata, None);
+    let updated_at_before = merchant_before.updated_at;
+
+    // Attempt to update with None (identical to stored value, no-op)
+    f.client.update_metadata(&id, &owner, &None);
+
+    let merchant_after = f.client.get_merchant(&id);
+    // Verify metadata is still None
+    assert_eq!(merchant_after.metadata, None);
+    // Verify updated_at was NOT changed
+    assert_eq!(merchant_after.updated_at, updated_at_before);
+}
+
+#[test]
+fn test_update_metadata_change_from_none_to_value() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    f.client.set_metadata_cooldown(&f.admin, &60);
+    f.env.ledger().set_timestamp(10_000);
+
+    // Register merchant with no metadata
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "AddMeta Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+
+    // Advance time beyond cooldown
+    f.env.ledger().set_timestamp(10_100);
+
+    // Add metadata (None -> Some)
+    let new_metadata = Some(String::from_str(&f.env, "ipfs://added"));
+    f.client.update_metadata(&id, &owner, &new_metadata);
+
+    let merchant_after = f.client.get_merchant(&id);
+    // Verify metadata was added
+    assert_eq!(merchant_after.metadata, new_metadata);
+    // Verify updated_at was updated
+    assert_eq!(merchant_after.updated_at, 10_100);
+}
+
+#[test]
+fn test_update_metadata_change_from_value_to_none() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    f.client.set_metadata_cooldown(&f.admin, &60);
+    f.env.ledger().set_timestamp(10_000);
+
+    // Register merchant with metadata
+    let initial_metadata = Some(String::from_str(&f.env, "ipfs://remove-me"));
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "RemoveMeta Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: initial_metadata.clone(),
+            required_verifications: 1,
+        },
+    );
+
+    // Advance time beyond cooldown
+    f.env.ledger().set_timestamp(10_100);
+
+    // Remove metadata (Some -> None)
+    f.client.update_metadata(&id, &owner, &None);
+
+    let merchant_after = f.client.get_merchant(&id);
+    // Verify metadata was removed
+    assert_eq!(merchant_after.metadata, None);
+    // Verify updated_at was updated
+    assert_eq!(merchant_after.updated_at, 10_100);
+}
+
+#[test]
 fn test_metadata_cooldown_is_bounded_and_noop_is_silent() {
     let f = TestFixture::setup();
 
