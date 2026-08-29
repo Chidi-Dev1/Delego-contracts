@@ -6,6 +6,7 @@
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
+#![warn(missing_docs)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, InvokeError,
