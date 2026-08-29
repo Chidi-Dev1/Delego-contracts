@@ -408,3 +408,21 @@ fn test_version_history_is_stored() {
     assert_eq!(first_snapshot.version, 1);
     assert_eq!(first_snapshot.record.status, DelegationStatus::Active);
 }
+
+// ── #90 checked_add boundary test ───────────────────────────────────────────
+
+#[test]
+fn test_create_delegation_returns_id_exhausted_at_boundary() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    // Directly set NextId to u64::MAX so the next increment overflows
+    env.storage()
+        .instance()
+        .set(&DataKey::NextId, &u64::MAX);
+
+    let label = Symbol::new(&env, "Boundary_Test");
+    let result =
+        client.try_create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    assert_eq!(result, Err(Ok(DelegationError::IdExhausted)));
+}

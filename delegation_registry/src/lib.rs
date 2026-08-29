@@ -112,6 +112,7 @@ pub enum DelegationError {
     InvalidVersion = 6,
     VersionNotLower = 7,
     SnapshotNotFound = 8,
+    IdExhausted = 9,
 }
 
 #[contract]
@@ -142,7 +143,7 @@ impl DelegationRegistry {
         permissions_contract: Address,
         label: Symbol,
         ttl_ledgers: u32,
-    ) -> u64 {
+    ) -> Result<u64, DelegationError> {
         owner.require_auth();
 
         let id = env
@@ -150,7 +151,8 @@ impl DelegationRegistry {
             .instance()
             .get(&DataKey::NextId)
             .unwrap_or(1u64);
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        let next_id = id.checked_add(1).ok_or(DelegationError::IdExhausted)?;
+        env.storage().instance().set(&DataKey::NextId, &next_id);
 
         let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
         let now = env.ledger().timestamp();
@@ -215,7 +217,7 @@ impl DelegationRegistry {
             },
         );
 
-        id
+        Ok(id)
     }
 
     pub fn pause_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
