@@ -956,3 +956,152 @@ fn test_transfer_permission_fails_if_new_delegate_already_has_permission() {
         Err(Ok(PermissionError::InvalidParam))
     );
 }
+
+// ── Issue #55: Relayed spend propagates through parent-chain budget ─────────
+
+/// A relayed child spend must decrement the parent budget just like a direct
+/// spend does.  Before this fix, `execute_spend_via_relayer` only touched the
+/// child record; after it the parent's `spent` counter must also increase.
+#[test]
+fn test_relayed_child_spend_decrements_parent_budget() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+    let child_delegate = Address::generate(&t.env);
+
+    // ── Set up parent permission: buyer → agent, total 200 ──────────────────
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(
+        &t.buyer, &t.agent, &200i128, // parent total
+        &100i128, // parent per-tx
+        &merchants, &3600u32,
+    );
+
+    // ── Set up child permission: agent → child_delegate, total 100 ──────────
+    // grant_child requires parent_delegate (= agent) to auth.
+    client.grant_child(
+        &t.buyer,
+        &t.agent,
+        &child_delegate,
+        &100i128, // child total — carved out of parent's 200
+        &100i128, // child per-tx
+        &merchants,
+        &3600u32,
+    );
+
+    // Confirm initial parent remaining = 200, child remaining = 100.
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 200);
+    assert_eq!(
+        client.get_remaining_allowance(&t.agent, &child_delegate),
+        100
+    );
+
+    // ── Register an ed25519 key for the child delegate ───────────────────────
+    let (signing_key, public_key) = test_keypair(&t.env, 55);
+    client.set_relayer_key(&child_delegate, &public_key);
+
+    // ── Build and sign a relayed spend of 75 on the child permission ─────────
+    let expiration_ledger = t.env.ledger().sequence() + 200;
+    let message = RelayedSpendMessage {
+        owner: t.agent.clone(), // child's owner == parent delegate
+        delegate: child_delegate.clone(),
+        merchant: t.seller.clone(),
+        amount: 75,
+        nonce: 0,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.agent, // owner of child permission
+        &child_delegate,
+        &75i128,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &signature,
+    );
+
+    // ── Assertions ───────────────────────────────────────────────────────────
+    // Child's remaining should drop by 75.
+    assert_eq!(
+        client.get_remaining_allowance(&t.agent, &child_delegate),
+        25,
+        "child remaining should be 100 - 75 = 25"
+    );
+
+    // Parent's remaining MUST ALSO drop by 75 (the whole point of issue #55).
+    assert_eq!(
+        client.get_remaining_allowance(&t.buyer, &t.agent),
+        125,
+        "parent remaining should be 200 - 75 = 125 (relayed spend must decrement parent)"
+    );
+}
+
+/// Verify that after the fix, both direct and relayed spends through the same
+/// child permission equally consume the shared parent budget, and the parent
+/// cap is enforced on the relayed path.
+#[test]
+fn test_relayed_spend_respects_parent_budget_cap() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+    let child_delegate = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+
+    // Parent: 100 total; child: 100 total.
+    client.grant(&t.buyer, &t.agent, &100i128, &100i128, &merchants, &3600u32);
+    client.grant_child(
+        &t.buyer,
+        &t.agent,
+        &child_delegate,
+        &100i128,
+        &100i128,
+        &merchants,
+        &3600u32,
+    );
+
+    // Spend 90 directly on the child, which should propagate to the parent.
+    client.execute_spend(&t.agent, &child_delegate, &90, &t.seller);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 10);
+    assert_eq!(
+        client.get_remaining_allowance(&t.agent, &child_delegate),
+        10
+    );
+
+    // Now attempt a relayed spend of 20, which should be blocked by the parent
+    // cap (only 10 remaining there).
+    let (signing_key, public_key) = test_keypair(&t.env, 56);
+    client.set_relayer_key(&child_delegate, &public_key);
+    let expiration_ledger = t.env.ledger().sequence() + 200;
+    let message = RelayedSpendMessage {
+        owner: t.agent.clone(),
+        delegate: child_delegate.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 0,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+
+    // The child still has 10 remaining, but even before reaching apply_spend
+    // the can_spend check on the child will block the 20 spend (child limit
+    // is also only 10).
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.agent,
+            &child_delegate,
+            &20,
+            &t.seller,
+            &0u64,
+            &expiration_ledger,
+            &signature,
+        ),
+        Err(Ok(PermissionError::ExceedsTotalLimit))
+    );
+}

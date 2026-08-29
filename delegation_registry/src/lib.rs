@@ -24,6 +24,7 @@ pub struct DelegationRecord {
     pub status: DelegationStatus,
     pub label: Symbol,
     pub created_at: u64,
+    pub updated_at: u64,
     pub expires_at_ledger: u32,
     pub version: u32,
 }
@@ -112,6 +113,7 @@ pub enum DelegationError {
     InvalidVersion = 6,
     VersionNotLower = 7,
     SnapshotNotFound = 8,
+    InvalidAgentId = 9,
 }
 
 #[contract]
@@ -128,6 +130,13 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    pub fn get_admin(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .expect("Admin not set")
+    }
+
     pub fn create_delegation(
         env: Env,
         owner: Address,
@@ -135,8 +144,15 @@ impl DelegationRegistry {
         permissions_contract: Address,
         label: Symbol,
         ttl_ledgers: u32,
-    ) -> u64 {
+    ) -> Result<u64, DelegationError> {
         owner.require_auth();
+
+        // Reject the all-zero sentinel agent id so authorization records
+        // can never be seeded with a dead id, keeping is_authorized
+        // failing closed.
+        if agent_id == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(DelegationError::InvalidAgentId);
+        }
 
         let id = env
             .storage()
@@ -156,6 +172,7 @@ impl DelegationRegistry {
             status: DelegationStatus::Active,
             label,
             created_at: now,
+            updated_at: now,
             expires_at_ledger,
             version: 1,
         };
@@ -208,7 +225,7 @@ impl DelegationRegistry {
             },
         );
 
-        id
+        Ok(id)
     }
 
     pub fn pause_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
@@ -226,6 +243,7 @@ impl DelegationRegistry {
 
         record.status = DelegationStatus::Paused;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -262,6 +280,7 @@ impl DelegationRegistry {
         if env.ledger().sequence() >= record.expires_at_ledger {
             record.status = DelegationStatus::Expired;
             record.version = Self::increment_version(&env, delegation_id);
+            record.updated_at = env.ledger().timestamp();
             env.storage()
                 .persistent()
                 .set(&DataKey::Delegation(delegation_id), &record);
@@ -282,6 +301,7 @@ impl DelegationRegistry {
 
         record.status = DelegationStatus::Active;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -302,6 +322,10 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    /// Revokes an active or paused delegation.
+    ///
+    /// Returns `Ok(true)` if the delegation transitioned to `Revoked`.
+    /// Returns `Ok(false)` if the delegation was already `Revoked` (idempotent no-op).
     pub fn revoke_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
         let mut record: DelegationRecord = env
             .storage()
@@ -312,11 +336,12 @@ impl DelegationRegistry {
         record.owner.require_auth();
 
         if record.status == DelegationStatus::Revoked {
-            return Ok(true);
+            return Ok(false);
         }
 
         record.status = DelegationStatus::Revoked;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -382,6 +407,7 @@ impl DelegationRegistry {
 
         record = snapshot.record;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -482,6 +508,7 @@ impl DelegationRegistry {
                     || record.status == DelegationStatus::Revoked;
                 if !already_terminal && current_ledger >= record.expires_at_ledger {
                     record.status = DelegationStatus::Expired;
+                    record.updated_at = env.ledger().timestamp();
                     env.storage().persistent().set(&key, &record);
 
                     env.events().publish(
