@@ -472,8 +472,9 @@ pub enum DataKey {
     QuorumConfig,
     DisputeVotes(u64),
     TimeoutExtensionVotes(u64),
-    TokenWhitelist,
-    TokenEnabled(Address),
+    AllowedToken(Address),
+    AllowedTokenAt(u32),
+    AllowedTokenCount,
     PauseState,
     EscrowMetadata(u64),
     LiquidityPool(Address),
@@ -1375,18 +1376,21 @@ impl EscrowContract {
             return Ok(true);
         }
 
-        let mut whitelist: soroban_sdk::Vec<Address> = env
+        let count: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::TokenWhitelist)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        whitelist.push_back(token_address.clone());
+            .get(&DataKey::AllowedTokenCount)
+            .unwrap_or(0);
+
         env.storage()
             .instance()
-            .set(&DataKey::TokenWhitelist, &whitelist);
+            .set(&DataKey::AllowedToken(token_address.clone()), &count);
         env.storage()
             .instance()
-            .set(&DataKey::TokenEnabled(token_address), &true);
+            .set(&DataKey::AllowedTokenAt(count), &token_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedTokenCount, &(count + 1));
 
         Ok(true)
     }
@@ -1402,20 +1406,47 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
-        let mut whitelist: soroban_sdk::Vec<Address> = env
+        let index_opt: Option<u32> = env
             .storage()
             .instance()
-            .get(&DataKey::TokenWhitelist)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        if let Some(index) = whitelist.first_index_of(&token_address) {
-            whitelist.remove(index);
-            env.storage()
+            .get(&DataKey::AllowedToken(token_address.clone()));
+
+        if let Some(idx) = index_opt {
+            let count: u32 = env
+                .storage()
                 .instance()
-                .set(&DataKey::TokenWhitelist, &whitelist);
+                .get(&DataKey::AllowedTokenCount)
+                .unwrap_or(0);
+            
+            if count > 0 {
+                let last_idx = count - 1;
+                if idx != last_idx {
+                    // Swap with the last element
+                    let last_token: Address = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::AllowedTokenAt(last_idx))
+                        .unwrap();
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::AllowedTokenAt(idx), &last_token);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::AllowedToken(last_token), &idx);
+                }
+                
+                // Remove the target token from mappings
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::AllowedToken(token_address));
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::AllowedTokenAt(last_idx));
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AllowedTokenCount, &last_idx);
+            }
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::TokenEnabled(token_address), &false);
 
         Ok(true)
     }
@@ -1424,16 +1455,37 @@ impl EscrowContract {
     pub fn is_token_allowed(env: Env, token_address: Address) -> bool {
         env.storage()
             .instance()
-            .get(&DataKey::TokenEnabled(token_address))
-            .unwrap_or(false)
+            .has(&DataKey::AllowedToken(token_address))
     }
 
     /// List all tokens currently approved for escrow deposits.
     pub fn list_tokens(env: Env) -> soroban_sdk::Vec<Address> {
-        env.storage()
+        let count: u32 = env
+            .storage()
             .instance()
-            .get(&DataKey::TokenWhitelist)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+            .get(&DataKey::AllowedTokenCount)
+            .unwrap_or(0);
+            
+        Self::list_tokens_paginated(env, 0, count)
+    }
+
+    /// List tokens currently approved for escrow deposits with pagination.
+    pub fn list_tokens_paginated(env: Env, offset: u32, limit: u32) -> soroban_sdk::Vec<Address> {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokenCount)
+            .unwrap_or(0);
+        
+        let mut tokens = soroban_sdk::Vec::new(&env);
+        let end = count.min(offset.saturating_add(limit));
+        
+        for i in offset..end {
+            if let Some(token) = env.storage().instance().get(&DataKey::AllowedTokenAt(i)) {
+                tokens.push_back(token);
+            }
+        }
+        tokens
     }
 
     /// Fund the shared liquidity pool for a token so it can back instant

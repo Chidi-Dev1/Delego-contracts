@@ -194,6 +194,34 @@ fn test_add_token_is_idempotent() {
 }
 
 #[test]
+fn test_large_whitelist_pagination() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    // Add 150 tokens
+    for _ in 0..150 {
+        let new_token = Address::generate(&t.env);
+        assert!(escrow_client.add_token(&t.admin, &new_token));
+    }
+
+    let tokens = escrow_client.list_tokens();
+    assert_eq!(tokens.len(), 151); // 1 from setup + 150
+
+    // Test pagination
+    let page_1 = escrow_client.list_tokens_paginated(&0, &50);
+    assert_eq!(page_1.len(), 50);
+
+    let page_2 = escrow_client.list_tokens_paginated(&50, &50);
+    assert_eq!(page_2.len(), 50);
+
+    let page_4 = escrow_client.list_tokens_paginated(&150, &50);
+    assert_eq!(page_4.len(), 1); // Only 1 left
+
+    let empty_page = escrow_client.list_tokens_paginated(&151, &50);
+    assert_eq!(empty_page.len(), 0);
+}
+
+#[test]
 fn test_full_purchase_lifecycle() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);

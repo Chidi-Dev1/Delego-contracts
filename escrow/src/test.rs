@@ -189,9 +189,10 @@ mod test {
         let key_limits: soroban_sdk::Val = DataKey::AmountLimits.into_val(&env);
         let key_quorum: soroban_sdk::Val = DataKey::QuorumConfig.into_val(&env);
         let key_votes_0: soroban_sdk::Val = DataKey::DisputeVotes(0u64).into_val(&env);
-        let key_whitelist: soroban_sdk::Val = DataKey::TokenWhitelist.into_val(&env);
-        let key_token_a: soroban_sdk::Val = DataKey::TokenEnabled(addr_a.clone()).into_val(&env);
-        let key_token_b: soroban_sdk::Val = DataKey::TokenEnabled(addr_b.clone()).into_val(&env);
+        let key_whitelist: soroban_sdk::Val = DataKey::AllowedTokenCount.into_val(&env);
+        let key_token_a: soroban_sdk::Val = DataKey::AllowedToken(addr_a.clone()).into_val(&env);
+        let key_token_b: soroban_sdk::Val = DataKey::AllowedToken(addr_b.clone()).into_val(&env);
+        let key_token_at: soroban_sdk::Val = DataKey::AllowedTokenAt(0).into_val(&env);
         let key_pause: soroban_sdk::Val = DataKey::PauseState.into_val(&env);
         let key_metadata_0: soroban_sdk::Val = DataKey::EscrowMetadata(0u64).into_val(&env);
         let key_metadata_1: soroban_sdk::Val = DataKey::EscrowMetadata(1u64).into_val(&env);
@@ -216,6 +217,7 @@ mod test {
             key_whitelist,
             key_token_a,
             key_token_b,
+            key_token_at,
             key_pause,
             key_metadata_0,
             key_metadata_1,
@@ -260,8 +262,8 @@ mod test {
         let env = Env::default();
         let addr_a = Address::generate(&env);
         let addr_b = Address::generate(&env);
-        let ka: soroban_sdk::Val = DataKey::TokenEnabled(addr_a).into_val(&env);
-        let kb: soroban_sdk::Val = DataKey::TokenEnabled(addr_b).into_val(&env);
+        let ka: soroban_sdk::Val = DataKey::AllowedToken(addr_a).into_val(&env);
+        let kb: soroban_sdk::Val = DataKey::AllowedToken(addr_b).into_val(&env);
         assert_ne!(
             soroban_sdk::Val::get_payload(ka),
             soroban_sdk::Val::get_payload(kb)
