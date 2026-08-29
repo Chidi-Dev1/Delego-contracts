@@ -2552,7 +2552,7 @@ mod test {
     fn test_get_permissions_by_owner() {
         let env = Env::default();
         env.mock_all_auths();
-        
+
         let owner = Address::generate(&env);
         let delegate1 = Address::generate(&env);
         let delegate2 = Address::generate(&env);
@@ -2575,17 +2575,17 @@ mod test {
 
         // Revoke one permission
         client.revoke(&owner, &delegate2);
-        
+
         let perms = client.get_permissions_by_owner(&owner);
         assert_eq!(perms.len(), 2);
-        
+
         // Transfer a permission
         let new_delegate = Address::generate(&env);
         client.transfer_permission(&owner, &delegate1, &new_delegate);
-        
+
         let perms = client.get_permissions_by_owner(&owner);
         assert_eq!(perms.len(), 2); // Still 2, delegate1 is removed, new_delegate is added.
-        
+
         // Verify new_delegate is in the list and delegate1 is not
         let mut found_new = false;
         let mut found_old = false;

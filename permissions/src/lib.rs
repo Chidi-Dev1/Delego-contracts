@@ -816,11 +816,11 @@ impl PermissionsContract {
             .persistent()
             .get(&user_perms_key)
             .unwrap_or(Vec::new(&env));
-            
+
         if let Some(index) = delegates.first_index_of(&old_delegate) {
             delegates.remove(index);
         }
-        
+
         if !delegates.contains(&new_delegate) {
             delegates.push_back(new_delegate.clone());
         }
@@ -1559,10 +1559,7 @@ impl PermissionsContract {
         }
     }
 
-    pub fn get_permissions_by_owner(
-        env: Env,
-        owner: Address,
-    ) -> Vec<PermissionRecord> {
+    pub fn get_permissions_by_owner(env: Env, owner: Address) -> Vec<PermissionRecord> {
         let delegates: Vec<Address> = env
             .storage()
             .persistent()
