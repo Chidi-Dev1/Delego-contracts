@@ -161,9 +161,9 @@ pub enum DataKey {
     Flags(Address),
     FrozenStatus(Address),
     RatedEscrows(Address),
-    /// `true` once `.1` has appeared as a `counterparty` on one of `.0`'s
-    /// recorded transactions. Backs an O(1) [`ReputationContract::has_transacted_with`]
-    /// check instead of scanning `TransactionHistory`.
+    /// `true` once `.1` has appeared in a recorded transaction with `.0`.
+    /// Stored in both directions so the relationship reads symmetrically while
+    /// still supporting a directed lookup when needed.
     Transacted(Address, Address),
 }
 
@@ -315,8 +315,16 @@ impl ReputationContract {
                 .unwrap_or_else(|| Vec::new(&env));
             history.push_back(escrow_id);
             env.storage().persistent().set(&hist_key, &history);
+
+            // Record the symmetric counterpart relationship in both directions so
+            // a transaction between A and B reads as transacted for both A->B and
+            // B->A when callers need a bidirectional relationship check.
             env.storage().persistent().set(
                 &DataKey::Transacted(entity.clone(), record.counterparty.clone()),
+                &true,
+            );
+            env.storage().persistent().set(
+                &DataKey::Transacted(record.counterparty.clone(), entity.clone()),
                 &true,
             );
             Self::apply_new_transaction_counts(&env, &entity, &outcome);
@@ -476,6 +484,28 @@ impl ReputationContract {
             .persistent()
             .get(&DataKey::FrozenStatus(entity))
             .unwrap_or(false)
+    }
+
+    /// Returns whether two entities have a transaction relationship.
+    ///
+    /// When `directed` is `false`, the check is symmetric: it returns true if
+    /// either direction has been recorded. When `directed` is `true`, it checks
+    /// only the exact `(entity_a, entity_b)` direction.
+    pub fn has_relation(env: Env, entity_a: Address, entity_b: Address, directed: bool) -> bool {
+        let forward = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Transacted(entity_a.clone(), entity_b.clone()))
+            .unwrap_or(false);
+        if directed {
+            return forward;
+        }
+        forward
+            || env
+                .storage()
+                .persistent()
+                .get(&DataKey::Transacted(entity_b, entity_a))
+                .unwrap_or(false)
     }
 
     pub fn get_config(env: Env) -> Result<ReputationConfig, ReputationError> {
@@ -726,10 +756,7 @@ impl ReputationContract {
     /// the entity's lifetime transaction count (the same unbounded-growth
     /// problem `SCORE_WINDOW` guards against in `recompute_score`).
     fn has_transacted_with(env: &Env, entity: &Address, counterparty: &Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Transacted(entity.clone(), counterparty.clone()))
-            .unwrap_or(false)
+        Self::has_relation(env.clone(), entity.clone(), counterparty.clone(), false)
     }
 
     fn load_or_default_reputation(env: &Env, entity: &Address) -> ReputationScore {
