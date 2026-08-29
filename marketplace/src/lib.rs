@@ -54,6 +54,10 @@ pub struct MerchantView {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
+pub struct NameRelease { pub name: String, pub released_at: u64, pub previous_merchant: u64 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct RegisterParams {
     pub name: String,
     pub description: String,
@@ -223,6 +227,8 @@ pub enum DataKey {
     NextMerchantId,
     Merchant(u64),
     MerchantName(String),
+    FreedName(String),
+    ArchivedMerchant(u64),
     VerifiedCount(u64),
     Verifiers,
     MerchantIds,
@@ -301,6 +307,12 @@ impl MarketplaceContract {
         let name_key = DataKey::MerchantName(params.name.clone());
         if env.storage().persistent().has(&name_key) {
             return Err(MarketplaceError::DuplicateMerchantName);
+        }
+
+        // If the name was previously freed, clear the FreedName entry so it can be reused.
+        let freed_key = DataKey::FreedName(params.name.clone());
+        if env.storage().persistent().has(&freed_key) {
+            env.storage().persistent().remove(&freed_key);
         }
 
         let now = env.ledger().timestamp();
@@ -438,6 +450,11 @@ impl MarketplaceContract {
         );
 
         Ok(next_id)
+    }
+
+    pub fn is_name_available(env: Env, name: String) -> bool {
+        let live_key = DataKey::MerchantName(name);
+        !env.storage().persistent().has(&live_key)
     }
 
     pub fn update_merchant_profile(
