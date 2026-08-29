@@ -666,6 +666,79 @@ fn test_reputation_score_injection_with_contract() {
     assert_eq!(fallback_injected, expected_score);
 }
 
+#[test]
+fn test_reputation_resolution_states() {
+    let f = TestFixture::setup();
+    let seller = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &seller,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Resolution Tester"),
+            description: String::from_str(&f.env, "Tests resolution"),
+            category: symbol_short!("test"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+
+    // State 1: NotConfigured
+    let view_det_not_conf = f.client.get_merchant_view_detailed(&id);
+    assert_eq!(view_det_not_conf.reputation, crate::ReputationResolution::NotConfigured);
+    assert_eq!(view_det_not_conf.view.reputation_score, None);
+
+    // Setup working reputation contract
+    let reputation_admin = Address::generate(&f.env);
+    let rep_id = f.env.register(
+        ReputationContract,
+        (
+            reputation_admin.clone(),
+            ReputationConfig {
+                decay_window_seconds: 90 * 24 * 60 * 60,
+                min_transactions_threshold: 1,
+                dispute_penalty_bps: 500,
+                freeze_threshold_flags: 3,
+            },
+        ),
+    );
+    let rep_client = ReputationContractClient::new(&f.env, &rep_id);
+    rep_client.record_transaction(
+        &reputation_admin,
+        &1u64,
+        &seller,
+        &Address::generate(&f.env),
+        &500i128,
+        &TransactionOutcome::Released,
+    );
+
+    // State 2: Available
+    f.client.set_merchant_reputation(&f.admin, &id, &Some(rep_id.clone()));
+    let view_det_avail = f.client.get_merchant_view_detailed(&id);
+    let rep_score = rep_client.get_reputation(&seller);
+    assert_eq!(
+        view_det_avail.reputation,
+        crate::ReputationResolution::Available(rep_score.score, rep_score.last_updated)
+    );
+    assert_eq!(view_det_avail.view.reputation_score, Some(rep_score.score));
+    
+    // Ensure get_merchant_view still works
+    let view_avail = f.client.get_merchant_view(&id);
+    assert_eq!(view_avail.reputation_score, Some(rep_score.score));
+
+    // State 3: CallFailed
+    // Set an invalid contract address
+    let bogus_addr = Address::generate(&f.env);
+    f.client.set_merchant_reputation(&f.admin, &id, &Some(bogus_addr));
+    let view_det_failed = f.client.get_merchant_view_detailed(&id);
+    assert_eq!(view_det_failed.reputation, crate::ReputationResolution::CallFailed);
+    assert_eq!(view_det_failed.view.reputation_score, None);
+    
+    // Ensure get_merchant_view still falls back to None on fail
+    let view_failed = f.client.get_merchant_view(&id);
+    assert_eq!(view_failed.reputation_score, None);
+}
+
 /// Acceptance flight test:
 /// Registers a merchant, verifies with 2 distinct verifiers, and reads it back.
 #[test]

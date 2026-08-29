@@ -54,6 +54,21 @@ pub struct MerchantView {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
+pub enum ReputationResolution {
+    NotConfigured,
+    Available(u32, u64),
+    CallFailed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct MerchantViewDetailed {
+    pub view: MerchantView,
+    pub reputation: ReputationResolution,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct RegisterParams {
     pub name: String,
     pub description: String,
@@ -762,7 +777,7 @@ impl MarketplaceContract {
         Ok(merchant)
     }
 
-    pub fn get_merchant_view(env: Env, merchant_id: u64) -> Result<MerchantView, MarketplaceError> {
+    pub fn get_merchant_view_detailed(env: Env, merchant_id: u64) -> Result<MerchantViewDetailed, MarketplaceError> {
         let merchant = Self::get_merchant(env.clone(), merchant_id)?;
 
         let reputation_contract = merchant.reputation.clone().or_else(|| {
@@ -771,7 +786,7 @@ impl MarketplaceContract {
                 .get(&DataKey::GlobalReputationContract)
         });
 
-        let reputation_score = if let Some(rep_addr) = reputation_contract {
+        let reputation = if let Some(rep_addr) = reputation_contract {
             if let Some(owner) = merchant.owner.clone() {
                 let args = soroban_sdk::vec![&env, owner.to_val()];
                 let call_result = env.try_invoke_contract::<ExternalReputationScore, InvokeError>(
@@ -780,17 +795,22 @@ impl MarketplaceContract {
                     args,
                 );
                 match call_result {
-                    Ok(Ok(rep)) => Some(rep.score),
-                    _ => None,
+                    Ok(Ok(rep)) => ReputationResolution::Available(rep.score, rep.last_updated),
+                    _ => ReputationResolution::CallFailed,
                 }
             } else {
-                None
+                ReputationResolution::NotConfigured
             }
         } else {
-            None
+            ReputationResolution::NotConfigured
         };
 
-        Ok(MerchantView {
+        let reputation_score = match &reputation {
+            ReputationResolution::Available(score, _) => Some(*score),
+            _ => None,
+        };
+
+        let view = MerchantView {
             id: merchant.id,
             name: merchant.name,
             category: merchant.category,
@@ -798,7 +818,17 @@ impl MarketplaceContract {
             verified: merchant.verified,
             status: merchant.status,
             reputation_score,
+        };
+
+        Ok(MerchantViewDetailed {
+            view,
+            reputation,
         })
+    }
+
+    pub fn get_merchant_view(env: Env, merchant_id: u64) -> Result<MerchantView, MarketplaceError> {
+        let detailed = Self::get_merchant_view_detailed(env, merchant_id)?;
+        Ok(detailed.view)
     }
 
     pub fn get_merchants(
