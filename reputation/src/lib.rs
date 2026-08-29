@@ -73,6 +73,13 @@ pub struct ReputationConfig {
     pub freeze_threshold_flags: u32,
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractVersion {
+    pub name: Symbol,
+    pub semver: Symbol,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -251,6 +258,13 @@ impl ReputationContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Config, &config);
         Ok(())
+    }
+
+    pub fn version(env: Env) -> ContractVersion {
+        ContractVersion {
+            name: symbol_short!("reput"),
+            semver: Symbol::new(&env, env!("CARGO_PKG_VERSION")),
+        }
     }
 
     // --- Core Recording ---
