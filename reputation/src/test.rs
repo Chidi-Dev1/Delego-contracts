@@ -925,6 +925,18 @@ fn test_update_config_happy_path() {
 }
 
 #[test]
+fn test_get_config_parity() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let mut new_config = default_config();
+    new_config.freeze_threshold_flags = 1;
+    client.update_config(&admin, &new_config);
+
+    assert_eq!(client.get_config(), new_config);
+}
+
+#[test]
 fn test_update_config_unauthorized() {
     let env = Env::default();
     let (client, _admin) = setup(&env);
