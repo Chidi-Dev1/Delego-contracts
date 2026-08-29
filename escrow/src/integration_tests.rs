@@ -2,12 +2,12 @@
 
 use crate::{
     BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowContract,
-    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState,
+    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, EscrowYieldAccruedEvent,
 };
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
-    Address, BytesN, Env, IntoVal, Vec,
+    testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
+    Address, BytesN, Env, IntoVal, TryIntoVal, Vec,
 };
 
 struct TestEnv {
@@ -1543,6 +1543,128 @@ fn test_extend_timeout_via_quorum_rejects_zero_extension() {
         escrow_client.try_extend_timeout_via_quorum(&escrow_id, &arbiters.get(0).unwrap(), &0u32),
         Err(Ok(EscrowError::InvalidExtension))
     );
+}
+
+// ── Issue #45: Yield events on every terminal payout path ─────────────────
+
+const SECONDS_PER_YEAR: i128 = 31_536_000;
+
+fn count_yield_events(env: &Env, contract_id: &Address) -> u32 {
+    let mut count = 0;
+    for event in env.events().all().iter() {
+        let (contract, topics, _value) = event;
+        if contract != *contract_id || topics.len() != 2 {
+            continue;
+        }
+        let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+        let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(env).unwrap();
+        if t0 == symbol_short!("escrow") && t1 == symbol_short!("yield") {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The final partial release that exhausts the balance (a terminal payout
+/// path) emits `EscrowYieldAccruedEvent` with the delta-accrued amount;
+/// non-terminal partial releases do not.
+#[test]
+fn test_partial_release_terminal_emits_yield_event() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let lending_contract = Address::generate(&t.env);
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500u32);
+
+    // Advance the ledger so yield has accrued since creation.
+    t.env.ledger().with_mut(|li| {
+        li.timestamp += 3_153_600;
+        li.sequence_number += 10;
+    });
+
+    // Non-terminal partial release: no yield event yet.
+    escrow_client.partial_release(&escrow_id, &t.buyer, &500);
+    assert_eq!(count_yield_events(&t.env, &t.escrow_contract_id), 0);
+
+    // Terminal partial release: yield event is emitted.
+    escrow_client.partial_release(&escrow_id, &t.buyer, &500);
+
+    let events = t.env.events().all();
+    let mut found = false;
+    for event in events.iter() {
+        let (contract, topics, value) = event;
+        if contract != t.escrow_contract_id || topics.len() != 2 {
+            continue;
+        }
+        let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&t.env).unwrap();
+        let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&t.env).unwrap();
+        if t0 == symbol_short!("escrow") && t1 == symbol_short!("yield") {
+            let evt: EscrowYieldAccruedEvent = value.try_into_val(&t.env).unwrap();
+            assert_eq!(evt.escrow_id, escrow_id);
+            assert_eq!(evt.seller, t.seller);
+            // 1000 * 500bps * 3_153_600s / (10_000 * SECONDS_PER_YEAR) = 5
+            assert_eq!(evt.yield_amount, 5);
+            assert_eq!(evt.held_seconds, 3_153_600);
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "EscrowYieldAccruedEvent not emitted on terminal partial release"
+    );
+}
+
+/// A split release that exhausts the balance (a terminal payout path) emits
+/// `EscrowYieldAccruedEvent` with the delta-accrued amount; non-terminal
+/// split releases do not.
+#[test]
+fn test_split_release_terminal_emits_yield_event() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let lending_contract = Address::generate(&t.env);
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500u32);
+
+    t.env.ledger().with_mut(|li| {
+        li.timestamp += 3_153_600;
+        li.sequence_number += 10;
+    });
+
+    let recipient = Address::generate(&t.env);
+
+    // Non-terminal split release: no yield event yet.
+    let mut partial_shares = Vec::new(&t.env);
+    partial_shares.push_back((recipient.clone(), 300i128));
+    escrow_client.split_release(&escrow_id, &t.buyer, &partial_shares);
+    assert_eq!(count_yield_events(&t.env, &t.escrow_contract_id), 0);
+
+    // Terminal split release: yield event is emitted.
+    let mut shares = Vec::new(&t.env);
+    shares.push_back((recipient.clone(), 300i128));
+    shares.push_back((recipient.clone(), 400i128));
+    escrow_client.split_release(&escrow_id, &t.buyer, &shares);
+
+    let events = t.env.events().all();
+    let mut found = false;
+    for event in events.iter() {
+        let (contract, topics, value) = event;
+        if contract != t.escrow_contract_id || topics.len() != 2 {
+            continue;
+        }
+        let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&t.env).unwrap();
+        let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&t.env).unwrap();
+        if t0 == symbol_short!("escrow") && t1 == symbol_short!("yield") {
+            let evt: EscrowYieldAccruedEvent = value.try_into_val(&t.env).unwrap();
+            assert_eq!(evt.escrow_id, escrow_id);
+            assert_eq!(evt.seller, t.seller);
+            assert_eq!(evt.yield_amount, 5);
+            assert_eq!(evt.held_seconds, 3_153_600);
+            found = true;
+        }
+    }
+    assert!(found, "EscrowYieldAccruedEvent not emitted on terminal split release");
 }
 
 // ── Issue #335: Escrow Liquidity Pool for Instant Settlement ──────────────

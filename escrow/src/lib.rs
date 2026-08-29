@@ -3069,6 +3069,28 @@ impl EscrowContract {
         }
         env.storage().persistent().set(&key, &record);
 
+        // #45: A split release that exhausts the escrow balance is a terminal
+        // payout path, so it reports the yield accrued over the holding period
+        // just like the other terminal payout paths.
+        if new_remaining == 0 {
+            let yield_config: Option<YieldConfig> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::EscrowYieldConfig(escrow_id));
+            if let Some(cfg) = &yield_config {
+                let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), &env);
+                env.events().publish(
+                    (symbol_short!("escrow"), symbol_short!("yield")),
+                    EscrowYieldAccruedEvent {
+                        escrow_id,
+                        seller: record.seller.clone(),
+                        yield_amount,
+                        held_seconds,
+                    },
+                );
+            }
+        }
+
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("splitrel")),
             EscrowSplitReleasedEvent {
