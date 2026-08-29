@@ -2,7 +2,6 @@
 //!
 //! Holds funds in escrow until order fulfillment is confirmed.
 
-<<<<<<< HEAD
 // Contract crates compile as no_std for release and wasm builds, but keep std
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
@@ -13,9 +12,6 @@
 // The `contractargs` proc-macro also generates wrapper functions that exceed the
 // limit, which cannot be annotated individually from user code.
 #![allow(clippy::too_many_arguments)]
-=======
-#![no_std]
->>>>>>> upstream/main
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     InvokeError, Symbol, Vec,

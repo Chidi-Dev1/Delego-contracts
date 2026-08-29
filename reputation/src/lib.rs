@@ -3,7 +3,6 @@
 //! Tracks time-decayed trust scores for merchants and agents on the Delego
 //! platform, driven by escrow transaction outcomes and counterparty ratings.
 
-<<<<<<< HEAD
 // Contract crates compile as no_std for release and wasm builds, but keep std
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
@@ -12,9 +11,6 @@
 // clippy's default 7-argument limit; restructuring them would break the
 // published ABI these contracts are reviewed against.
 #![allow(clippy::too_many_arguments)]
-=======
-#![no_std]
->>>>>>> upstream/main
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,

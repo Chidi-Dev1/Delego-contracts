@@ -4,15 +4,11 @@
 //! paginated category and name discovery, commission configuration, metadata cooldown lock,
 //! status lifecycle controls, and reputation score snapshot integration.
 
-<<<<<<< HEAD
 // Contract crates compile as no_std for release and wasm builds, but keep std
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::too_many_arguments)]
-=======
-#![no_std]
->>>>>>> upstream/main
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, InvokeError,
