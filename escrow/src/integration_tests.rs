@@ -1545,6 +1545,59 @@ fn test_extend_timeout_via_quorum_rejects_zero_extension() {
     );
 }
 
+// ── Issue #36: extend_timeout typed InvalidExtension error ────────────────
+
+/// Extending the timeout to the same ledger as the current one is rejected
+/// with the typed `InvalidExtension` error.
+#[test]
+fn test_extend_timeout_rejects_equal_ledger() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    assert_eq!(
+        escrow_client.try_extend_timeout(&escrow_id, &t.buyer, &record.timeout_ledger),
+        Err(Ok(EscrowError::InvalidExtension))
+    );
+}
+
+/// Extending the timeout to a ledger earlier than the current one is
+/// rejected with the typed `InvalidExtension` error.
+#[test]
+fn test_extend_timeout_rejects_lower_ledger() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+    let lower = record.timeout_ledger - 5;
+
+    assert_eq!(
+        escrow_client.try_extend_timeout(&escrow_id, &t.buyer, &lower),
+        Err(Ok(EscrowError::InvalidExtension))
+    );
+}
+
+/// Extending the timeout to a strictly later ledger succeeds and updates the
+/// record.
+#[test]
+fn test_extend_timeout_accepts_higher_ledger() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+    let higher = record.timeout_ledger + 50;
+
+    let res = escrow_client.try_extend_timeout(&escrow_id, &t.buyer, &higher);
+    assert_eq!(res, Ok(Ok(true)));
+
+    let after = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(after.timeout_ledger, higher);
+}
+
 // ── Issue #335: Escrow Liquidity Pool for Instant Settlement ──────────────
 
 #[test]
