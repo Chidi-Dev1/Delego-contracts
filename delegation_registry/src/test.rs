@@ -3,7 +3,7 @@
 use super::*;
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Events, Ledger},
+    testutils::{storage::Persistent, Address as _, Events, Ledger},
     Address, BytesN, Env, Symbol, TryFromVal,
 };
 
@@ -534,4 +534,173 @@ fn test_revoke_paused_delegation_returns_true() {
     let repeat_result = client.revoke_delegation(&id);
     assert!(!repeat_result);
     assert_eq!(client.get_delegation_version(&id), 3);
+}
+
+// ── TTL bumping on reads (#94) ──────────────────────────────────────────────
+
+/// Large TTL in ledgers so the delegation's `expires_at_ledger` is never
+/// reached when we advance the ledger sequence to the storage-TTL
+/// boundary (thousands of sequences later).
+const LARGE_TTL: u32 = 10_000_000;
+
+#[test]
+fn test_get_delegation_bumps_ttl() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "TTL_Bump_Get");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &LARGE_TTL);
+
+    let delegation_key = DataKey::Delegation(id);
+    let user_dels_key = DataKey::UserDelegations(owner.clone());
+
+    // After creation the TTL should already be bumped.
+    let initial_delegation_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&delegation_key)
+    });
+    assert!(initial_delegation_ttl > 17_280);
+
+    let initial_user_dels_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&user_dels_key)
+    });
+    assert!(initial_user_dels_ttl > 17_280);
+
+    // Advance to the point where TTL is about to drop below the threshold
+    // and call get_delegation — this should refresh both keys.
+    env.ledger()
+        .set_sequence_number(initial_delegation_ttl - 17_280 + 1);
+    let _ = client.get_delegation(&id);
+    let refreshed_delegation_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&delegation_key)
+    });
+    assert!(refreshed_delegation_ttl > 17_280);
+
+    let refreshed_user_dels_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&user_dels_key)
+    });
+    assert!(refreshed_user_dels_ttl > 17_280);
+}
+
+#[test]
+fn test_is_authorized_bumps_ttl() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "TTL_Bump_Auth");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &LARGE_TTL);
+
+    let delegation_key = DataKey::Delegation(id);
+    let user_dels_key = DataKey::UserDelegations(owner.clone());
+
+    let initial_delegation_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&delegation_key)
+    });
+    assert!(initial_delegation_ttl > 17_280);
+
+    // Advance past the bump threshold and verify is_authorized refreshes TTL.
+    env.ledger()
+        .set_sequence_number(initial_delegation_ttl - 17_280 + 1);
+    assert!(client.is_authorized(&id, &agent_id));
+
+    let refreshed_delegation_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&delegation_key)
+    });
+    assert!(refreshed_delegation_ttl > 17_280);
+
+    let refreshed_user_dels_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&user_dels_key)
+    });
+    assert!(refreshed_user_dels_ttl > 17_280);
+}
+
+#[test]
+fn test_get_delegations_by_owner_bumps_ttl() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label1 = Symbol::new(&env, "TTL_Del1");
+    let label2 = Symbol::new(&env, "TTL_Del2");
+    let id1 = client.create_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label1,
+        &LARGE_TTL,
+    );
+    let id2 = client.create_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label2,
+        &LARGE_TTL,
+    );
+
+    let del_key_1 = DataKey::Delegation(id1);
+    let del_key_2 = DataKey::Delegation(id2);
+    let user_dels_key = DataKey::UserDelegations(owner.clone());
+
+    let initial_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&del_key_1)
+    });
+    assert!(initial_ttl > 17_280);
+
+    // Advance to the bump boundary and call get_delegations_by_owner.
+    env.ledger().set_sequence_number(initial_ttl - 17_280 + 1);
+    let records = client.get_delegations_by_owner(&owner);
+    assert_eq!(records.len(), 2);
+
+    let refreshed_del_1 = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&del_key_1)
+    });
+    assert!(refreshed_del_1 > 17_280);
+
+    let refreshed_del_2 = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&del_key_2)
+    });
+    assert!(refreshed_del_2 > 17_280);
+
+    let refreshed_user_dels = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&user_dels_key)
+    });
+    assert!(refreshed_user_dels > 17_280);
+}
+
+#[test]
+fn test_active_authorization_survives_ttl_boundary() {
+    // End-to-end: create a delegation, advance time close to TTL expiry,
+    // then verify is_authorized still works and the delegation record
+    // remains accessible after the bump.
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Boundary_Test");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &LARGE_TTL);
+
+    // Authorization is valid.
+    assert!(client.is_authorized(&id, &agent_id));
+
+    let delegation_key = DataKey::Delegation(id);
+    let initial_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&delegation_key)
+    });
+
+    // Advance to the bump threshold boundary.
+    env.ledger().set_sequence_number(initial_ttl - 17_280 + 1);
+
+    // The delegation should still be authorized (is_authorized bumps TTL).
+    assert!(client.is_authorized(&id, &agent_id));
+
+    // The delegation record should still be readable (get_delegation bumps).
+    let record = client.get_delegation(&id);
+    assert_eq!(record.status, DelegationStatus::Active);
+    assert_eq!(record.id, id);
+
+    // A second boundary crossing should still work thanks to the bumped TTL.
+    let second_ttl = env.as_contract(&client.address, || {
+        env.storage().persistent().get_ttl(&delegation_key)
+    });
+    env.ledger().set_sequence_number(second_ttl - 17_280 + 1);
+    assert!(client.is_authorized(&id, &agent_id));
+    let record = client.get_delegation(&id);
+    assert_eq!(record.status, DelegationStatus::Active);
 }

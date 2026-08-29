@@ -4,6 +4,11 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
+/// Persistent entries are bumped when they approach expiry and kept alive
+/// for roughly 30 days, matching the repository's persistent-storage policy.
+const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
+const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DelegationStatus {
@@ -180,6 +185,11 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Delegation(id), &record);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Delegation(id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         // Initialize version tracking
         env.storage()
@@ -203,6 +213,11 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::DelegationHistory(id), &history);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DelegationHistory(id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         let mut user_dels = env
             .storage()
@@ -214,6 +229,16 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::UserDelegations(owner.clone()), &user_dels);
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserDelegations(owner.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Bump the instance TTL to keep the contract alive.
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         env.events().publish(
             (symbol_short!("deleg"), symbol_short!("created")),
@@ -422,10 +447,15 @@ impl DelegationRegistry {
         env: Env,
         delegation_id: u64,
     ) -> Result<DelegationRecord, DelegationError> {
-        env.storage()
+        let record: DelegationRecord = env
+            .storage()
             .persistent()
             .get(&DataKey::Delegation(delegation_id))
-            .ok_or(DelegationError::NotFound)
+            .ok_or(DelegationError::NotFound)?;
+
+        Self::bump_delegation(&env, delegation_id, &record.owner);
+
+        Ok(record)
     }
 
     pub fn get_delegation_version(env: Env, delegation_id: u64) -> u32 {
@@ -443,11 +473,21 @@ impl DelegationRegistry {
     }
 
     pub fn get_delegations_by_owner(env: Env, owner: Address) -> Vec<DelegationRecord> {
-        let user_dels = env
+        let user_dels_key = DataKey::UserDelegations(owner.clone());
+        let user_dels: Vec<u64> = env
             .storage()
             .persistent()
-            .get::<_, Vec<u64>>(&DataKey::UserDelegations(owner))
+            .get(&user_dels_key)
             .unwrap_or(Vec::new(&env));
+
+        // Bump the index key so it stays alive alongside the records.
+        if env.storage().persistent().has(&user_dels_key) {
+            env.storage().persistent().extend_ttl(
+                &user_dels_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
 
         let mut records = Vec::new(&env);
         for id in user_dels.iter() {
@@ -456,6 +496,7 @@ impl DelegationRegistry {
                 .persistent()
                 .get::<_, DelegationRecord>(&DataKey::Delegation(id))
             {
+                Self::bump_delegation(&env, id, &record.owner);
                 records.push_back(record);
             }
         }
@@ -483,6 +524,10 @@ impl DelegationRegistry {
         if record.agent_id != agent_id {
             return false;
         }
+
+        // Bump TTL on both the delegation record and its owner index so
+        // active delegations stay alive while they're being queried.
+        Self::bump_delegation(&env, delegation_id, &record.owner);
 
         true
     }
@@ -560,6 +605,26 @@ impl DelegationRegistry {
         }
         expired
     }
+    /// Extends the TTL on the delegation record and its owner-index key,
+    /// keeping them alive in persistent storage. Called from read paths
+    /// (`get_delegation`, `get_delegations_by_owner`, `is_authorized`) so
+    /// active delegations are not evicted while still semantically live.
+    fn bump_delegation(env: &Env, delegation_id: u64, owner: &Address) {
+        let delegation_key = DataKey::Delegation(delegation_id);
+        env.storage().persistent().extend_ttl(
+            &delegation_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let user_dels_key = DataKey::UserDelegations(owner.clone());
+        env.storage().persistent().extend_ttl(
+            &user_dels_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
     fn increment_version(env: &Env, delegation_id: u64) -> u32 {
         let version: u32 = env
             .storage()
