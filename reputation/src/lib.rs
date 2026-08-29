@@ -111,6 +111,8 @@ pub enum ReputationError {
     /// Same reporter already flagged.
     AlreadyFlagged = 8,
     InvalidParam = 9,
+    NoActiveFlag = 10,
+    NotFlagReporter = 11,
 }
 
 #[contracttype]
@@ -993,7 +995,7 @@ mod config_parity_test {
         let stored: ReputationConfig = env.invoke_contract(
             &contract_id,
             &Symbol::new(&env, "get_config"),
-            (),
+            soroban_sdk::vec![&env],
         );
 
         assert_eq!(stored, config);

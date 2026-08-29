@@ -1005,7 +1005,7 @@ fn test_set_fee_distribution_rejects_zero_address_treasury() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
 
-    let zero_address = Address::from_contract_id(&BytesN::from_array(&t.env, &[0u8; 32]));
+    let zero_address = soroban_sdk::Address::from_str(&t.env, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4");
     let mut config = Vec::new(&t.env);
     config.push_back(TreasuryShare {
         treasury: zero_address,

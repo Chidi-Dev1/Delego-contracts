@@ -647,6 +647,8 @@ pub enum EscrowError {
     AmountLimitsNotSet = 40,
     /// Contract fee configuration has not been set
     FeeConfigNotSet = 41,
+    /// Maximum treasuries exceeded
+    MaxTreasuriesExceeded = 42,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -1321,7 +1323,7 @@ impl EscrowContract {
         }
 
         if shares.len() > MAX_TREASURIES {
-            return Err(EscrowError::InvalidFeeBps);
+            return Err(EscrowError::MaxTreasuriesExceeded);
         }
 
         let mut total_bps: u32 = 0;
@@ -3698,7 +3700,7 @@ impl EscrowContract {
 #[cfg(test)]
 mod fee_distribution_tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Env as _};
+    use soroban_sdk::testutils::{Address as _};
 
     fn setup(env: &Env) -> Address {
         let admin = Address::generate(env);

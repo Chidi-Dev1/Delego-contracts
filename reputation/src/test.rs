@@ -7,7 +7,7 @@ use crate::{
 };
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Ledger, storage::Persistent},
     Address, Env, String,
 };
 
