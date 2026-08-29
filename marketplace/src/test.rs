@@ -269,6 +269,22 @@ fn test_update_metadata_cooldown_and_admin_override() {
 }
 
 #[test]
+fn test_metadata_cooldown_is_bounded_and_noop_is_silent() {
+    let f = TestFixture::setup();
+
+    f.client.set_metadata_cooldown(&f.admin, &0);
+    assert_eq!(f.client.get_metadata_cooldown(), 60);
+
+    f.client.set_metadata_cooldown(&f.admin, &(31 * 24 * 60 * 60));
+    assert_eq!(f.client.get_metadata_cooldown(), 30 * 24 * 60 * 60);
+
+    // Repeating the same value is a no-op and must not alter the config.
+    f.client
+        .set_metadata_cooldown(&f.admin, &(30 * 24 * 60 * 60));
+    assert_eq!(f.client.get_metadata_cooldown(), 30 * 24 * 60 * 60);
+}
+
+#[test]
 fn test_verifier_management() {
     let f = TestFixture::setup();
     let verifier_addr = Address::generate(&f.env);
