@@ -219,6 +219,30 @@ fn test_record_transaction_released_scores_full() {
 }
 
 #[test]
+fn test_record_transaction_records_relation_in_both_directions() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+
+    assert!(client.has_relation(&entity, &counterparty, &false));
+    assert!(client.has_relation(&counterparty, &entity, &false));
+    assert!(client.has_relation(&entity, &counterparty, &true));
+    assert!(client.has_relation(&counterparty, &entity, &true));
+    let stranger = Address::generate(&env);
+    assert!(!client.has_relation(&entity, &stranger, &false));
+}
+
+#[test]
 fn test_record_transaction_unmasks_score_at_threshold() {
     let env = Env::default();
     let (client, admin) = setup(&env);
