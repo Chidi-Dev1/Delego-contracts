@@ -506,6 +506,101 @@ fn test_execute_spend_via_relayer_succeeds() {
     assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 1);
 }
 
+/// A second relayed spend inside the configured velocity interval is rejected
+/// with `VelocityLimitExceeded`, while a later spend after the interval has
+/// elapsed succeeds (issue #54).
+#[test]
+fn test_execute_spend_via_relayer_enforces_velocity_limit() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    // Configure a 10-ledger minimum spend interval.
+    client.set_admin(&t.admin);
+    client.set_velocity_limit(&t.admin, &10u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 9);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 1000;
+
+    // First relayed spend succeeds and records the current ledger.
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 0,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &signature,
+    );
+
+    // Second relayed spend within the interval (same ledger) is rejected.
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 1,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &t.seller,
+            &1u64,
+            &expiration_ledger,
+            &signature,
+        ),
+        Err(Ok(PermissionError::VelocityLimitExceeded))
+    );
+
+    // After the interval elapses, a relayed spend succeeds again. The rejected
+    // spend above never advanced the nonce, so it is still 1.
+    t.env.ledger().with_mut(|li| {
+        li.sequence_number += 10;
+    });
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 1,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &1u64,
+        &expiration_ledger,
+        &signature,
+    );
+    // Only the first and third relayed spends succeeded (40 total spent).
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 960);
+}
+
 #[test]
 fn test_execute_spend_via_relayer_rejects_replayed_nonce() {
     let t = TestEnv::setup();
