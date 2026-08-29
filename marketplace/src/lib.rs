@@ -166,6 +166,9 @@ pub struct MerchantUnsuspendedEvent {
 pub struct MerchantClosedEvent {
     pub merchant_id: u64,
     pub closed_by: Address,
+    pub reason: Symbol,
+    pub name: String,
+    pub category: Symbol,
 }
 
 #[contracttype]
@@ -1031,6 +1034,7 @@ impl MarketplaceContract {
         env: Env,
         admin: Address,
         merchant_id: u64,
+        reason: Symbol,
     ) -> Result<(), MarketplaceError> {
         admin.require_auth();
         let current_admin = Self::get_admin(env.clone())?;
@@ -1051,6 +1055,9 @@ impl MarketplaceContract {
             MerchantClosedEvent {
                 merchant_id,
                 closed_by: admin,
+                reason,
+                name: merchant.name.clone(),
+                category: merchant.category,
             },
         );
 

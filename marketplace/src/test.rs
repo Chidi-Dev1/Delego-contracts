@@ -467,7 +467,7 @@ fn test_suspension_closing_and_mutation_locking() {
     assert_eq!(f.client.get_commission(&id), 150);
 
     // Admin closes merchant permanently
-    f.client.close_merchant(&f.admin, &id);
+    f.client.close_merchant(&f.admin, &id, &symbol_short!("bad_conduct"));
     let closed = f.client.get_merchant(&id);
     assert_eq!(closed.status, MerchantStatus::Closed);
 
