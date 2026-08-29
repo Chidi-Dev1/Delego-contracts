@@ -408,3 +408,27 @@ fn test_version_history_is_stored() {
     assert_eq!(first_snapshot.version, 1);
     assert_eq!(first_snapshot.record.status, DelegationStatus::Active);
 }
+
+#[test]
+fn test_rollback_cannot_revive_past_expiry_snapshot() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Past_Expiry");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+
+    // Create a second version so there is a v1 snapshot to roll back to.
+    client.pause_delegation(&id);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Paused);
+
+    // Advance the ledger past the original expiry (created at 100, ttl 100 => expires at 200).
+    env.ledger().set_sequence_number(300);
+
+    // Rolling back to the Active v1 snapshot must NOT revive a delegation
+    // that has already expired; it should be marked Expired instead.
+    client.rollback_delegation(&id, &1u32);
+
+    let record = client.get_delegation(&id);
+    assert_eq!(record.status, DelegationStatus::Expired);
+}
