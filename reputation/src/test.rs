@@ -908,6 +908,34 @@ fn test_resolve_flag_missing() {
     assert_eq!(res, Err(Ok(ReputationError::EntityNotFound)));
 }
 
+#[test]
+fn test_resolve_flag_no_active_flag() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
+
+    let res = client.try_resolve_flag(&admin, &reporter, &entity);
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
+}
+
+#[test]
+fn test_resolve_flag_not_flag_reporter() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let other_reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
+    make_transacting_counterparty(&client, &admin, &entity, &other_reporter, 2u64);
+
+    client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
+
+    let res = client.try_resolve_flag(&admin, &other_reporter, &entity);
+    assert_eq!(res, Err(Ok(ReputationError::NotFlagReporter)));
+}
+
 // --- freeze / unfreeze ---
 
 #[test]
