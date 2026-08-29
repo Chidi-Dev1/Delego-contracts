@@ -1065,25 +1065,11 @@ impl PermissionsContract {
             merchant.clone(),
         )?;
 
-        // #324: Velocity check — reject if min_spend_interval has not yet elapsed
+        // #54: Velocity check — reject if min_spend_interval has not yet elapsed
         // since the last recorded spend ledger for this (owner, delegate) pair.
+        Self::check_velocity(&env, &owner, &delegate)?;
+
         let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
-        if let Some(last_ledger) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, u32>(&velocity_key)
-        {
-            if let Some(min_interval) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u32>(&DataKey::MinSpendInterval)
-            {
-                let current = env.ledger().sequence();
-                if current < last_ledger + min_interval {
-                    return Err(PermissionError::VelocityLimitExceeded);
-                }
-            }
-        }
 
         let key = DataKey::Permission(owner.clone(), delegate.clone());
         let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
@@ -1142,6 +1128,37 @@ impl PermissionsContract {
             env.storage().persistent().set(&parent_key, &parent_record);
         }
 
+        Ok(())
+    }
+
+    /// Rejects a spend when the configured velocity limit (`MinSpendInterval`)
+    /// has not yet elapsed since the last recorded spend ledger for this
+    /// (owner, delegate) pair (issue #54). Called from both `execute_spend`
+    /// and `execute_spend_via_relayer` before the new spend is recorded, so
+    /// direct and relayed spends share the same throttle. No-op when no
+    /// interval has been configured or no prior spend exists.
+    fn check_velocity(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+    ) -> Result<(), PermissionError> {
+        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
+        if let Some(last_ledger) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&velocity_key)
+        {
+            if let Some(min_interval) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u32>(&DataKey::MinSpendInterval)
+            {
+                let current = env.ledger().sequence();
+                if current < last_ledger + min_interval {
+                    return Err(PermissionError::VelocityLimitExceeded);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1236,6 +1253,10 @@ impl PermissionsContract {
             amount,
             merchant.clone(),
         )?;
+
+        // #54: Relayed spends are subject to the same velocity limit as direct
+        // spends — reject if min_spend_interval has not yet elapsed.
+        Self::check_velocity(&env, &owner, &delegate)?;
 
         let perm_key = DataKey::Permission(owner.clone(), delegate.clone());
         let mut record: PermissionRecord = env.storage().persistent().get(&perm_key).unwrap();
