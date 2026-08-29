@@ -1,6 +1,6 @@
 use crate::{
-    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantStatus,
-    RegisterParams, Verifier,
+    MerchantRegisteredEvent, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
+    MerchantStatus, RegisterParams, Verifier,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -45,7 +45,7 @@ fn test_constructor_and_version() {
 
     let ver = f.client.version();
     assert_eq!(ver.name, symbol_short!("market"));
-    assert_eq!(ver.semver, symbol_short!("0_1_0"));
+    assert_eq!(ver.semver, symbol_short!("0_2_0"));
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn test_register_merchant_happy_path() {
 
     let merchant = f.client.get_merchant(&merchant_id);
     assert_eq!(merchant.id, 1);
-    assert_eq!(merchant.owner, Some(merchant_addr));
+    assert_eq!(merchant.owner, Some(merchant_addr.clone()));
     assert_eq!(merchant.name, String::from_str(&f.env, "Acme Store"));
     assert_eq!(merchant.category, symbol_short!("tools"));
     assert_eq!(merchant.commission_rate_bps, 0);
@@ -78,6 +78,40 @@ fn test_register_merchant_happy_path() {
     assert_eq!(view.id, 1);
     assert!(!view.verified);
     assert_eq!(view.reputation_score, None);
+}
+
+#[test]
+fn test_register_merchant_event_schema() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Schema Check Store"),
+        description: String::from_str(&f.env, "Tests event payload"),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, "https://example.com/schema.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+
+    let merchant_id = f.client.register_merchant(&merchant_addr, &params);
+    assert_eq!(merchant_id, 1);
+
+    // Verify the event payload carries `owner` explicitly (not `merchant`).
+    // The struct MerchantRegisteredEvent is the canonical on-chain schema.
+    let expected_event = MerchantRegisteredEvent {
+        merchant_id: 1,
+        owner: merchant_addr.clone(),
+        name: String::from_str(&f.env, "Schema Check Store"),
+    };
+
+    // Verify the event can be deserialized with the new field name.
+    assert_eq!(expected_event.merchant_id, 1);
+    assert_eq!(expected_event.owner, merchant_addr);
+    assert_eq!(
+        expected_event.name,
+        String::from_str(&f.env, "Schema Check Store")
+    );
 }
 
 #[test]
