@@ -327,6 +327,55 @@ mod test {
         assert_eq!(res, Err(Ok(EscrowError::NotFound)));
     }
 
+    // ─── TTL Bumping on Escrow Reads ──────────────────────────────────────────
+
+    // A long-lived, open escrow must not be evicted while it is still being read.
+    // The read paths (e.g. `get_escrow`) are expected to `extend_ttl` on the
+    // `Escrow(id)` persistent key. This test creates an escrow, advances the
+    // ledger toward the TTL boundary, reads it (which should bump the TTL), then
+    // advances further and asserts the record is still live and readable.
+    #[test]
+    fn test_get_escrow_bumps_ttl_across_expiry_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        // Register and whitelist a token, then fund the buyer.
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        client.add_token(&admin, &token);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin_client =
+            soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &1_000_000i128);
+
+        let order_id = BytesN::from_array(&env, &[7u8; 32]);
+        // Amount stays within the [100, 1_000_000] limits configured in setup.
+        let escrow_id = client.create(
+            &buyer, &seller, &token, &1000i128, &order_id, &1000u32, &None, &None,
+        );
+
+        // Advance the ledger close to the persistent TTL boundary, then read the
+        // escrow so the read path refreshes (bumps) its TTL.
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 100_000;
+        });
+        let before = client.get_escrow(&escrow_id);
+
+        // Advance again past what would have been the original expiry. Because the
+        // read above bumped the TTL, the record must still be live and readable.
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 100_000;
+        });
+        let after = client.get_escrow(&escrow_id);
+
+        assert_eq!(before, after);
+    }
+
     // ─── Issue #172: Escrow Creation Metadata Hash Tests ─────────────────────
 
     #[test]
