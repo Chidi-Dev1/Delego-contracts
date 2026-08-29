@@ -112,6 +112,7 @@ pub enum DelegationError {
     InvalidVersion = 6,
     VersionNotLower = 7,
     SnapshotNotFound = 8,
+    InvalidAgentId = 9,
 }
 
 #[contract]
@@ -142,8 +143,15 @@ impl DelegationRegistry {
         permissions_contract: Address,
         label: Symbol,
         ttl_ledgers: u32,
-    ) -> u64 {
+    ) -> Result<u64, DelegationError> {
         owner.require_auth();
+
+        // Reject the all-zero sentinel agent id so authorization records
+        // can never be seeded with a dead id, keeping is_authorized
+        // failing closed.
+        if agent_id == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(DelegationError::InvalidAgentId);
+        }
 
         let id = env
             .storage()
@@ -215,7 +223,7 @@ impl DelegationRegistry {
             },
         );
 
-        id
+        Ok(id)
     }
 
     pub fn pause_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {

@@ -89,6 +89,25 @@ fn test_unauthorized_access() {
 // ── #322 Typed-error tests ──────────────────────────────────────────────────
 
 #[test]
+fn test_zero_agent_id_rejected_with_typed_error() {
+    let (env, client, _, owner, _, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let zero_agent_id = BytesN::from_array(&env, &[0u8; 32]);
+    let label = Symbol::new(&env, "Zero_Agent");
+
+    // The all-zero sentinel must be refused at creation — it would otherwise
+    // seed an authorization record with a dead id.
+    let result =
+        client.try_create_delegation(&owner, &zero_agent_id, &permissions_contract, &label, &1000);
+    assert_eq!(result, Err(Ok(DelegationError::InvalidAgentId)));
+
+    // No delegation record may exist for the refused id.
+    let records = client.get_delegations_by_owner(&owner);
+    assert_eq!(records.len(), 0);
+}
+
+#[test]
 fn test_resume_active_fails_with_typed_error() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
