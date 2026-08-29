@@ -199,6 +199,11 @@ const MAX_HALVINGS: u64 = 13;
 /// how large an entity's lifetime history grows.
 const SCORE_WINDOW: u32 = 200;
 
+/// Persistent entries are bumped when they approach expiry and kept alive
+/// for roughly 30 days, matching the repository's persistent-storage policy.
+const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
+const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
+
 /// Maps a transaction outcome to its contribution toward `score`, in basis
 /// points, per the reputation score formula.
 fn outcome_value_bps(outcome: &TransactionOutcome) -> i128 {
@@ -322,6 +327,11 @@ impl ReputationContract {
             recorded_at: env.ledger().timestamp(),
         };
         env.storage().persistent().set(&record_key, &record);
+        env.storage().persistent().extend_ttl(
+            &record_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
         if existing.is_none() {
             let hist_key = DataKey::TransactionHistory(entity.clone());
