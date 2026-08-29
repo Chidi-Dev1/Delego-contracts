@@ -2420,6 +2420,9 @@ mod test {
             PermissionError::ExceedsParentLimit as u32,
             PermissionError::VelocityLimitExceeded as u32,
             PermissionError::InactivityThresholdNotSet as u32,
+            PermissionError::LimitBelowSpent as u32,
+            PermissionError::ExceedsAllowance as u32,
+            PermissionError::NotInitialized as u32,
         ];
 
         let mut seen = std::vec::Vec::<u32>::new();
@@ -2431,7 +2434,7 @@ mod test {
             );
             seen.push(val);
         }
-        assert_eq!(seen.len(), 21, "expected 21 distinct error discriminants");
+        assert_eq!(seen.len(), 24, "expected 24 distinct error discriminants");
     }
 
     #[test]
@@ -2458,6 +2461,9 @@ mod test {
             PermissionError::ExceedsParentLimit,
             PermissionError::VelocityLimitExceeded,
             PermissionError::InactivityThresholdNotSet,
+            PermissionError::LimitBelowSpent,
+            PermissionError::ExceedsAllowance,
+            PermissionError::NotInitialized,
         ];
 
         let mut seen = std::vec::Vec::<u32>::new();
@@ -2471,7 +2477,7 @@ mod test {
             );
             seen.push(serialized);
         }
-        assert_eq!(seen.len(), 21, "expected 21 distinct error variants");
+        assert_eq!(seen.len(), 24, "expected 24 distinct error variants");
     }
 
     // --- PermissionUsage & get_permission_usage tests ---
