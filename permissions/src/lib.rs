@@ -29,6 +29,10 @@ pub const MAX_AUDIT_ENTRIES: u32 = 200;
 /// effectively disable spending forever with no clear signal, so it is
 /// rejected outright.
 pub const MAX_VELOCITY_INTERVAL: u32 = 6_307_200;
+/// Default allowance-decrease timelock in seconds (24 hours).
+pub const DEFAULT_DECREASE_TIMELOCK_SECS: u64 = 86_400;
+/// Maximum configurable allowance-decrease timelock (30 days).
+pub const MAX_DECREASE_TIMELOCK_SECS: u64 = 2_592_000;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -569,6 +573,8 @@ pub enum DataKey {
     InactivityThreshold,
     /// Instance-level minimum number of ledgers between successive spends (velocity limit).
     MinSpendInterval,
+    /// Instance-level delay in seconds before a scheduled allowance decrease can execute.
+    DecreaseTimelockSecs,
     /// Last ledger on which a spend was executed for a (owner, delegate) pair.
     LastSpendLedger(Address, Address),
     /// Append-only audit log for a (owner, delegate) pair.
@@ -2062,7 +2068,7 @@ impl PermissionsContract {
             return Err(PermissionError::PendingDecreaseExists);
         }
 
-        let execution_time = env.ledger().timestamp() + 86400;
+        let execution_time = env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
 
         let pending = PendingAllowanceDecrement {
             amount,
@@ -2479,6 +2485,33 @@ impl PermissionsContract {
     /// spends for any delegation pair (#324). Admin-only.
     ///
     /// Set `interval` to `0` to disable velocity limiting.
+    /// Configure the delay before a scheduled allowance decrease can execute.
+    /// Admin-only; values are bounded to prevent disabling the security delay.
+    pub fn set_decrease_timelock_secs(
+        env: Env,
+        admin: Address,
+        secs: u64,
+    ) -> Result<(), PermissionError> {
+        Self::require_admin(&env, &admin)?;
+
+        if secs == 0 || secs > MAX_DECREASE_TIMELOCK_SECS {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DecreaseTimelockSecs, &secs);
+        Ok(())
+    }
+
+    /// Returns the configured allowance-decrease timelock in seconds.
+    pub fn get_decrease_timelock_secs(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DecreaseTimelockSecs)
+            .unwrap_or(DEFAULT_DECREASE_TIMELOCK_SECS)
+    }
+
     pub fn set_velocity_limit(
         env: Env,
         admin: Address,
