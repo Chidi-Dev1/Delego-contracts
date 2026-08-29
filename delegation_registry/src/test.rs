@@ -535,4 +535,3 @@ fn test_revoke_paused_delegation_returns_true() {
     assert!(!repeat_result);
     assert_eq!(client.get_delegation_version(&id), 3);
 }
-

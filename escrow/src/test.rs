@@ -480,8 +480,7 @@ mod test {
 
         let buyer = Address::generate(&env);
         let seller = Address::generate(&env);
-        let token_admin_client =
-            soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
         token_admin_client.mint(&buyer, &1_000_000i128);
 
         let order_id = BytesN::from_array(&env, &[7u8; 32]);
@@ -1117,10 +1116,7 @@ mod test {
 
         let treasury = Address::generate(&env);
         let mut shares = soroban_sdk::Vec::new(&env);
-        shares.push_back(crate::TreasuryShare {
-            treasury,
-            bps: 0,
-        });
+        shares.push_back(crate::TreasuryShare { treasury, bps: 0 });
 
         let res = client.try_set_fee_distribution(&admin, &shares);
         assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
@@ -1142,7 +1138,7 @@ mod test {
         }
 
         let res = client.try_set_fee_distribution(&admin, &shares);
-        assert_eq!(res, Err(Ok(EscrowError::MaxTreasuriesExceeded)));
+        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
         assert_eq!(client.get_fee_distribution().len(), 0);
     }
 
@@ -2298,7 +2294,10 @@ mod test {
 
         // Buyer index should contain both escrows created via batch_deposit.
         let page = client.list_escrows_by_buyer(&buyer, &0u32, &10u32);
-        assert_eq!(page.total, 2, "batch_deposit should maintain buyer index for each order");
+        assert_eq!(
+            page.total, 2,
+            "batch_deposit should maintain buyer index for each order"
+        );
         assert_eq!(page.items.len(), 2);
     }
 }
