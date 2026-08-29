@@ -107,6 +107,10 @@ pub enum ReputationError {
     /// Same reporter already flagged.
     AlreadyFlagged = 8,
     InvalidParam = 9,
+    /// No flags exist for this entity.
+    NoActiveFlag = 10,
+    /// The caller is not the reporter who flagged this entity.
+    NotFlagReporter = 11,
 }
 
 #[contracttype]
@@ -668,10 +672,16 @@ impl ReputationContract {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
 
-        let idx = flags
-            .iter()
-            .position(|f| f.reporter == reporter && !f.resolved)
-            .ok_or(ReputationError::EntityNotFound)?;
+        // Distinguish between "no flags exist at all" and "flags exist but
+        // none are from this reporter" so callers get a precise error.
+        let idx = if flags.is_empty() {
+            return Err(ReputationError::NoActiveFlag);
+        } else {
+            flags
+                .iter()
+                .position(|f| f.reporter == reporter && !f.resolved)
+                .ok_or(ReputationError::NotFlagReporter)?
+        };
         let mut flag = flags.get(idx as u32).unwrap();
         flag.resolved = true;
         flags.set(idx as u32, flag);

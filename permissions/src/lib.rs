@@ -1404,8 +1404,6 @@ impl PermissionsContract {
         // since the last recorded spend ledger for this (owner, delegate) pair.
         Self::check_velocity(&env, &owner, &delegate)?;
 
-        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
-
         let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         // Emit after successful spend only (issue #99).
@@ -1643,6 +1641,12 @@ impl PermissionsContract {
             amount,
             merchant.clone(),
         )?;
+
+        // #54: Velocity check — reject if min_spend_interval has not yet elapsed
+        // since the last recorded spend ledger for this (owner, delegate) pair.
+        // Shared with execute_spend so direct and relayed spends share the
+        // same throttle (issue #179).
+        Self::check_velocity(&env, &owner, &delegate)?;
 
         // Advance the nonce before mutating spend state so a replay attempt
         // within the same ledger is rejected even if apply_spend panics.

@@ -913,7 +913,7 @@ fn test_resolve_flag_missing() {
     let reporter = Address::generate(&env);
 
     let res = client.try_resolve_flag(&admin, &reporter, &entity);
-    assert_eq!(res, Err(Ok(ReputationError::EntityNotFound)));
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
 }
 
 #[test]

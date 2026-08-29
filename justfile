@@ -22,3 +22,8 @@ fmt-check:
 
 check: lint fmt-check
     cargo check --workspace
+
+# Run every CI check locally in the same order as the GitHub Actions
+# workflow.  A single `just ci` should catch every failure before pushing.
+ci: fmt-check lint test build-wasm
+    echo "✅ all CI checks passed"
