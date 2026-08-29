@@ -895,3 +895,31 @@ impl ReputationContract {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod config_parity_test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn get_config_matches_constructor_config() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let config = ReputationConfig {
+            decay_window_seconds: 86_400,
+            min_transactions_threshold: 5,
+            dispute_penalty_bps: 250,
+            freeze_threshold_flags: 3,
+        };
+
+        let contract_id = env.register(ReputationContract, (admin, config.clone()));
+
+        let stored: ReputationConfig = env.invoke_contract(
+            &contract_id,
+            &Symbol::new(&env, "get_config"),
+            (),
+        );
+
+        assert_eq!(stored, config);
+    }
+}
