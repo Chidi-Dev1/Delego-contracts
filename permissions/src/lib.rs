@@ -560,6 +560,8 @@ pub enum DataKey {
     LastSpendLedger(Address, Address),
     /// Append-only audit log for a (owner, delegate) pair.
     AuditLog(Address, Address),
+    /// Index of delegate addresses granted by a given owner.
+    UserPermissions(Address),
 }
 
 #[contract]
@@ -609,6 +611,17 @@ impl PermissionsContract {
         Self::validate_merchant_list(&env, &allowed_merchants)?;
 
         let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
+
+        let user_perms_key = DataKey::UserPermissions(owner.clone());
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&user_perms_key)
+            .unwrap_or(Vec::new(&env));
+        if !delegates.contains(&delegate) {
+            delegates.push_back(delegate.clone());
+            env.storage().persistent().set(&user_perms_key, &delegates);
+        }
 
         let record = PermissionRecord {
             owner: owner.clone(),
@@ -791,6 +804,17 @@ impl PermissionsContract {
             .persistent()
             .get::<DataKey, PermissionRecord>(&key)
         {
+            let user_perms_key = DataKey::UserPermissions(owner.clone());
+            let mut delegates: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&user_perms_key)
+                .unwrap_or(Vec::new(&env));
+            if let Some(index) = delegates.first_index_of(&delegate) {
+                delegates.remove(index);
+                env.storage().persistent().set(&user_perms_key, &delegates);
+            }
+
             record.status = PermissionStatus::Revoked;
             env.storage().persistent().set(&key, &record);
             env.storage()
@@ -887,6 +911,22 @@ impl PermissionsContract {
         if env.storage().persistent().has(&new_key) {
             return Err(PermissionError::InvalidParam);
         }
+
+        let user_perms_key = DataKey::UserPermissions(owner.clone());
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&user_perms_key)
+            .unwrap_or(Vec::new(&env));
+
+        if let Some(index) = delegates.first_index_of(&old_delegate) {
+            delegates.remove(index);
+        }
+
+        if !delegates.contains(&new_delegate) {
+            delegates.push_back(new_delegate.clone());
+        }
+        env.storage().persistent().set(&user_perms_key, &delegates);
 
         // Store the new permission
         env.storage().persistent().set(&new_key, &new_record);
@@ -1754,6 +1794,26 @@ impl PermissionsContract {
                 }
             }
         }
+    }
+
+    pub fn get_permissions_by_owner(env: Env, owner: Address) -> Vec<PermissionRecord> {
+        let delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserPermissions(owner.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        let mut records = Vec::new(&env);
+        for delegate in delegates.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Permission(owner.clone(), delegate))
+            {
+                records.push_back(record);
+            }
+        }
+        records
     }
 
     pub fn get_permission(env: Env, owner: Address, delegate: Address) -> PermissionRecord {
