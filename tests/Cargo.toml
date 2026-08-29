@@ -15,6 +15,7 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 delego-escrow = { path = "../escrow", features = ["testutils"] }
 delego-permissions = { path = "../permissions", features = ["testutils"] }
 delego-reputation = { path = "../reputation", features = ["testutils"] }
+ed25519-dalek = "2"
 
 [[test]]
 name = "cross_contract"

@@ -2,7 +2,6 @@
 //! Spending limits, delegated authority, and time-locked allowance decrements
 
 #![cfg_attr(not(test), no_std)]
-#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, BytesN,
     Env, Symbol, Vec,
@@ -20,6 +19,16 @@ pub const CONTRACT_SEMVER: &str = "0_1_0";
 /// Prevents overly large merchant lists from increasing storage and execution
 /// costs unexpectedly.
 pub const MAX_MERCHANTS_PER_PERMISSION: u32 = 25;
+
+/// Maximum number of entries retained in a single (owner, delegate) pair's
+/// audit log. Once exceeded, the oldest entry is dropped on each append so
+/// long-lived permissions don't accrue unbounded storage.
+pub const MAX_AUDIT_ENTRIES: u32 = 200;
+/// Upper bound on the velocity limit's minimum-spend-interval, in ledgers.
+/// At ~5s per ledger this is roughly one year; anything above this would
+/// effectively disable spending forever with no clear signal, so it is
+/// rejected outright.
+pub const MAX_VELOCITY_INTERVAL: u32 = 6_307_200;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -54,6 +63,8 @@ pub enum PermissionError {
     InvalidNonce = 13,
     /// Relayer-submitted signature has expired
     SignatureExpired = 14,
+    /// A live permission already exists; use `re_grant` to replace it explicitly (issue #51)
+    AlreadyGranted = 15,
     /// Owner and delegate cannot be the same address
     SelfDelegationNotAllowed = 401,
     /// Fewer valid owner signatures were provided than the configured threshold
@@ -72,6 +83,11 @@ pub enum PermissionError {
     PendingDecreaseExists = 408,
     /// Time-lock on pending allowance decrease has not elapsed yet
     TimeLockActive = 409,
+    /// A multi-owner spend accumulation would overflow or exceed the
+    /// permission's total allowance
+    ExceedsAllowance = 410,
+    /// Admin-gated call made before `set_admin` has ever been called
+    NotInitialized = 500,
 }
 
 #[contracttype]
@@ -169,6 +185,14 @@ pub struct PermissionGrantedEvent {
     pub delegate: Address,
     pub per_tx_limit: i128,
     pub total_limit: i128,
+    /// Amount the previous record for `(owner, delegate)` had already spent
+    /// before this (re-)grant. `0` for a first grant with no prior record.
+    /// Lets consumers see that a re-grant reset spend accounting (issue #51).
+    pub previous_spent: i128,
+    /// Change in remaining allowance caused by this (re-)grant, i.e. the new
+    /// total limit minus the previous remaining allowance. Positive when more
+    /// spending power was added, negative when it was reduced (issue #51).
+    pub remaining_delta: i128,
     pub expires_at_ledger: u32,
     pub merchant_count: u32,
 }
@@ -315,7 +339,8 @@ pub struct AllowanceIncreasedEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct VelocityLimitSetEvent {
-    pub min_spend_interval: u32,
+    pub previous: Option<u32>,
+    pub current: u32,
     pub set_by: Address,
 }
 
@@ -327,6 +352,45 @@ pub struct PermissionExpiryUpdatedEvent {
     pub delegate: Address,
     pub old_expiry: u32,
     pub new_expiry: u32,
+}
+
+/// Emitted by `set_relayer_key` whenever a delegate's relayer signing key
+/// is registered or rotated, so a key swap (e.g. from a compromised
+/// delegate) leaves an on-chain trace.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RelayerKeyChangedEvent {
+    pub delegate: Address,
+    pub old_key: Option<BytesN<32>>,
+    pub new_key: BytesN<32>,
+}
+
+/// Emitted by `renew_permission` when a renewal's requested extension would
+/// overflow `u32` and is instead capped at `u32::MAX`, so callers get an
+/// explicit signal rather than a silently saturated expiry.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PermissionExpiryCappedEvent {
+    pub owner: Address,
+    pub delegate: Address,
+    pub capped_at: u32,
+}
+
+/// Emitted by `propose_admin` when the current admin proposes a successor
+/// as part of the two-step admin transfer.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AdminProposedEvent {
+    pub current_admin: Address,
+    pub new_admin: Address,
+}
+
+/// Emitted by `accept_admin` once the proposed successor accepts the role.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AdminAcceptedEvent {
+    pub previous_admin: Address,
+    pub new_admin: Address,
 }
 
 /// A single entry in the on-chain audit log for a (owner, delegate) pair.
@@ -352,6 +416,26 @@ pub struct DelegateStatusView {
     pub active: bool,
     pub reason: Symbol,
     pub remaining: i128,
+}
+
+/// Status view that surfaces `PermissionStatus` explicitly rather than only
+/// a derived `active`/`reason` pair, so callers can distinguish e.g.
+/// "revoked" from "no budget left" without relying on `reason` string
+/// matching.
+///
+/// `remaining` is `0` for every non-`Active` state (matching
+/// `DelegateStatusView`'s existing convention) — it does not reflect the
+/// permission's underlying allowance once it is no longer spendable.
+/// `expires_at_ledger` is always the record's stored expiry regardless of
+/// status, or `0` when no permission record exists for this pair.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegateStatusV2 {
+    pub owner: Address,
+    pub delegate: Address,
+    pub status: PermissionStatus,
+    pub remaining: i128,
+    pub expires_at_ledger: u32,
 }
 
 ///
@@ -403,6 +487,25 @@ pub struct PermissionUsageStats {
     pub last_spend_ledger: u32,
 }
 
+/// Non-truncating usage telemetry view (issue: add spend-count and
+/// BPS-denominated average to usage stats).
+///
+/// `average_spent_bps` is `total_spent * 10_000 / spend_count`, i.e. the
+/// average spend amount expressed in basis points of a single unit, which
+/// preserves precision that plain integer-division of `average_spend`
+/// would otherwise round away for small or skewed spend counts. Both this
+/// and `average_spend` use truncating integer division; callers needing
+/// the exact fractional remainder should derive it from `total_spent` and
+/// `spend_count` directly.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageStatsView {
+    pub spend_count: u64,
+    pub total_spent: i128,
+    pub average_spent_bps: u64,
+    pub last_spend_ledger: Option<u32>,
+}
+
 /// Tracks the total spent amount and most recent spend ledger for audit and freshness checks.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -420,6 +523,14 @@ pub struct MerchantRestriction {
     pub owner: Address,
     pub delegate: Address,
     pub merchant: Option<Address>,
+}
+
+/// Full merchant whitelist for a delegation pair, bounded by
+/// `MAX_MERCHANTS_PER_PERMISSION`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRestrictionView {
+    pub merchants: Vec<Address>,
 }
 
 #[contracttype]
@@ -462,13 +573,27 @@ pub enum DataKey {
     LastSpendLedger(Address, Address),
     /// Append-only audit log for a (owner, delegate) pair.
     AuditLog(Address, Address),
+    /// Index of delegate addresses granted by a given owner.
+    UserPermissions(Address),
 }
 
 #[contract]
 pub struct PermissionsContract;
 
+// The `#[contractimpl]` macro generates client/wrapper functions that mirror
+// the ABI entry-point signatures above; they cannot be annotated individually
+// from user code, so the allow lives on the impl block for those generated
+// wrappers only. User-defined functions carry their own scoped allows.
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl PermissionsContract {
+    /// Records a (owner, delegate) delegation as a **first grant**.
+    ///
+    /// A plain `grant` refuses to silently overwrite a live permission
+    /// (issue #51): if an Active/Paused record already exists for this
+    /// `(owner, delegate)` pair, it returns [`PermissionError::AlreadyGranted`]
+    /// instead of resetting its spend accounting. Callers that deliberately
+    /// want to replace an existing delegation must use [`Self::re_grant`].
     pub fn grant(
         env: Env,
         owner: Address,
@@ -477,6 +602,64 @@ impl PermissionsContract {
         limit_per_tx: i128,
         allowed_merchants: Vec<Address>,
         ttl_ledgers: u32,
+    ) -> Result<(), PermissionError> {
+        Self::grant_impl(
+            env,
+            owner,
+            delegate,
+            limit_total,
+            limit_per_tx,
+            allowed_merchants,
+            ttl_ledgers,
+            false,
+        )
+    }
+
+    /// Explicitly replaces an existing delegation's terms (issue #51).
+    ///
+    /// Unlike [`Self::grant`], this is permitted on a live (Active/Paused)
+    /// permission. The emitted [`PermissionGrantedEvent`] carries the previous
+    /// record's `spent` (as `previous_spent`) and the resulting change in
+    /// remaining allowance (as `remaining_delta`), so spend accounting is
+    /// never erased without a distinguishable signal.
+    ///
+    /// Fails with [`PermissionError::PermissionNotFound`] if no permission
+    /// exists yet for `(owner, delegate)` — use `grant` for a first grant.
+    pub fn re_grant(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        limit_total: i128,
+        limit_per_tx: i128,
+        allowed_merchants: Vec<Address>,
+        ttl_ledgers: u32,
+    ) -> Result<(), PermissionError> {
+        Self::grant_impl(
+            env,
+            owner,
+            delegate,
+            limit_total,
+            limit_per_tx,
+            allowed_merchants,
+            ttl_ledgers,
+            true,
+        )
+    }
+
+    /// Shared implementation for `grant` / `re_grant`.
+    ///
+    /// `re_grant` opts the caller into replacing an existing live permission
+    /// and reports the previous spent / remaining delta on the event so spend
+    /// accounting is never silently discarded.
+    fn grant_impl(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        limit_total: i128,
+        limit_per_tx: i128,
+        allowed_merchants: Vec<Address>,
+        ttl_ledgers: u32,
+        re_grant: bool,
     ) -> Result<(), PermissionError> {
         owner.require_auth();
 
@@ -510,7 +693,44 @@ impl PermissionsContract {
         // Validate merchant whitelist bounds and uniqueness.
         Self::validate_merchant_list(&env, &allowed_merchants)?;
 
+        // Issue #51: distinguish a first grant from a re-grant. A plain grant
+        // must not silently overwrite a live delegation and reset its spend
+        // accounting; only an explicit re-grant replaces it, and it reports
+        // the previous spent amount and the remaining-allowance delta.
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let existing: Option<PermissionRecord> = env.storage().persistent().get(&key);
+        let (previous_spent, old_remaining) = match &existing {
+            Some(r) => (r.spent, r.limit_total - r.spent),
+            None => (0, 0),
+        };
+        match &existing {
+            Some(r)
+                if !re_grant
+                    && matches!(
+                        r.status,
+                        PermissionStatus::Active | PermissionStatus::Paused
+                    ) =>
+            {
+                return Err(PermissionError::AlreadyGranted);
+            }
+            None if re_grant => {
+                return Err(PermissionError::PermissionNotFound);
+            }
+            _ => {}
+        }
+
         let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
+
+        let user_perms_key = DataKey::UserPermissions(owner.clone());
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&user_perms_key)
+            .unwrap_or(Vec::new(&env));
+        if !delegates.contains(&delegate) {
+            delegates.push_back(delegate.clone());
+            env.storage().persistent().set(&user_perms_key, &delegates);
+        }
 
         let record = PermissionRecord {
             owner: owner.clone(),
@@ -526,10 +746,13 @@ impl PermissionsContract {
             parent_delegate: None,
         };
 
-        env.storage().persistent().set(
-            &DataKey::Permission(owner.clone(), delegate.clone()),
-            &record,
-        );
+        env.storage().persistent().set(&key, &record);
+
+        // Change in usable allowance caused by this (re-)grant. For a first
+        // grant `old_remaining` is 0 so this equals the new total limit; for a
+        // re-grant it reflects how much more (or less) the delegate can spend
+        // than before.
+        let remaining_delta = limit_total - old_remaining;
 
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("granted")),
@@ -538,6 +761,8 @@ impl PermissionsContract {
                 delegate: delegate.clone(),
                 per_tx_limit: limit_per_tx,
                 total_limit: limit_total,
+                previous_spent,
+                remaining_delta,
                 expires_at_ledger,
                 merchant_count: allowed_merchants.len(),
             },
@@ -552,13 +777,12 @@ impl PermissionsContract {
             },
         );
 
-        Self::append_audit_log(
-            &env,
-            &owner,
-            &delegate,
-            owner.clone(),
-            symbol_short!("granted"),
-        );
+        let action = if re_grant {
+            symbol_short!("regranted")
+        } else {
+            symbol_short!("granted")
+        };
+        Self::append_audit_log(&env, &owner, &delegate, owner.clone(), action);
 
         Ok(())
     }
@@ -676,6 +900,8 @@ impl PermissionsContract {
                 delegate: child_delegate,
                 per_tx_limit: limit_per_tx,
                 total_limit: limit_total,
+                previous_spent: 0,
+                remaining_delta: limit_total,
                 expires_at_ledger,
                 merchant_count: allowed_merchants.len(),
             },
@@ -693,6 +919,17 @@ impl PermissionsContract {
             .persistent()
             .get::<DataKey, PermissionRecord>(&key)
         {
+            let user_perms_key = DataKey::UserPermissions(owner.clone());
+            let mut delegates: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&user_perms_key)
+                .unwrap_or(Vec::new(&env));
+            if let Some(index) = delegates.first_index_of(&delegate) {
+                delegates.remove(index);
+                env.storage().persistent().set(&user_perms_key, &delegates);
+            }
+
             record.status = PermissionStatus::Revoked;
             env.storage().persistent().set(&key, &record);
             env.storage()
@@ -790,6 +1027,22 @@ impl PermissionsContract {
             return Err(PermissionError::InvalidParam);
         }
 
+        let user_perms_key = DataKey::UserPermissions(owner.clone());
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&user_perms_key)
+            .unwrap_or(Vec::new(&env));
+
+        if let Some(index) = delegates.first_index_of(&old_delegate) {
+            delegates.remove(index);
+        }
+
+        if !delegates.contains(&new_delegate) {
+            delegates.push_back(new_delegate.clone());
+        }
+        env.storage().persistent().set(&user_perms_key, &delegates);
+
         // Store the new permission
         env.storage().persistent().set(&new_key, &new_record);
 
@@ -856,8 +1109,22 @@ impl PermissionsContract {
             // Store old expiry for audit log
             let old_expires = record.expires_at_ledger;
 
-            // Extend TTL
-            record.expires_at_ledger = record.expires_at_ledger.saturating_add(additional_ledgers);
+            // Extend TTL, explicitly signalling rather than silently
+            // saturating if the extension would overflow u32.
+            record.expires_at_ledger = match old_expires.checked_add(additional_ledgers) {
+                Some(new_expiry) => new_expiry,
+                None => {
+                    env.events().publish(
+                        (symbol_short!("perm"), symbol_short!("exp_cap")),
+                        PermissionExpiryCappedEvent {
+                            owner: owner.clone(),
+                            delegate: delegate.clone(),
+                            capped_at: u32::MAX,
+                        },
+                    );
+                    u32::MAX
+                }
+            };
 
             // Persist the updated record (spent counter preserved)
             env.storage().persistent().set(&key, &record);
@@ -947,6 +1214,23 @@ impl PermissionsContract {
         Ok(())
     }
 
+    /// Requires that `caller` is authorized and matches the stored admin.
+    /// Returns `PermissionError::NotInitialized` (never panics) if
+    /// `set_admin` has not yet been called, and `Unauthorized` if `caller`
+    /// is not the stored admin.
+    fn require_admin(env: &Env, caller: &Address) -> Result<Address, PermissionError> {
+        caller.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PermissionError::NotInitialized)?;
+        if *caller != stored_admin {
+            return Err(PermissionError::Unauthorized);
+        }
+        Ok(stored_admin)
+    }
+
     /// Validates the merchant whitelist:
     /// - Must not exceed `MAX_MERCHANTS_PER_PERMISSION` entries.
     /// - Must not contain duplicate addresses.
@@ -997,6 +1281,53 @@ impl PermissionsContract {
         }
     }
 
+    /// Walks the `parent_owner`/`parent_delegate` chain of a permission
+    /// record, returning the minimum `expires_at_ledger` across the record
+    /// itself and every ancestor. A child permission is only ever
+    /// spendable up to the earliest expiry in its lineage, so a parent
+    /// that expires naturally (by ledger, without an explicit `revoke`)
+    /// also caps every descendant's effective liveness — closing the gap
+    /// where only explicit revocation cascaded but natural expiry did not.
+    ///
+    /// Bounded to 32 hops to guard against a pathological/cyclic parent
+    /// chain; real chains are expected to be a handful of levels deep.
+    fn effective_expiry(env: &Env, record: &PermissionRecord) -> u32 {
+        let mut min_expiry = record.expires_at_ledger;
+        let mut next_parent = match (record.parent_owner.clone(), record.parent_delegate.clone()) {
+            (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+            _ => None,
+        };
+
+        let mut hops = 0u32;
+        while let Some((p_owner, p_delegate)) = next_parent {
+            if hops >= 32 {
+                break;
+            }
+            hops += 1;
+
+            let parent_key = DataKey::Permission(p_owner, p_delegate);
+            let parent_record: PermissionRecord = match env.storage().persistent().get(&parent_key)
+            {
+                Some(r) => r,
+                None => break,
+            };
+
+            if parent_record.expires_at_ledger < min_expiry {
+                min_expiry = parent_record.expires_at_ledger;
+            }
+
+            next_parent = match (
+                parent_record.parent_owner.clone(),
+                parent_record.parent_delegate.clone(),
+            ) {
+                (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+                _ => None,
+            };
+        }
+
+        min_expiry
+    }
+
     pub fn can_spend(
         env: Env,
         owner: Address,
@@ -1017,7 +1348,11 @@ impl PermissionsContract {
             PermissionStatus::Revoked => return Err(PermissionError::Unauthorized),
         }
 
-        if env.ledger().sequence() >= record.expires_at_ledger {
+        // Bound liveness by the full ancestor chain: a parent that expired
+        // naturally (by ledger, without an explicit revoke) also expires
+        // this child, even though this record's own `expires_at_ledger`
+        // hasn't been reached yet.
+        if env.ledger().sequence() >= Self::effective_expiry(&env, &record) {
             return Err(PermissionError::Expired);
         }
 
@@ -1071,23 +1406,7 @@ impl PermissionsContract {
 
         let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
 
-        let key = DataKey::Permission(owner.clone(), delegate.clone());
-        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
-
-        record.spent += amount;
-        let mut next_parent = match (record.parent_owner.clone(), record.parent_delegate.clone()) {
-            (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
-            _ => None,
-        };
-        env.storage().persistent().set(&key, &record);
-        Self::record_spend_stats(&env, &owner, &delegate, amount);
-
-        // Record the current ledger as the last spend ledger for velocity tracking.
-        env.storage()
-            .persistent()
-            .set(&velocity_key, &env.ledger().sequence());
-
-        let remaining = record.limit_total - record.spent;
+        let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         // Emit after successful spend only (issue #99).
         env.events().publish(
@@ -1101,9 +1420,50 @@ impl PermissionsContract {
             },
         );
 
-        // Walk the parent chain, deducting the same amount from each
-        // ancestor's allowance so a child's spend is also reflected against
-        // the allowance it was carved out of (issue #332).
+        Ok(())
+    }
+
+    /// Shared helper that applies a validated spend to the child permission
+    /// record and then walks the parent chain, decrementing each ancestor's
+    /// allowance by the same `amount` (issue #55 / #332).
+    ///
+    /// Callers **must** have already run all validation (`can_spend`,
+    /// velocity checks, nonce checks, …) before calling this function.
+    /// `apply_spend` only mutates storage — it does **not** re-validate.
+    ///
+    /// Returns the remaining allowance on the child permission after the spend.
+    fn apply_spend(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+        amount: i128,
+    ) -> Result<i128, PermissionError> {
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
+
+        record.spent += amount;
+        let remaining = record.limit_total - record.spent;
+
+        // Capture the parent link before writing the updated record so we can
+        // walk the chain without holding an immutable borrow.
+        let mut next_parent = match (record.parent_owner.clone(), record.parent_delegate.clone()) {
+            (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+            _ => None,
+        };
+        env.storage().persistent().set(&key, &record);
+
+        Self::record_spend_stats(env, owner, delegate, amount);
+
+        // Record the current ledger for velocity tracking.
+        env.storage().persistent().set(
+            &DataKey::LastSpendLedger(owner.clone(), delegate.clone()),
+            &env.ledger().sequence(),
+        );
+
+        // Walk the parent chain, deducting the same amount from each ancestor's
+        // allowance so a child's spend is also reflected against the allowance
+        // it was carved out of (issue #332). This path is now shared between
+        // execute_spend and execute_spend_via_relayer (issue #55).
         while let Some((p_owner, p_delegate)) = next_parent {
             let parent_key = DataKey::Permission(p_owner, p_delegate);
             let mut parent_record: PermissionRecord = env
@@ -1122,13 +1482,13 @@ impl PermissionsContract {
                 parent_record.parent_owner.clone(),
                 parent_record.parent_delegate.clone(),
             ) {
-                (Some(p_owner), Some(p_delegate)) => Some((p_owner, p_delegate)),
+                (Some(pp_owner), Some(pp_delegate)) => Some((pp_owner, pp_delegate)),
                 _ => None,
             };
             env.storage().persistent().set(&parent_key, &parent_record);
         }
 
-        Ok(())
+        Ok(remaining)
     }
 
     /// Rejects a spend when the configured velocity limit (`MinSpendInterval`)
@@ -1172,9 +1532,36 @@ impl PermissionsContract {
         public_key: BytesN<32>,
     ) -> Result<(), PermissionError> {
         delegate.require_auth();
+
+        let old_key: Option<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RelayerKey(delegate.clone()));
+
         env.storage()
             .instance()
-            .set(&DataKey::RelayerKey(delegate), &public_key);
+            .set(&DataKey::RelayerKey(delegate.clone()), &public_key);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("relaykey")),
+            RelayerKeyChangedEvent {
+                delegate: delegate.clone(),
+                old_key,
+                new_key: public_key,
+            },
+        );
+
+        // Relayer keys aren't scoped to an (owner, delegate) pair, so the
+        // audit trail is keyed by (delegate, delegate) rather than a real
+        // owner relationship.
+        Self::append_audit_log(
+            &env,
+            &delegate,
+            &delegate,
+            delegate.clone(),
+            symbol_short!("relaykey"),
+        );
+
         Ok(())
     }
 
@@ -1203,6 +1590,9 @@ impl PermissionsContract {
     /// delegate's registered public key, the `nonce` must match the
     /// delegate's next expected nonce (preventing replay), and
     /// `expiration_ledger` must not yet have been reached.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_spend_via_relayer(
         env: Env,
         relayer: Address,
@@ -1254,23 +1644,15 @@ impl PermissionsContract {
             merchant.clone(),
         )?;
 
-        // #54: Relayed spends are subject to the same velocity limit as direct
-        // spends — reject if min_spend_interval has not yet elapsed.
-        Self::check_velocity(&env, &owner, &delegate)?;
-
-        let perm_key = DataKey::Permission(owner.clone(), delegate.clone());
-        let mut record: PermissionRecord = env.storage().persistent().get(&perm_key).unwrap();
-        record.spent += amount;
-        env.storage().persistent().set(&perm_key, &record);
+        // Advance the nonce before mutating spend state so a replay attempt
+        // within the same ledger is rejected even if apply_spend panics.
         env.storage().persistent().set(&nonce_key, &(nonce + 1));
-        Self::record_spend_stats(&env, &owner, &delegate, amount);
 
-        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
-        env.storage()
-            .persistent()
-            .set(&velocity_key, &env.ledger().sequence());
+        // apply_spend increments the child record, walks the full parent chain,
+        // updates usage stats, and records the last spend ledger — identical to
+        // the direct execute_spend path (issue #55).
+        let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
-        let remaining = record.limit_total - record.spent;
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("relayed")),
             PermissionSpendEvent {
@@ -1291,6 +1673,9 @@ impl PermissionsContract {
     /// the minimum number of owner signatures required to authorize a spend
     /// (1 <= threshold <= owners.len()). The caller must be one of `owners`.
     /// Stored keyed by `(owners[0], delegate)`.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_multi_owner(
         env: Env,
         caller: Address,
@@ -1309,6 +1694,17 @@ impl PermissionsContract {
         }
         if threshold == 0 || threshold > owners.len() {
             return Err(PermissionError::InvalidParam);
+        }
+
+        // Reject self-delegation unless explicitly allowed, mirroring the
+        // guard already applied on `grant` and `grant_child`.
+        let allow_self: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowSelfDelegation)
+            .unwrap_or(false);
+        if !allow_self && owners.contains(&delegate) {
+            return Err(PermissionError::SelfDelegationNotAllowed);
         }
         if limit_per_tx <= 0 || limit_total < limit_per_tx {
             return Err(PermissionError::InvalidParam);
@@ -1437,7 +1833,18 @@ impl PermissionsContract {
         merchant: Address,
     ) -> Result<(), PermissionError> {
         delegate.require_auth();
+
+        // Deduplicate signers before requiring auth or counting them toward
+        // quorum: a duplicate-padded list must not waste auth frames, and
+        // must not be able to satisfy the threshold with fewer real
+        // signers than intended.
+        let mut unique_signers: Vec<Address> = Vec::new(&env);
         for signer in signers.iter() {
+            if !unique_signers.contains(&signer) {
+                unique_signers.push_back(signer);
+            }
+        }
+        for signer in unique_signers.iter() {
             signer.require_auth();
         }
 
@@ -1445,7 +1852,7 @@ impl PermissionsContract {
             env.clone(),
             primary_owner.clone(),
             delegate.clone(),
-            signers.clone(),
+            unique_signers.clone(),
             amount,
             merchant.clone(),
         )?;
@@ -1453,7 +1860,11 @@ impl PermissionsContract {
         let key = DataKey::MultiPermission(primary_owner.clone(), delegate.clone());
         let mut record: MultiOwnerPermission = env.storage().persistent().get(&key).unwrap();
 
-        record.spent += amount;
+        record.spent = record
+            .spent
+            .checked_add(amount)
+            .filter(|spent| *spent <= record.limit_total)
+            .ok_or(PermissionError::ExceedsAllowance)?;
         env.storage().persistent().set(&key, &record);
 
         let remaining = record.limit_total - record.spent;
@@ -1466,7 +1877,7 @@ impl PermissionsContract {
                 merchant,
                 amount,
                 remaining,
-                signer_count: signers.len(),
+                signer_count: unique_signers.len(),
             },
         );
 
@@ -1542,6 +1953,26 @@ impl PermissionsContract {
                 }
             }
         }
+    }
+
+    pub fn get_permissions_by_owner(env: Env, owner: Address) -> Vec<PermissionRecord> {
+        let delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserPermissions(owner.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        let mut records = Vec::new(&env);
+        for delegate in delegates.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Permission(owner.clone(), delegate))
+            {
+                records.push_back(record);
+            }
+        }
+        records
     }
 
     pub fn get_permission(env: Env, owner: Address, delegate: Address) -> PermissionRecord {
@@ -1712,13 +2143,23 @@ impl PermissionsContract {
         record.status = PermissionStatus::Paused;
         env.storage().persistent().set(&perm_key, &record);
 
+        let reason_code = symbol_short!("none");
+        env.storage().persistent().set(
+            &DataKey::PauseMetadata(owner.clone(), delegate.clone()),
+            &PauseMetadata {
+                paused_by: owner.clone(),
+                reason_code: reason_code.clone(),
+                paused_at_ledger: env.ledger().sequence(),
+            },
+        );
+
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("paused")),
             PermissionPausedEvent {
                 owner: owner.clone(),
                 delegate: delegate.clone(),
                 paused_by: owner.clone(),
-                reason_code: symbol_short!("none"),
+                reason_code,
             },
         );
 
@@ -1748,6 +2189,9 @@ impl PermissionsContract {
 
         record.status = PermissionStatus::Active;
         env.storage().persistent().set(&perm_key, &record);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PauseMetadata(owner.clone(), delegate.clone()));
 
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("resumed")),
@@ -1769,12 +2213,18 @@ impl PermissionsContract {
         Ok(())
     }
 
-    /// Returns the stored pause metadata, or panics if the permission is not currently paused.
-    pub fn get_pause_metadata(env: Env, owner: Address, delegate: Address) -> PauseMetadata {
-        env.storage()
+    /// Returns the stored pause metadata for `(owner, delegate)`, or `Ok(None)`
+    /// when the permission is not currently paused (never panics on a missing
+    /// entry).
+    pub fn get_pause_metadata(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<Option<PauseMetadata>, PermissionError> {
+        Ok(env
+            .storage()
             .persistent()
-            .get(&DataKey::PauseMetadata(owner, delegate))
-            .unwrap()
+            .get(&DataKey::PauseMetadata(owner, delegate)))
     }
 
     pub fn set_admin(env: Env, admin: Address) {
@@ -1805,6 +2255,15 @@ impl PermissionsContract {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("adm_prop")),
+            AdminProposedEvent {
+                current_admin: caller,
+                new_admin,
+            },
+        );
+
         Ok(())
     }
 
@@ -1820,22 +2279,28 @@ impl PermissionsContract {
         if caller != pending {
             return Err(PermissionError::Unauthorized);
         }
+        let previous_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PermissionError::NotFound)?;
         env.storage().instance().set(&DataKey::Admin, &caller);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("adm_acc")),
+            AdminAcceptedEvent {
+                previous_admin,
+                new_admin: caller,
+            },
+        );
+
         Ok(())
     }
 
     /// Pause new grant creation. Admin-only.
     pub fn pause_grants(env: Env, admin: Address) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         let state = PermissionPauseState {
             grants_paused: true,
@@ -1859,15 +2324,7 @@ impl PermissionsContract {
 
     /// Unpause new grant creation. Admin-only.
     pub fn unpause_grants(env: Env, admin: Address) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         let state = PermissionPauseState {
             grants_paused: false,
@@ -1907,15 +2364,7 @@ impl PermissionsContract {
         admin: Address,
         threshold_seconds: u64,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
         if threshold_seconds == 0 {
             return Err(PermissionError::InvalidParam);
         }
@@ -1994,6 +2443,47 @@ impl PermissionsContract {
         Ok(true)
     }
 
+    /// Transitions a permission whose TTL has elapsed from `Active` to
+    /// `Expired`, making the `PermissionStatus::Expired` variant reachable
+    /// in stored state rather than only computed on the fly. `is_active`,
+    /// `can_spend`, and `get_delegate_status` already treat an
+    /// on-the-fly-expired `Active` record as not spendable, so this is a
+    /// bookkeeping transition rather than a behavior change for those
+    /// reads — it lets `get_permission`/`get_multi_permission` callers see
+    /// `Expired` in the stored `status` field without recomputing it
+    /// themselves. Returns `Ok(true)` if a transition occurred, `Ok(false)`
+    /// if the record was not eligible (already non-`Active`, or not yet
+    /// past its expiry).
+    pub fn sweep_expired(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        caller: Address,
+    ) -> Result<bool, PermissionError> {
+        caller.require_auth();
+
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let mut record: PermissionRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PermissionError::PermissionNotFound)?;
+
+        if record.status != PermissionStatus::Active {
+            return Ok(false);
+        }
+        if env.ledger().sequence() < record.expires_at_ledger {
+            return Ok(false);
+        }
+
+        record.status = PermissionStatus::Expired;
+        env.storage().persistent().set(&key, &record);
+
+        Self::append_audit_log(&env, &owner, &delegate, caller, symbol_short!("expired"));
+
+        Ok(true)
+    }
+
     /// Configure the minimum number of ledgers that must elapse between successive
     /// spends for any delegation pair (#324). Admin-only.
     ///
@@ -2003,15 +2493,13 @@ impl PermissionsContract {
         admin: Address,
         interval: u32,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
+        Self::require_admin(&env, &admin)?;
+
+        if interval > MAX_VELOCITY_INTERVAL {
+            return Err(PermissionError::InvalidParam);
         }
+
+        let previous: Option<u32> = env.storage().instance().get(&DataKey::MinSpendInterval);
 
         env.storage()
             .instance()
@@ -2020,7 +2508,8 @@ impl PermissionsContract {
         env.events().publish(
             (symbol_short!("perm"), symbol_short!("velset")),
             VelocityLimitSetEvent {
-                min_spend_interval: interval,
+                previous,
+                current: interval,
                 set_by: admin,
             },
         );
@@ -2051,15 +2540,7 @@ impl PermissionsContract {
         admin: Address,
         allow: bool,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
         env.storage()
             .instance()
             .set(&DataKey::AllowSelfDelegation, &allow);
@@ -2072,15 +2553,7 @@ impl PermissionsContract {
         admin: Address,
         schema: Symbol,
     ) -> Result<(), PermissionError> {
-        admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("Admin not set");
-        if admin != stored_admin {
-            return Err(PermissionError::Unauthorized);
-        }
+        Self::require_admin(&env, &admin)?;
 
         let mut registry: Vec<Symbol> = env
             .storage()
@@ -2112,9 +2585,15 @@ impl PermissionsContract {
 
     /// Grants a permission and stores optional metadata hash (issue #181).
     ///
+    /// Grants a permission and stores optional metadata hash (issue #181).
+    ///
     /// When `metadata` is provided, its `schema` must already be registered
     /// via `register_schema` — unregistered schemas are rejected with
     /// `PermissionError::UnknownSchema` and no grant is recorded (issue #328).
+    ///
+    /// This is a **first grant**: like [`Self::grant`], it rejects a live
+    /// (Active/Paused) existing permission with `PermissionError::AlreadyGranted`
+    /// (issue #51). Use [`Self::re_grant_with_metadata`] to replace one.
     pub fn grant_with_metadata(
         env: Env,
         owner: Address,
@@ -2125,18 +2604,8 @@ impl PermissionsContract {
         ttl_ledgers: u32,
         metadata: Option<PermissionMetadata>,
     ) -> Result<(), PermissionError> {
-        if let Some(ref m) = metadata {
-            let registry: Vec<Symbol> = env
-                .storage()
-                .instance()
-                .get(&DataKey::SchemaRegistry)
-                .unwrap_or_else(|| Vec::new(&env));
-            if !registry.contains(&m.schema) {
-                return Err(PermissionError::UnknownSchema);
-            }
-        }
-
-        Self::grant(
+        Self::validate_metadata_schema(&env, &metadata)?;
+        Self::grant_impl(
             env.clone(),
             owner.clone(),
             delegate.clone(),
@@ -2144,21 +2613,78 @@ impl PermissionsContract {
             limit_per_tx,
             allowed_merchants,
             ttl_ledgers,
+            false,
         )?;
+        Self::store_metadata(&env, &owner, &delegate, metadata);
+        Ok(())
+    }
 
-        let meta_key = DataKey::Metadata(owner, delegate);
+    /// Explicitly replaces an existing permission while storing optional
+    /// metadata (issue #51). Semantics mirror [`Self::re_grant`] combined with
+    /// the metadata handling of [`Self::grant_with_metadata`]: permitted on a
+    /// live permission, fails with `PermissionError::PermissionNotFound` if no
+    /// record exists, and the granted event reports the previous spent amount.
+    pub fn re_grant_with_metadata(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        limit_total: i128,
+        limit_per_tx: i128,
+        allowed_merchants: Vec<Address>,
+        ttl_ledgers: u32,
+        metadata: Option<PermissionMetadata>,
+    ) -> Result<(), PermissionError> {
+        Self::validate_metadata_schema(&env, &metadata)?;
+        Self::grant_impl(
+            env.clone(),
+            owner.clone(),
+            delegate.clone(),
+            limit_total,
+            limit_per_tx,
+            allowed_merchants,
+            ttl_ledgers,
+            true,
+        )?;
+        Self::store_metadata(&env, &owner, &delegate, metadata);
+        Ok(())
+    }
+
+    /// Rejects metadata whose `schema` is not in the approved registry (issue #328).
+    fn validate_metadata_schema(
+        env: &Env,
+        metadata: &Option<PermissionMetadata>,
+    ) -> Result<(), PermissionError> {
+        if let Some(ref m) = metadata {
+            let registry: Vec<Symbol> = env
+                .storage()
+                .instance()
+                .get(&DataKey::SchemaRegistry)
+                .unwrap_or_else(|| Vec::new(env));
+            if !registry.contains(&m.schema) {
+                return Err(PermissionError::UnknownSchema);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores provided metadata, or clears any stale metadata from a previous
+    /// grant so `get_metadata` never returns a hash that belongs to an older
+    /// policy.
+    fn store_metadata(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+        metadata: Option<PermissionMetadata>,
+    ) {
+        let meta_key = DataKey::Metadata(owner.clone(), delegate.clone());
         match metadata {
             Some(m) => env.storage().persistent().set(&meta_key, &m),
             None => {
-                // Clear any stale metadata from a previous grant so
-                // get_metadata cannot return a hash that belongs to an older policy.
                 if env.storage().persistent().has(&meta_key) {
                     env.storage().persistent().remove(&meta_key);
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Returns optional metadata for a permission grant (issue #181).
@@ -2188,6 +2714,22 @@ impl PermissionsContract {
             owner,
             delegate,
             merchant,
+        })
+    }
+
+    /// Returns the full whitelisted-merchant list for a delegation pair,
+    /// bounded by `MAX_MERCHANTS_PER_PERMISSION`. Returns `None` when no
+    /// permission record exists; an empty `Vec` when the record exists but
+    /// has no merchant restriction configured.
+    pub fn get_merchant_restrictions(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Option<MerchantRestrictionView> {
+        let key = DataKey::Permission(owner, delegate);
+        let record: PermissionRecord = env.storage().persistent().get(&key)?;
+        Some(MerchantRestrictionView {
+            merchants: record.allowed_merchants,
         })
     }
 
@@ -2231,6 +2773,40 @@ impl PermissionsContract {
                 first_spend_ledger: 0,
                 last_spend_ledger: 0,
             })
+    }
+
+    /// Returns non-truncating usage telemetry for a (owner, delegate)
+    /// delegation, including a BPS-denominated average spend that avoids
+    /// the coarse rounding plain integer division produces on
+    /// `PermissionUsageStats::average_spend`. A pair with no recorded
+    /// spends returns zeroed stats with `last_spend_ledger: None`.
+    pub fn get_usage_stats_bps(env: Env, owner: Address, delegate: Address) -> UsageStatsView {
+        let stats = Self::get_usage_stats(env, owner, delegate);
+
+        let average_spent_bps = if stats.total_spends == 0 {
+            0
+        } else {
+            let total_spent_u = if stats.total_spent < 0 {
+                0i128
+            } else {
+                stats.total_spent
+            };
+            total_spent_u
+                .saturating_mul(10_000)
+                .checked_div(stats.total_spends as i128)
+                .unwrap_or(0) as u64
+        };
+
+        UsageStatsView {
+            spend_count: stats.total_spends,
+            total_spent: stats.total_spent,
+            average_spent_bps,
+            last_spend_ledger: if stats.total_spends == 0 {
+                None
+            } else {
+                Some(stats.last_spend_ledger)
+            },
+        }
     }
 
     /// Returns the total spent amount and the ledger sequence of the most
@@ -2339,6 +2915,45 @@ impl PermissionsContract {
         }
     }
 
+    /// Like `get_delegate_status`, but surfaces `PermissionStatus` directly
+    /// instead of a derived `active`/`reason` pair — so a `Revoked`
+    /// permission is distinguishable from an `Expired` one without string
+    /// matching on `reason`.
+    pub fn get_delegate_status_v2(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Option<DelegateStatusV2> {
+        let key = DataKey::Permission(owner.clone(), delegate.clone());
+        let record: PermissionRecord = env.storage().persistent().get(&key)?;
+
+        let is_expired = env.ledger().sequence() >= record.expires_at_ledger;
+        let effective_status = if is_expired && record.status == PermissionStatus::Active {
+            PermissionStatus::Expired
+        } else {
+            record.status.clone()
+        };
+
+        let remaining = if effective_status == PermissionStatus::Active {
+            let raw = record.limit_total - record.spent;
+            if raw < 0 {
+                0
+            } else {
+                raw
+            }
+        } else {
+            0
+        };
+
+        Some(DelegateStatusV2 {
+            owner,
+            delegate,
+            status: effective_status,
+            remaining,
+            expires_at_ledger: record.expires_at_ledger,
+        })
+    }
+
     /// Quick-check whether a permission is currently active (exists, has
     /// `Active` status, and has not expired).
     pub fn is_active(env: Env, owner: Address, delegate: Address) -> bool {
@@ -2350,7 +2965,7 @@ impl PermissionsContract {
         if record.status != PermissionStatus::Active {
             return false;
         }
-        env.ledger().sequence() < record.expires_at_ledger
+        env.ledger().sequence() < Self::effective_expiry(&env, &record)
     }
 
     /// Returns the audit log for a (owner, delegate) pair, or an empty vec
@@ -2383,8 +2998,18 @@ impl PermissionsContract {
             actor,
             timestamp: env.ledger().timestamp(),
         });
+        Self::retain_audit(&mut log, MAX_AUDIT_ENTRIES);
 
         env.storage().persistent().set(&key, &log);
+    }
+
+    /// Drops the oldest entries from `log` until its length is at most
+    /// `cap`, keeping per-permission audit storage flat regardless of how
+    /// many state-changing actions the pair accumulates over its lifetime.
+    fn retain_audit(log: &mut Vec<AuditLogEntry>, cap: u32) {
+        while log.len() > cap {
+            log.remove(0);
+        }
     }
 
     /// spend. Called from both `execute_spend` and `execute_spend_via_relayer`

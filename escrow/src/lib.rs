@@ -3,12 +3,6 @@
 //! Holds funds in escrow until order fulfillment is confirmed.
 
 #![no_std]
-// `create` and `deposit` have 9 parameters — more than clippy's default limit of 7.
-// These are Soroban contract entry points whose signatures are part of the
-// published on-chain ABI; restructuring them would be a breaking change.
-// The `contractargs` proc-macro also generates wrapper functions that exceed the
-// limit, which cannot be annotated individually from user code.
-#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     InvokeError, Symbol, Vec,
@@ -71,6 +65,7 @@ pub struct EscrowRecord {
     pub status: EscrowStatus,
     pub order_id: BytesN<32>,
     pub created_at: u64,
+    pub updated_at: u64,
     pub timeout_ledger: u32,
 }
 
@@ -189,6 +184,20 @@ pub struct EscrowResolvedEvent {
     pub resolved_by: Address,
 }
 
+/// Emitted on each arbiter vote during dispute resolution (#32).
+///
+/// Reports live tallies so indexers and UIs can track quorum progress
+/// on-chain without replaying storage diffs.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DisputeVotedEvent {
+    pub escrow_id: u64,
+    pub arbiter: Address,
+    pub release_to_seller: bool,
+    pub votes_for: u32,
+    pub threshold: u32,
+}
+
 /// Emitted when escrowed funds are split among multiple recipients (#321).
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -299,6 +308,19 @@ pub struct TreasuryShare {
     pub treasury: Address,
     /// Share in basis points (e.g., 250 = 2.5%)
     pub bps: u32,
+}
+
+/// Net seller payout plus the platform fee deducted for a release amount,
+/// as computed by `compute_payout` (issue #27).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleasePayout {
+    /// Amount the seller actually receives after the fee is deducted.
+    pub seller_net: i128,
+    /// Total fee charged across all treasuries.
+    pub fee: i128,
+    /// Primary treasury that receives the fee (from `FeeConfig`).
+    pub treasury: Address,
 }
 
 #[contracttype]
@@ -444,8 +466,9 @@ pub enum DataKey {
     QuorumConfig,
     DisputeVotes(u64),
     TimeoutExtensionVotes(u64),
-    TokenWhitelist,
-    TokenEnabled(Address),
+    AllowedToken(Address),
+    AllowedTokenAt(u32),
+    AllowedTokenCount,
     PauseState,
     EscrowMetadata(u64),
     LiquidityPool(Address),
@@ -457,11 +480,86 @@ pub enum DataKey {
     EscrowYieldConfig(u64),
     /// Release condition for an escrow.
     ReleaseCondition(u64),
+    /// Admin flag: when `true`, buyer-originated releases on the escrow must
+    /// pass `get_release_eligibility` (issue #48).
+    RequireReleaseCondition(u64),
+    /// Append-only list of all escrow IDs, used for paginated enumeration (issue #49).
+    EscrowIds,
+    /// Per-buyer append-only list of escrow IDs (issue #49).
+    BuyerEscrowIds(Address),
 }
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
+/// Canonical ABI numbering for `EscrowError`.
+///
+/// Error codes are part of the contract ABI. They are frozen for the 0.x
+/// deployment line; do not renumber, remove, or reuse existing codes. The
+/// declaration order below is not meaningful — the `#[repr(u32)]` values are.
+///
+/// # Registry
+///
+/// `First version` records the first contract version in which a code is
+/// known to be present. Legacy variants are marked `≤0.2.0` because they
+/// predate this audit; exact pre-0.2.0 introduction releases are not
+/// tracked.
+///
+/// | Code | Variant | First version |
+/// |------|---------|---------------|
+/// | 1 | AlreadyInitialized | ≤0.2.0 |
+/// | 2 | NotFound | ≤0.2.0 |
+/// | 3 | Unauthorized | ≤0.2.0 |
+/// | 4 | AlreadyReleased | ≤0.2.0 |
+/// | 5 | AlreadyRefunded | ≤0.2.0 |
+/// | 6 | InvalidStatus | ≤0.2.0 |
+/// | 7 | TimeoutNotReached | ≤0.2.0 |
+/// | 8 | NotDisputed | ≤0.2.0 |
+/// | 9 | InvalidAmount | ≤0.2.0 |
+/// | 10 | TokenNotWhitelisted | ≤0.2.0 |
+/// | 11 | InsufficientEscrowBalance | ≤0.2.0 |
+/// | 12 | ZeroAmount | ≤0.2.0 |
+/// | 13 | NoPendingTransfer | ≤0.2.0 |
+/// | 14 | InvalidPendingAdmin | ≤0.2.0 |
+/// | 15 | AdminAlreadyExists | ≤0.2.0 |
+/// | 16 | InvalidFeeBps | ≤0.2.0 |
+/// | 17 | AmountBelowMin | ≤0.2.0 |
+/// | 18 | AmountAboveMax | ≤0.2.0 |
+/// | 19 | InvalidLimits | ≤0.2.0 |
+/// | 20 | NotAnArbiter | ≤0.2.0 |
+/// | 21 | AlreadyVoted | ≤0.2.0 |
+/// | 22 | InvalidQuorum | ≤0.2.0 |
+/// | 23 | QuorumNotReached | ≤0.2.0 |
+/// | 24 | QuorumConfigNotSet | ≤0.2.0 |
+/// | 25 | ConflictingQuorum | ≤0.2.0 |
+/// | 26 | CreationPaused | ≤0.2.0 |
+/// | 27 | AlreadyCancelled | ≤0.2.0 |
+/// | 28 | AlreadyFunded | ≤0.2.0 |
+/// | 29 | InvalidExtension | ≤0.2.0 |
+/// | 30 | PoolNotFound | ≤0.2.0 |
+/// | 31 | InsufficientPoolBalance | ≤0.2.0 |
+/// | 32 | InvalidAddress | ≤0.2.0 |
+/// | 33 | InvalidEscrowParticipants | ≤0.2.0 |
+/// | 36 | ReleaseConditionNotSet | ≤0.2.0 |
+/// | 37 | OracleCallFailed | ≤0.2.0 |
+/// | 38 | ConditionNotMet | ≤0.2.0 |
+/// | 39 | InvalidYieldConfig | ≤0.2.0 |
+/// | 40 | AmountLimitsNotSet | ≤0.2.0 |
+/// | 41 | FeeConfigNotSet | ≤0.2.0 |
+/// | 201 | InvalidReleaseRecipient | ≤0.2.0 |
+/// | 400+ | Reserved for new variants | next major |
+///
+/// # Allocating new variants
+///
+/// New variants MUST use codes in the reserved contiguous range starting at
+/// 400. Do not fill historical gaps or reuse codes from the registry above.
+///
+/// # Renumber plan
+///
+/// The next `ContractVersion` major bump (1.0.0) is the planned breaking
+/// release for renumbering `EscrowError` contiguously from 1 to N, removing
+/// gaps and sorting declaration order by code. Until that release, the codes
+/// in the registry above are stable.
 pub enum EscrowError {
     /// Contract already initialized
     AlreadyInitialized = 1,
@@ -637,14 +735,22 @@ pub struct EscrowSnapshot {
     pub release_eligible: bool,
 }
 
-/// Read-only view of the yield an escrow has accrued so far, returned by
-/// `get_accrued_yield` (issue #331).
+/// Monotonic yield snapshot returned by [`EscrowContract::get_accrued_yield`]
+/// (issue #34).
+///
+/// All inputs needed for display are included so polling UIs cannot observe
+/// decreasing yield.  `snapshot_ledger` anchors the read to a block-stable
+/// point; `held_seconds` is computed from `created_at` to that ledger's
+/// timestamp, making the result deterministic within a single ledger close.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowYieldView {
+pub struct YieldView {
     pub escrow_id: u64,
-    pub accrued_yield: i128,
-    pub apr_bps: u32,
+    pub principal: i128,
+    pub apy_bps: u32,
+    pub held_seconds: u64,
+    pub accrued: i128,
+    pub snapshot_ledger: u32,
 }
 
 /// Compact read-only escrow summary for API/indexer consumers (issue #90).
@@ -671,9 +777,38 @@ pub struct EscrowSummary {
     pub status: EscrowStatus,
 }
 
+/// Paginated result returned by `list_escrows` and `list_escrows_by_buyer`
+/// (issue #49). `items` contains up to `limit` escrow records starting at
+/// `offset`. `total` is the total number of escrows in the queried index.
+/// `next_offset` is `Some(offset + items.len())` when more records follow,
+/// or `None` when the last page has been reached.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowListPage {
+    pub items: soroban_sdk::Vec<EscrowRecord>,
+    pub total: u32,
+    pub next_offset: Option<u32>,
+}
+
+/// Maximum number of escrows returned in a single page from `list_escrows`
+/// or `list_escrows_by_buyer`. Callers requesting a larger `limit` will
+/// silently receive at most this many records.
+pub const MAX_PAGE_LIMIT: u32 = 50;
+
 /// Seconds in a 365-day year, used to prorate `YieldConfig::apr_bps` down to
 /// the actual holding period of an escrow.
 const SECONDS_PER_YEAR: i128 = 31_536_000;
+
+/// Maximum number of treasury rows accepted by `set_fee_distribution`.
+/// Keeps the fee-splitting loop bounded and prevents unbounded config growth.
+const MAX_TREASURIES: u32 = 10;
+
+/// Persistent TTL bump parameters (mirrors `marketplace`/`reputation`): any
+/// entry whose remaining TTL is below the threshold is extended out to ~30
+/// days of ledgers. Escrow records are long-lived by design — an open escrow
+/// must not be evicted while funds are still locked.
+const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
+const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
 
 fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
     match record.status {
@@ -696,6 +831,11 @@ fn is_zero_address(env: &Env, address: &Address) -> bool {
 #[contract]
 pub struct EscrowContract;
 
+// The `#[contractimpl]` macro generates client/wrapper functions that mirror
+// the ABI entry-point signatures above; they cannot be annotated individually
+// from user code, so the allow lives on the impl block for those generated
+// wrappers only. User-defined functions carry their own scoped allows.
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl EscrowContract {
     /// Initialize the escrow contract with the admin, fee config, and amount limits.
@@ -731,6 +871,10 @@ impl EscrowContract {
                 max_amount,
             },
         );
+        // Keep the contract instance alive from deployment.
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         Ok(true)
     }
 
@@ -739,7 +883,7 @@ impl EscrowContract {
     pub fn version(_env: Env) -> ContractVersion {
         ContractVersion {
             name: symbol_short!("escrow"),
-            semver: symbol_short!("0_1_0"),
+            semver: symbol_short!("0_2_0"),
         }
     }
 
@@ -927,10 +1071,24 @@ impl EscrowContract {
         }
 
         votes.push_back(DisputeVote {
-            arbiter,
+            arbiter: arbiter.clone(),
             release_to_seller,
         });
         env.storage().persistent().set(&votes_key, &votes);
+
+        // Compute live tallies so the event reflects the state *after* this vote.
+        let votes_for = votes.iter().filter(|v| v.release_to_seller).count() as u32;
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("vote")),
+            DisputeVotedEvent {
+                escrow_id,
+                arbiter,
+                release_to_seller,
+                votes_for,
+                threshold: quorum_config.threshold,
+            },
+        );
 
         Ok(true)
     }
@@ -997,13 +1155,12 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
-            let fee = Self::distribute_fee(&env, &token_client, record.amount)?;
-            let seller_amount = record.amount - fee;
-
+            let payout = Self::compute_payout(&env, record.amount)?;
+            Self::distribute_fee(&env, &token_client, record.amount)?;
             token_client.transfer(
                 &env.current_contract_address(),
                 &record.seller,
-                &seller_amount,
+                &payout.seller_net,
             );
             record.status = EscrowStatus::Released;
         } else {
@@ -1015,6 +1172,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Refunded;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -1098,6 +1256,7 @@ impl EscrowContract {
         let previous_timeout_ledger = record.timeout_ledger;
         let new_timeout_ledger = previous_timeout_ledger.saturating_add(extension_ledgers);
         record.timeout_ledger = new_timeout_ledger;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().remove(&votes_key);
 
@@ -1171,8 +1330,18 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
+        if shares.len() > MAX_TREASURIES {
+            return Err(EscrowError::InvalidFeeBps);
+        }
+
         let mut total_bps: u32 = 0;
         for share in shares.iter() {
+            if is_zero_address(&env, &share.treasury) {
+                return Err(EscrowError::InvalidAddress);
+            }
+            if share.bps == 0 {
+                return Err(EscrowError::InvalidFeeBps);
+            }
             total_bps = total_bps
                 .checked_add(share.bps)
                 .ok_or(EscrowError::InvalidFeeBps)?;
@@ -1221,27 +1390,67 @@ impl EscrowContract {
             .get(&DataKey::FeeDistribution)
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
 
-        if !shares.is_empty() {
-            let mut total_fee: i128 = 0;
+        let total_fee = Self::compute_fee_amount(env, amount)?;
+        if total_fee == 0 {
+            return Ok(0);
+        }
+
+        if shares.is_empty() {
+            let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
+            token_client.transfer(
+                &env.current_contract_address(),
+                &fee_config.treasury,
+                &total_fee,
+            );
+        } else {
             for share in shares.iter() {
                 let bps = share.bps as i128;
                 let fee = (amount / 10_000i128) * bps + ((amount % 10_000i128) * bps) / 10_000i128;
                 if fee > 0 {
                     token_client.transfer(&env.current_contract_address(), &share.treasury, &fee);
-                    total_fee += fee;
                 }
+            }
+        }
+        Ok(total_fee)
+    }
+
+    /// Computes the total release fee (in tokens) for `amount`, splitting it
+    /// across the configured multi-treasury distribution when one is set,
+    /// falling back to the single-treasury `FeeConfig` otherwise. Never
+    /// transfers tokens and never panics on a missing config: returns
+    /// `FeeConfigNotSet` when no config exists.
+    fn compute_fee_amount(env: &Env, amount: i128) -> Result<i128, EscrowError> {
+        let shares: soroban_sdk::Vec<TreasuryShare> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeDistribution)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+        if !shares.is_empty() {
+            let mut total_fee: i128 = 0;
+            for share in shares.iter() {
+                let bps = share.bps as i128;
+                total_fee +=
+                    (amount / 10_000i128) * bps + ((amount % 10_000i128) * bps) / 10_000i128;
             }
             Ok(total_fee)
         } else {
             let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
             let fee_bps = fee_config.fee_bps as i128;
-            let fee =
-                (amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128;
-            if fee > 0 {
-                token_client.transfer(&env.current_contract_address(), &fee_config.treasury, &fee);
-            }
-            Ok(fee)
+            Ok((amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128)
         }
+    }
+
+    /// Computes the net seller payout and platform fee for `amount` (issue #27).
+    /// Pure calculation — see `distribute_fee` for the transfer side.
+    fn compute_payout(env: &Env, amount: i128) -> Result<ReleasePayout, EscrowError> {
+        let fee = Self::compute_fee_amount(env, amount)?;
+        let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
+        Ok(ReleasePayout {
+            seller_net: amount - fee,
+            fee,
+            treasury: fee_config.treasury,
+        })
     }
 
     /// Add a token to the escrow whitelist. Admin-only.
@@ -1259,18 +1468,21 @@ impl EscrowContract {
             return Ok(true);
         }
 
-        let mut whitelist: soroban_sdk::Vec<Address> = env
+        let count: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::TokenWhitelist)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        whitelist.push_back(token_address.clone());
+            .get(&DataKey::AllowedTokenCount)
+            .unwrap_or(0);
+
         env.storage()
             .instance()
-            .set(&DataKey::TokenWhitelist, &whitelist);
+            .set(&DataKey::AllowedToken(token_address.clone()), &count);
         env.storage()
             .instance()
-            .set(&DataKey::TokenEnabled(token_address), &true);
+            .set(&DataKey::AllowedTokenAt(count), &token_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedTokenCount, &(count + 1));
 
         Ok(true)
     }
@@ -1286,20 +1498,47 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
-        let mut whitelist: soroban_sdk::Vec<Address> = env
+        let index_opt: Option<u32> = env
             .storage()
             .instance()
-            .get(&DataKey::TokenWhitelist)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        if let Some(index) = whitelist.first_index_of(&token_address) {
-            whitelist.remove(index);
-            env.storage()
+            .get(&DataKey::AllowedToken(token_address.clone()));
+
+        if let Some(idx) = index_opt {
+            let count: u32 = env
+                .storage()
                 .instance()
-                .set(&DataKey::TokenWhitelist, &whitelist);
+                .get(&DataKey::AllowedTokenCount)
+                .unwrap_or(0);
+
+            if count > 0 {
+                let last_idx = count - 1;
+                if idx != last_idx {
+                    // Swap with the last element
+                    let last_token: Address = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::AllowedTokenAt(last_idx))
+                        .unwrap();
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::AllowedTokenAt(idx), &last_token);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::AllowedToken(last_token), &idx);
+                }
+
+                // Remove the target token from mappings
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::AllowedToken(token_address));
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::AllowedTokenAt(last_idx));
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AllowedTokenCount, &last_idx);
+            }
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::TokenEnabled(token_address), &false);
 
         Ok(true)
     }
@@ -1308,16 +1547,37 @@ impl EscrowContract {
     pub fn is_token_allowed(env: Env, token_address: Address) -> bool {
         env.storage()
             .instance()
-            .get(&DataKey::TokenEnabled(token_address))
-            .unwrap_or(false)
+            .has(&DataKey::AllowedToken(token_address))
     }
 
     /// List all tokens currently approved for escrow deposits.
     pub fn list_tokens(env: Env) -> soroban_sdk::Vec<Address> {
-        env.storage()
+        let count: u32 = env
+            .storage()
             .instance()
-            .get(&DataKey::TokenWhitelist)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+            .get(&DataKey::AllowedTokenCount)
+            .unwrap_or(0);
+
+        Self::list_tokens_paginated(env, 0, count)
+    }
+
+    /// List tokens currently approved for escrow deposits with pagination.
+    pub fn list_tokens_paginated(env: Env, offset: u32, limit: u32) -> soroban_sdk::Vec<Address> {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowedTokenCount)
+            .unwrap_or(0);
+
+        let mut tokens = soroban_sdk::Vec::new(&env);
+        let end = count.min(offset.saturating_add(limit));
+
+        for i in offset..end {
+            if let Some(token) = env.storage().instance().get(&DataKey::AllowedTokenAt(i)) {
+                tokens.push_back(token);
+            }
+        }
+        tokens
     }
 
     /// Fund the shared liquidity pool for a token so it can back instant
@@ -1415,11 +1675,9 @@ impl EscrowContract {
     /// shared liquidity pool for that escrow's token, instead of going
     /// through the ordinary buyer/admin-triggered `release` flow. Admin-only.
     ///
-    /// The pool's tracked balance is left unchanged by a settlement: the
-    /// amount it fronts to the seller is immediately backed by the settling
-    /// escrow's own already-deposited funds, which remain held by this
-    /// contract. `pool.balance` therefore always reflects real, currently
-    /// unencumbered liquidity available to back further instant settlements.
+    /// The settled amount is debited from the pool's tracked balance so that
+    /// `pool.balance` always reflects real, currently unencumbered liquidity
+    /// and a later `withdraw_from_pool` cannot over-commit the same tokens.
     pub fn settle_from_pool(
         env: Env,
         escrow_id: u64,
@@ -1446,7 +1704,7 @@ impl EscrowContract {
         }
 
         let pool_key = DataKey::LiquidityPool(record.token.clone());
-        let pool: LiquidityPool = env
+        let mut pool: LiquidityPool = env
             .storage()
             .instance()
             .get(&pool_key)
@@ -1458,8 +1716,15 @@ impl EscrowContract {
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         token_client.transfer(&env.current_contract_address(), &record.seller, &remaining);
 
+        pool.balance = pool
+            .balance
+            .checked_sub(remaining)
+            .ok_or(EscrowError::InsufficientPoolBalance)?;
+        env.storage().instance().set(&pool_key, &pool);
+
         record.released_amount = record.amount;
         record.status = EscrowStatus::Released;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -1493,6 +1758,9 @@ impl EscrowContract {
     /// treasury are the zero address, and
     /// [`EscrowError::InvalidEscrowParticipants`] when buyer and seller are
     /// the same address.
+    // Reason: Soroban ABI entry point — 9 args is part of the published
+    // on-chain signature and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         env: Env,
         buyer: Address,
@@ -1534,6 +1802,8 @@ impl EscrowContract {
     /// the whole batch instead of once per order, since Soroban's auth
     /// tracker only matches one invocation of `require_auth` per address per
     /// top-level call.
+    // Reason: mirrors the `create` ABI signature so batch callers stay uniform.
+    #[allow(clippy::too_many_arguments)]
     fn create_internal(
         env: Env,
         buyer: Address,
@@ -1580,7 +1850,9 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::LastEscrowId, &last_id);
 
-        let timeout_ledger = env.ledger().sequence() + timeout_ledgers;
+        let timeout_ledger = timeout_ledgers
+            .checked_add(env.ledger().sequence())
+            .ok_or(EscrowError::InvalidExtension)?;
         let record = EscrowRecord {
             escrow_id: last_id,
             buyer: buyer.clone(),
@@ -1592,12 +1864,32 @@ impl EscrowContract {
             status: EscrowStatus::Created,
             order_id: order_id.clone(),
             created_at: env.ledger().timestamp(),
+            updated_at: env.ledger().timestamp(),
             timeout_ledger,
         };
 
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(last_id), &record);
+
+        // Maintain global escrow ID index for list_escrows (issue #49).
+        let mut all_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowIds)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        all_ids.push_back(last_id);
+        env.storage().instance().set(&DataKey::EscrowIds, &all_ids);
+
+        // Maintain per-buyer index for list_escrows_by_buyer (issue #49).
+        let buyer_ids_key = DataKey::BuyerEscrowIds(buyer.clone());
+        let mut buyer_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&buyer_ids_key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        buyer_ids.push_back(last_id);
+        env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
 
         if let (Some(hash), Some(sch)) = (order_hash, schema) {
             let metadata = EscrowMetadata {
@@ -1617,6 +1909,24 @@ impl EscrowContract {
                 },
             );
         }
+
+        // A long-lived, open escrow must not be evicted while it is still
+        // being read: bump the TTL of the record, its buyer index, and the
+        // contract instance (mirrors marketplace/reputation).
+        let storage = env.storage().persistent();
+        storage.extend_ttl(
+            &DataKey::Escrow(last_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        storage.extend_ttl(
+            &buyer_ids_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("created")),
@@ -1664,6 +1974,7 @@ impl EscrowContract {
         token_client.transfer(&buyer, &env.current_contract_address(), &record.amount);
 
         record.status = EscrowStatus::Funded;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         Ok(true)
@@ -1702,6 +2013,7 @@ impl EscrowContract {
         }
 
         record.status = EscrowStatus::Cancelled;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -1718,6 +2030,9 @@ impl EscrowContract {
 
     /// Deposit funds into escrow for an order.
     /// Combined convenience call: creates an escrow and immediately funds it.
+    // Reason: Soroban ABI entry point — 9 args is part of the published
+    // on-chain signature and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
     pub fn deposit(
         env: Env,
         buyer: Address,
@@ -1756,6 +2071,8 @@ impl EscrowContract {
     /// Shared `deposit` logic used by both `deposit` and `batch_deposit`.
     /// Callers are responsible for their own validation and
     /// `buyer.require_auth()`.
+    // Reason: mirrors the `deposit` ABI signature so batch callers stay uniform.
+    #[allow(clippy::too_many_arguments)]
     fn deposit_internal(
         env: Env,
         buyer: Address,
@@ -1786,7 +2103,16 @@ impl EscrowContract {
         token_client.transfer(&buyer, &env.current_contract_address(), &amount);
 
         record.status = EscrowStatus::Funded;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         Ok(escrow_id)
     }
@@ -1891,6 +2217,7 @@ impl EscrowContract {
     /// Release a partial amount to the seller.
     /// `release_amount` must be <= (record.amount - record.released_amount).
     /// If release_amount equals the remaining balance, set status to Released.
+    /// The platform fee is deducted from `release_amount` (issue #27).
     pub fn partial_release(
         env: Env,
         escrow_id: u64,
@@ -1927,12 +2254,31 @@ impl EscrowContract {
         }
         Self::validate_release_status(&record)?;
 
+        // When the admin has required it, buyer-originated releases must pass
+        // the release-eligibility gate (issue #48). Admins are not gated.
+        if caller == record.buyer
+            && env
+                .storage()
+                .persistent()
+                .get(&DataKey::RequireReleaseCondition(escrow_id))
+                .unwrap_or(false)
+            && Self::release_block_reason(env.clone(), &record).is_some()
+        {
+            return Err(EscrowError::ConditionNotMet);
+        }
+
         Self::execute_release(&env, escrow_id, &key, record, caller, release_amount)
     }
 
     /// Shared release logic used by both `partial_release` and
     /// `evaluate_and_release`. Callers are responsible for their own
     /// authorization checks before invoking this.
+    ///
+    /// The platform fee (per `FeeConfig` or the multi-treasury
+    /// `FeeDistribution`) is deducted from `release_amount` and transferred to
+    /// the treasury(ies); the seller receives the remainder (issue #27).
+    /// `released_amount` tracks the full escrow-amount released, not the net
+    /// seller payout.
     fn execute_release(
         env: &Env,
         escrow_id: u64,
@@ -1951,10 +2297,13 @@ impl EscrowContract {
         }
 
         let token_client = soroban_sdk::token::Client::new(env, &record.token);
+
+        let payout = Self::compute_payout(env, release_amount)?;
+        Self::distribute_fee(env, &token_client, release_amount)?;
         token_client.transfer(
             &env.current_contract_address(),
             &record.seller,
-            &release_amount,
+            &payout.seller_net,
         );
 
         record.released_amount += release_amount;
@@ -1964,6 +2313,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Released;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(key, &record);
 
         env.events().publish(
@@ -2003,6 +2353,7 @@ impl EscrowContract {
     }
 
     /// Release escrowed funds to the seller. Only the buyer or admin may call.
+    /// The platform fee is deducted from the released amount (issue #27).
     pub fn release(
         env: Env,
         escrow_id: u64,
@@ -2110,6 +2461,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Refunded;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -2193,7 +2545,8 @@ impl EscrowContract {
     }
 
     /// Query the configured oracle and release the full remaining balance to the
-    /// seller if the condition it reports is met (issue #339).
+    /// seller if the condition it reports is met (issue #339). The seller
+    /// receives the remaining balance minus the platform fee (issue #27).
     ///
     /// Any caller may trigger evaluation once a condition has been configured via
     /// `set_release_condition` — authorization to move funds comes from the
@@ -2264,6 +2617,7 @@ impl EscrowContract {
         }
 
         record.status = EscrowStatus::Disputed;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -2302,13 +2656,12 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
-            let fee = Self::distribute_fee(&env, &token_client, record.amount)?;
-            let seller_amount = record.amount - fee;
-
+            let payout = Self::compute_payout(&env, record.amount)?;
+            Self::distribute_fee(&env, &token_client, record.amount)?;
             token_client.transfer(
                 &env.current_contract_address(),
                 &record.seller,
-                &seller_amount,
+                &payout.seller_net,
             );
             record.status = EscrowStatus::Released;
         } else {
@@ -2320,6 +2673,7 @@ impl EscrowContract {
             record.status = EscrowStatus::Refunded;
         }
 
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -2371,10 +2725,22 @@ impl EscrowContract {
     /// Read-only getter for escrow state.
     pub fn get_escrow(env: Env, escrow_id: u64) -> EscrowRecord {
         let key = DataKey::Escrow(escrow_id);
-        env.storage()
+        let record: EscrowRecord = env
+            .storage()
             .persistent()
             .get(&key)
-            .expect("Escrow not found")
+            .expect("Escrow not found");
+        // Reads extend the TTL so a long-lived, open escrow is not evicted
+        // while it is still being read (mirrors marketplace `get_merchant`).
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        record
     }
 
     /// Read-only buyer-facing receipt for an escrow.
@@ -2509,13 +2875,22 @@ impl EscrowContract {
         Ok(true)
     }
 
-    /// Read-only view of the yield an escrow has accrued so far, based on
-    /// the time it has been held (issue #331). Returns zero accrued yield
-    /// when no `YieldConfig` is set. Never mutates storage.
+    /// Monotonic yield snapshot for an escrow (issue #34).
+    ///
+    /// Returns a [`YieldView`] containing every input needed to compute
+    /// display-relevant yield numbers.  `snapshot_ledger` anchors the read
+    /// to the current ledger, `held_seconds` is derived from
+    /// `created_at` to the snapshot ledger's close time, and `accrued` is
+    /// the yield at that frozen point.  Two calls within the same ledger
+    /// always return identical results; calls in different ledgers produce
+    /// monotonically increasing `held_seconds` and `accrued`.
+    ///
+    /// Returns zero yield fields when no `YieldConfig` is set.
+    /// Never mutates storage.
     ///
     /// # Errors
     /// Returns [`EscrowError::NotFound`] when no escrow exists for `escrow_id`.
-    pub fn get_accrued_yield(env: Env, escrow_id: u64) -> Result<EscrowYieldView, EscrowError> {
+    pub fn get_accrued_yield(env: Env, escrow_id: u64) -> Result<YieldView, EscrowError> {
         let key = DataKey::Escrow(escrow_id);
         let record: EscrowRecord = env
             .storage()
@@ -2527,13 +2902,19 @@ impl EscrowContract {
             .storage()
             .persistent()
             .get(&DataKey::EscrowYieldConfig(escrow_id));
-        let apr_bps = yield_config.as_ref().map(|c| c.apr_bps).unwrap_or(0);
-        let (accrued_yield, _) = Self::compute_yield(&record, yield_config.as_ref(), &env);
+        let apy_bps = yield_config.as_ref().map(|c| c.apr_bps).unwrap_or(0);
+        let snapshot_ledger = env.ledger().sequence();
+        let (accrued, held_seconds) = Self::compute_yield(&record, yield_config.as_ref(), &env);
 
-        Ok(EscrowYieldView {
+        let remaining = record.amount - record.released_amount;
+
+        Ok(YieldView {
             escrow_id,
-            accrued_yield,
-            apr_bps,
+            principal: remaining,
+            apy_bps,
+            held_seconds,
+            accrued,
+            snapshot_ledger,
         })
     }
 
@@ -2962,8 +3343,10 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Computes yield accrued on an escrow's principal for the time it has
-    /// been held, based on the given `YieldConfig` APR. Returns
+    /// Computes yield accrued on an escrow's remaining principal for the time
+    /// it has been held, based on the given `YieldConfig` APR.  The principal
+    /// is `record.amount - record.released_amount` so partially released
+    /// escrows report honest yield (issue #33).  Returns
     /// `(yield_amount, held_seconds)`; `(0, 0)` when no yield config is set.
     fn compute_yield(
         record: &EscrowRecord,
@@ -2973,7 +3356,8 @@ impl EscrowContract {
         match yield_config {
             Some(cfg) => {
                 let held_seconds = env.ledger().timestamp().saturating_sub(record.created_at);
-                let yield_amount = (record.amount * cfg.apr_bps as i128 * held_seconds as i128)
+                let remaining = record.amount - record.released_amount;
+                let yield_amount = (remaining * cfg.apr_bps as i128 * held_seconds as i128)
                     / (10_000i128 * SECONDS_PER_YEAR);
                 (yield_amount, held_seconds)
             }
@@ -3067,6 +3451,7 @@ impl EscrowContract {
         if new_remaining == 0 {
             record.status = EscrowStatus::Released;
         }
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -3107,7 +3492,7 @@ impl EscrowContract {
         }
 
         if new_timeout_ledger <= record.timeout_ledger {
-            return Err(EscrowError::InvalidAmount);
+            return Err(EscrowError::InvalidExtension);
         }
 
         // Authorization: admin can do it alone; otherwise both buyer AND seller must sign.
@@ -3122,6 +3507,7 @@ impl EscrowContract {
 
         let old_timeout = record.timeout_ledger;
         record.timeout_ledger = new_timeout_ledger;
+        record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
@@ -3135,6 +3521,105 @@ impl EscrowContract {
         );
 
         Ok(true)
+    }
+
+    /// Paginated enumeration of all escrows (issue #49).
+    ///
+    /// Returns up to `min(limit, MAX_PAGE_LIMIT)` [`EscrowRecord`]s starting
+    /// at zero-based `offset`. The global escrow ID list is maintained by
+    /// `create_internal`, so records are returned in creation order.
+    ///
+    /// `page.total`       — total number of escrows ever created.
+    /// `page.next_offset` — `Some(next)` when another page follows; `None` on
+    ///                      the last page.
+    pub fn list_escrows(env: Env, offset: u32, limit: u32) -> EscrowListPage {
+        let all_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowIds)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let total = all_ids.len();
+        let capped_limit = limit.min(MAX_PAGE_LIMIT);
+        let start = offset.min(total);
+        let end = (start + capped_limit).min(total);
+
+        let mut items = soroban_sdk::Vec::new(&env);
+        for i in start..end {
+            let escrow_id = all_ids.get(i).unwrap();
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, EscrowRecord>(&DataKey::Escrow(escrow_id))
+            {
+                items.push_back(record);
+            }
+        }
+
+        let count = end - start;
+        let next_offset = if end < total {
+            Some(start + count)
+        } else {
+            None
+        };
+
+        EscrowListPage {
+            items,
+            total,
+            next_offset,
+        }
+    }
+
+    /// Paginated enumeration of escrows for a specific buyer (issue #49).
+    ///
+    /// Returns up to `min(limit, MAX_PAGE_LIMIT)` [`EscrowRecord`]s belonging
+    /// to `buyer`, starting at zero-based `offset` within that buyer's index.
+    /// The per-buyer index is maintained by `create_internal` in creation order.
+    ///
+    /// `page.total`       — total number of escrows created by this buyer.
+    /// `page.next_offset` — `Some(next)` when another page follows; `None` on
+    ///                      the last page.
+    pub fn list_escrows_by_buyer(
+        env: Env,
+        buyer: Address,
+        offset: u32,
+        limit: u32,
+    ) -> EscrowListPage {
+        let buyer_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BuyerEscrowIds(buyer))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let total = buyer_ids.len();
+        let capped_limit = limit.min(MAX_PAGE_LIMIT);
+        let start = offset.min(total);
+        let end = (start + capped_limit).min(total);
+
+        let mut items = soroban_sdk::Vec::new(&env);
+        for i in start..end {
+            let escrow_id = buyer_ids.get(i).unwrap();
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, EscrowRecord>(&DataKey::Escrow(escrow_id))
+            {
+                items.push_back(record);
+            }
+        }
+
+        let count = end - start;
+        let next_offset = if end < total {
+            Some(start + count)
+        } else {
+            None
+        };
+
+        EscrowListPage {
+            items,
+            total,
+            next_offset,
+        }
     }
 
     pub fn is_admin(env: Env, address: Address) -> bool {
@@ -3192,6 +3677,46 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Enable or disable the release-condition gate for buyer-originated
+    /// releases on an escrow (issue #48). Admin-only.
+    ///
+    /// When `require` is `true`, buyer-originated `partial_release`/`release`
+    /// on this escrow are blocked unless `get_release_eligibility` returns
+    /// eligible. The default is `false` for backward compatibility.
+    pub fn set_require_release_condition(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        require: bool,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+        if !Self::is_admin(env.clone(), caller) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        check_not_terminal(&record)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RequireReleaseCondition(escrow_id), &require);
+        Ok(true)
+    }
+
+    /// Read-only getter for whether buyer-originated releases on an escrow are
+    /// gated on the release condition. Defaults to `false` when unset.
+    pub fn get_require_release_condition(env: Env, escrow_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RequireReleaseCondition(escrow_id))
+            .unwrap_or(false)
+    }
+
     // ── Ticket 2: get_yield_config ────────────────────────────────────────────
 
     /// Read-only getter for the yield configuration of an escrow.
@@ -3223,6 +3748,87 @@ impl EscrowContract {
     /// storage.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+}
+
+#[cfg(test)]
+mod fee_distribution_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        env.mock_all_auths();
+        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
+        (client, admin, contract_id)
+    }
+
+    #[test]
+    fn rejects_zero_address_treasury() {
+        let env = Env::default();
+        let (client, admin, _contract_id) = setup(&env);
+        let shares = soroban_sdk::vec![
+            &env,
+            TreasuryShare {
+                treasury: Address::from_str(&env, ZERO_ACCOUNT_STRKEY),
+                bps: 100,
+            }
+        ];
+
+        let res = client.try_set_fee_distribution(&admin, &shares);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidAddress)));
+    }
+
+    #[test]
+    fn rejects_zero_bps_share() {
+        let env = Env::default();
+        let (client, admin, _contract_id) = setup(&env);
+        let treasury = Address::generate(&env);
+        let shares = soroban_sdk::vec![&env, TreasuryShare { treasury, bps: 0 }];
+
+        let res = client.try_set_fee_distribution(&admin, &shares);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
+    }
+
+    #[test]
+    fn rejects_too_many_treasuries() {
+        let env = Env::default();
+        let (client, admin, _contract_id) = setup(&env);
+        let mut shares = Vec::new(&env);
+        for _ in 0..=MAX_TREASURIES {
+            shares.push_back(TreasuryShare {
+                treasury: Address::generate(&env),
+                bps: 1,
+            });
+        }
+
+        let res = client.try_set_fee_distribution(&admin, &shares);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
+    }
+
+    #[test]
+    fn accepts_multi_treasury_distribution() {
+        let env = Env::default();
+        let (client, admin, _contract_id) = setup(&env);
+        let treasury1 = Address::generate(&env);
+        let treasury2 = Address::generate(&env);
+        let shares = soroban_sdk::vec![
+            &env,
+            TreasuryShare {
+                treasury: treasury1.clone(),
+                bps: 300,
+            },
+            TreasuryShare {
+                treasury: treasury2.clone(),
+                bps: 200,
+            },
+        ];
+
+        assert!(client.set_fee_distribution(&admin, &shares.clone()));
+        assert_eq!(client.get_fee_distribution(), shares);
     }
 }
 

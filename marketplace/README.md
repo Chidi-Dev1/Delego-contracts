@@ -53,7 +53,7 @@ pub fn get_commission(env: Env, merchant_id: u64) -> Result<u32, MarketplaceErro
 ```rust
 pub fn suspend_merchant(env: Env, admin: Address, merchant_id: u64) -> Result<(), MarketplaceError>
 pub fn unsuspend_merchant(env: Env, admin: Address, merchant_id: u64) -> Result<(), MarketplaceError>
-pub fn close_merchant(env: Env, admin: Address, merchant_id: u64) -> Result<(), MarketplaceError>
+pub fn close_merchant(env: Env, admin: Address, merchant_id: u64, reason: Symbol) -> Result<(), MarketplaceError>
 ```
 
 ### Reputation & Admin
