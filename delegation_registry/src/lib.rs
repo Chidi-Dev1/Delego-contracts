@@ -322,6 +322,10 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    /// Revokes an active or paused delegation.
+    ///
+    /// Returns `Ok(true)` if the delegation transitioned to `Revoked`.
+    /// Returns `Ok(false)` if the delegation was already `Revoked` (idempotent no-op).
     pub fn revoke_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
         let mut record: DelegationRecord = env
             .storage()
@@ -332,7 +336,7 @@ impl DelegationRegistry {
         record.owner.require_auth();
 
         if record.status == DelegationStatus::Revoked {
-            return Ok(true);
+            return Ok(false);
         }
 
         record.status = DelegationStatus::Revoked;
