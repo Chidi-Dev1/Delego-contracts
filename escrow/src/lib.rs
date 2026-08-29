@@ -737,6 +737,10 @@ pub const MAX_PAGE_LIMIT: u32 = 50;
 /// the actual holding period of an escrow.
 const SECONDS_PER_YEAR: i128 = 31_536_000;
 
+/// Maximum number of treasury rows accepted by `set_fee_distribution`.
+/// Keeps the fee-splitting loop bounded and prevents unbounded config growth.
+const MAX_TREASURIES: u32 = 10;
+
 fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
     match record.status {
         EscrowStatus::Released => Err(EscrowError::AlreadyReleased),
@@ -1248,8 +1252,18 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
+        if shares.len() > MAX_TREASURIES {
+            return Err(EscrowError::InvalidFeeBps);
+        }
+
         let mut total_bps: u32 = 0;
         for share in shares.iter() {
+            if is_zero_address(&env, &share.treasury) {
+                return Err(EscrowError::InvalidAddress);
+            }
+            if share.bps == 0 {
+                return Err(EscrowError::InvalidFeeBps);
+            }
             total_bps = total_bps
                 .checked_add(share.bps)
                 .ok_or(EscrowError::InvalidFeeBps)?;
@@ -3610,6 +3624,108 @@ impl EscrowContract {
     /// storage.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+}
+
+#[cfg(test)]
+mod fee_distribution_tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Env as _};
+
+    fn setup(env: &Env) -> Address {
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        env.mock_all_auths();
+        EscrowContract::initialize(
+            env.clone(),
+            admin.clone(),
+            250,
+            treasury,
+            1,
+            1_000_000,
+        )
+        .unwrap();
+        admin
+    }
+
+    #[test]
+    fn rejects_zero_address_treasury() {
+        let env = Env::default();
+        let admin = setup(&env);
+        let shares = soroban_sdk::vec![
+            &env,
+            TreasuryShare {
+                treasury: Address::from_str(&env, ZERO_ACCOUNT_STRKEY),
+                bps: 100,
+            }
+        ];
+
+        assert_eq!(
+            EscrowContract::set_fee_distribution(env.clone(), admin, shares),
+            Err(EscrowError::InvalidAddress)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_bps_share() {
+        let env = Env::default();
+        let admin = setup(&env);
+        let treasury = Address::generate(&env);
+        let shares = soroban_sdk::vec![
+            &env,
+            TreasuryShare {
+                treasury,
+                bps: 0,
+            }
+        ];
+
+        assert_eq!(
+            EscrowContract::set_fee_distribution(env.clone(), admin, shares),
+            Err(EscrowError::InvalidFeeBps)
+        );
+    }
+
+    #[test]
+    fn rejects_too_many_treasuries() {
+        let env = Env::default();
+        let admin = setup(&env);
+        let mut shares = Vec::new(&env);
+        for _ in 0..=MAX_TREASURIES {
+            shares.push_back(TreasuryShare {
+                treasury: Address::generate(&env),
+                bps: 1,
+            });
+        }
+
+        assert_eq!(
+            EscrowContract::set_fee_distribution(env.clone(), admin, shares),
+            Err(EscrowError::InvalidFeeBps)
+        );
+    }
+
+    #[test]
+    fn accepts_multi_treasury_distribution() {
+        let env = Env::default();
+        let admin = setup(&env);
+        let treasury1 = Address::generate(&env);
+        let treasury2 = Address::generate(&env);
+        let shares = soroban_sdk::vec![
+            &env,
+            TreasuryShare {
+                treasury: treasury1.clone(),
+                bps: 300,
+            },
+            TreasuryShare {
+                treasury: treasury2.clone(),
+                bps: 200,
+            },
+        ];
+
+        assert_eq!(
+            EscrowContract::set_fee_distribution(env.clone(), admin, shares.clone()),
+            Ok(true)
+        );
+        assert_eq!(EscrowContract::get_fee_distribution(env), shares);
     }
 }
 
