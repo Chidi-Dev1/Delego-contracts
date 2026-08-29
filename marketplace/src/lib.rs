@@ -192,6 +192,7 @@ pub struct AdminProposedEvent {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct AdminAcceptedEvent {
+    pub previous_admin: Address,
     pub new_admin: Address,
 }
 
@@ -1110,6 +1111,8 @@ impl MarketplaceContract {
             return Err(MarketplaceError::Unauthorized);
         }
 
+        let previous_admin = Self::get_admin(env.clone())?;
+
         env.storage().instance().set(&DataKey::Admin, &caller);
         env.storage()
             .instance()
@@ -1117,7 +1120,10 @@ impl MarketplaceContract {
 
         env.events().publish(
             (symbol_short!("mkplc"), symbol_short!("adm_acc")),
-            AdminAcceptedEvent { new_admin: caller },
+            AdminAcceptedEvent {
+                previous_admin,
+                new_admin: caller,
+            },
         );
 
         Ok(())
