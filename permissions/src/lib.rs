@@ -72,6 +72,8 @@ pub enum PermissionError {
     PendingDecreaseExists = 408,
     /// Time-lock on pending allowance decrease has not elapsed yet
     TimeLockActive = 409,
+    /// Decrease would drop the allowance limit below what has already been spent
+    LimitBelowSpent = 410,
 }
 
 #[contracttype]
@@ -1616,11 +1618,15 @@ impl PermissionsContract {
         owner.require_auth();
 
         let perm_key = DataKey::Permission(owner.clone(), delegate.clone());
-        let _record: PermissionRecord = env.storage().persistent().get(&perm_key).unwrap();
+        let record: PermissionRecord = env.storage().persistent().get(&perm_key).unwrap();
 
         let pend_key = DataKey::PendingDecrement(owner.clone(), delegate.clone());
         if env.storage().persistent().has(&pend_key) {
             return Err(PermissionError::PendingDecreaseExists);
+        }
+
+        if record.limit_total - amount < record.spent {
+            return Err(PermissionError::LimitBelowSpent);
         }
 
         let execution_time = env.ledger().timestamp() + 86400;
@@ -1655,7 +1661,7 @@ impl PermissionsContract {
         let previous_limit = record.limit_total;
         let new_limit = record.limit_total - pending.amount;
         if new_limit < record.spent {
-            return Err(PermissionError::ExceedsTotalLimit);
+            return Err(PermissionError::LimitBelowSpent);
         }
 
         record.limit_total = new_limit;

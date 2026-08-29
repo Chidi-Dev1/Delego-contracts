@@ -436,7 +436,7 @@ fn test_decrease_allowance_rejects_pending_decrease() {
 }
 
 #[test]
-fn test_execute_decrease_allowance_rejects_below_spent_amount() {
+fn test_decrease_allowance_rejects_below_spent_at_schedule_time() {
     let t = TestEnv::setup();
     let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
     let merchant = soroban_sdk::Address::generate(&t.env);
@@ -444,14 +444,35 @@ fn test_execute_decrease_allowance_rejects_below_spent_amount() {
 
     client.grant(&t.buyer, &t.agent, &1000, &1000, &merchants, &36000);
     client.execute_spend(&t.buyer, &t.agent, &800, &merchant);
-    client.decrease_allowance(&t.buyer, &t.agent, &300);
+
+    let decrease = client.try_decrease_allowance(&t.buyer, &t.agent, &300);
+    assert_eq!(decrease, Err(Ok(PermissionError::LimitBelowSpent)));
+
+    // No pending decrement should have been scheduled: allowance is untouched.
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 200);
+}
+
+#[test]
+fn test_execute_decrease_allowance_rejects_below_spent_at_execution_time() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchant = soroban_sdk::Address::generate(&t.env);
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &1000, &merchants, &36000);
+
+    // Valid at schedule time: 900 <= 1000 remaining.
+    client.decrease_allowance(&t.buyer, &t.agent, &900);
+
+    // Spend moves during the timelock, undercutting the scheduled decrease.
+    client.execute_spend(&t.buyer, &t.agent, &500, &merchant);
     t.env
         .ledger()
         .set_timestamp(t.env.ledger().timestamp() + 86401);
 
     assert_eq!(
         client.try_execute_decrease_allowance(&t.buyer, &t.agent),
-        Err(Ok(PermissionError::ExceedsTotalLimit))
+        Err(Ok(PermissionError::LimitBelowSpent))
     );
 }
 
