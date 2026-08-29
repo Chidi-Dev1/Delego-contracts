@@ -558,6 +558,12 @@ impl MarketplaceContract {
             return Err(MarketplaceError::Unauthorized);
         }
 
+        // Change-detection: Compare incoming metadata against stored value
+        if merchant.metadata == new_metadata {
+            // No change detected; skip write and event emission
+            return Ok(());
+        }
+
         let now = env.ledger().timestamp();
 
         if !is_admin {
