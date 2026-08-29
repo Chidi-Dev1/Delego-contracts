@@ -305,6 +305,19 @@ pub struct FeeConfig {
     pub treasury: Address,
 }
 
+/// Complete escrow configuration including admin and fee parameters.
+/// Used by `__constructor` to atomically initialize the contract at deploy time
+/// without requiring post-deployment initialization calls that could be front-run.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowConfig {
+    pub admin: Address,
+    pub fee_bps: u32,
+    pub treasury: Address,
+    pub min_amount: i128,
+    pub max_amount: i128,
+}
+
 /// One treasury's share of the release fee, used by [`FeeConfig`]'s
 /// multi-treasury successor configured via `set_fee_distribution`.
 #[contracttype]
@@ -832,7 +845,58 @@ pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
+    /// Constructor: Initialize the escrow contract at deploy time with atomic admin + config setup.
+    ///
+    /// The host guarantees this function runs exactly once during contract deployment,
+    /// eliminating the front-run vulnerability where the first mempool caller could seize admin
+    /// by calling `initialize` without authentication.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `config` - Complete [`EscrowConfig`] containing admin, fee parameters, and amount limits
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::InvalidFeeBps`] if fee_bps > 1000.
+    /// Returns [`EscrowError::InvalidLimits`] if min_amount <= 0 or max_amount < min_amount.
+    /// Returns [`EscrowError::InvalidAddress`] if treasury is a zero address.
+    pub fn __constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
+        // Validate configuration
+        if config.fee_bps > 1000 {
+            return Err(EscrowError::InvalidFeeBps);
+        }
+        if config.min_amount <= 0 || config.max_amount < config.min_amount {
+            return Err(EscrowError::InvalidLimits);
+        }
+        if is_zero_address(&env, &config.treasury) {
+            return Err(EscrowError::InvalidAddress);
+        }
+
+        // Atomically store admin and configuration at deploy time
+        env.storage().instance().set(&DataKey::Admin, &config.admin);
+        env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfig, &FeeConfig {
+                fee_bps: config.fee_bps,
+                treasury: config.treasury.clone(),
+            });
+        env.storage().instance().set(
+            &DataKey::AmountLimits,
+            &EscrowAmountLimits {
+                min_amount: config.min_amount,
+                max_amount: config.max_amount,
+            },
+        );
+
+        Ok(())
+    }
+
     /// Initialize the escrow contract with the admin, fee config, and amount limits.
+    ///
+    /// # Deprecation Note
+    /// For new deployments, prefer [`__constructor`] which is called atomically at deploy time
+    /// and cannot be front-run. This function exists for backward compatibility with legacy
+    /// contracts deployed before the constructor pattern was available.
     pub fn initialize(
         env: Env,
         admin: Address,
