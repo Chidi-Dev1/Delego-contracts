@@ -65,6 +65,13 @@ pub struct RegisterParams {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
+pub struct VerificationPolicy {
+    pub required: u32,
+    pub max_verifications: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct Verifier {
     pub address: Address,
     pub label: Symbol,
@@ -219,7 +226,7 @@ pub enum DataKey {
     MetadataCooldown,
     MerchantVerifier(u64, Address),
     MerchantVerifierList(u64),
-    RequiredVerifications(u64),
+    VerificationPolicy(u64),
     LastMetadataUpdate(u64),
     GlobalReputationContract,
 }
@@ -238,6 +245,7 @@ pub struct ExternalReputationScore {
 }
 
 const MAX_COMMISSION_BPS: u32 = 10_000;
+const MAX_REQUIRED_VERIFICATIONS: u32 = 50;
 const DEFAULT_METADATA_COOLDOWN_SECS: u64 = 86_400; // 24 hours
 const MAX_PAGE_LIMIT: u32 = 50;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
@@ -304,6 +312,15 @@ impl MarketplaceContract {
             params.required_verifications
         };
 
+        // Determine current verifier capacity and enforce bounds
+        let verifiers_len: u32 = Self::get_verifiers(env.clone()).len();
+        if required_verifications > MAX_REQUIRED_VERIFICATIONS {
+            return Err(MarketplaceError::InvalidParam);
+        }
+        if verifiers_len > 0 && required_verifications > verifiers_len {
+            return Err(MarketplaceError::InvalidParam);
+        }
+
         let new_merchant = Merchant {
             id: next_id,
             owner: Some(merchant.clone()),
@@ -325,10 +342,13 @@ impl MarketplaceContract {
             .persistent()
             .set(&DataKey::Merchant(next_id), &new_merchant);
         env.storage().persistent().set(&name_key, &next_id);
-        env.storage().persistent().set(
-            &DataKey::RequiredVerifications(next_id),
-            &required_verifications,
-        );
+        let policy = VerificationPolicy {
+            required: required_verifications,
+            max_verifications: verifiers_len.min(MAX_REQUIRED_VERIFICATIONS),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerificationPolicy(next_id), &policy);
         env.storage()
             .persistent()
             .set(&DataKey::VerifiedCount(next_id), &0u32);
@@ -370,7 +390,7 @@ impl MarketplaceContract {
         );
         storage.extend_ttl(&name_key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         storage.extend_ttl(
-            &DataKey::RequiredVerifications(next_id),
+            &DataKey::VerificationPolicy(next_id),
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -586,6 +606,25 @@ impl MarketplaceContract {
             return Err(MarketplaceError::VerifierNotFound);
         }
 
+        // Ensure removal won't invalidate any existing merchant verification policies
+        let new_verifiers_len: u32 = new_verifiers.len();
+        let merchant_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantIds)
+            .unwrap_or_else(|| Vec::new(&env));
+        for id in merchant_ids.iter() {
+            let policy: Option<VerificationPolicy> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::VerificationPolicy(id));
+            if let Some(p) = policy {
+                if p.required > new_verifiers_len {
+                    return Err(MarketplaceError::InvalidParam);
+                }
+            }
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::Verifiers, &new_verifiers);
@@ -655,11 +694,13 @@ impl MarketplaceContract {
             .persistent()
             .set(&DataKey::VerifiedCount(merchant_id), &new_count);
 
-        let required: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::RequiredVerifications(merchant_id))
-            .unwrap_or(1);
+        let required: u32 = {
+            let policy: Option<VerificationPolicy> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::VerificationPolicy(merchant_id));
+            policy.map(|p| p.required).unwrap_or(1)
+        };
 
         if new_count >= required {
             merchant.verified = true;
