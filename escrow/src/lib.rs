@@ -498,6 +498,74 @@ pub enum DataKey {
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
+/// Canonical ABI numbering for `EscrowError`.
+///
+/// Error codes are part of the contract ABI. They are frozen for the 0.x
+/// deployment line; do not renumber, remove, or reuse existing codes. The
+/// declaration order below is not meaningful — the `#[repr(u32)]` values are.
+///
+/// # Registry
+///
+/// `First version` records the first contract version in which a code is
+/// known to be present. Legacy variants are marked `≤0.2.0` because they
+/// predate this audit; exact pre-0.2.0 introduction releases are not
+/// tracked.
+///
+/// | Code | Variant | First version |
+/// |------|---------|---------------|
+/// | 1 | AlreadyInitialized | ≤0.2.0 |
+/// | 2 | NotFound | ≤0.2.0 |
+/// | 3 | Unauthorized | ≤0.2.0 |
+/// | 4 | AlreadyReleased | ≤0.2.0 |
+/// | 5 | AlreadyRefunded | ≤0.2.0 |
+/// | 6 | InvalidStatus | ≤0.2.0 |
+/// | 7 | TimeoutNotReached | ≤0.2.0 |
+/// | 8 | NotDisputed | ≤0.2.0 |
+/// | 9 | InvalidAmount | ≤0.2.0 |
+/// | 10 | TokenNotWhitelisted | ≤0.2.0 |
+/// | 11 | InsufficientEscrowBalance | ≤0.2.0 |
+/// | 12 | ZeroAmount | ≤0.2.0 |
+/// | 13 | NoPendingTransfer | ≤0.2.0 |
+/// | 14 | InvalidPendingAdmin | ≤0.2.0 |
+/// | 15 | AdminAlreadyExists | ≤0.2.0 |
+/// | 16 | InvalidFeeBps | ≤0.2.0 |
+/// | 17 | AmountBelowMin | ≤0.2.0 |
+/// | 18 | AmountAboveMax | ≤0.2.0 |
+/// | 19 | InvalidLimits | ≤0.2.0 |
+/// | 20 | NotAnArbiter | ≤0.2.0 |
+/// | 21 | AlreadyVoted | ≤0.2.0 |
+/// | 22 | InvalidQuorum | ≤0.2.0 |
+/// | 23 | QuorumNotReached | ≤0.2.0 |
+/// | 24 | QuorumConfigNotSet | ≤0.2.0 |
+/// | 25 | ConflictingQuorum | ≤0.2.0 |
+/// | 26 | CreationPaused | ≤0.2.0 |
+/// | 27 | AlreadyCancelled | ≤0.2.0 |
+/// | 28 | AlreadyFunded | ≤0.2.0 |
+/// | 29 | InvalidExtension | ≤0.2.0 |
+/// | 30 | PoolNotFound | ≤0.2.0 |
+/// | 31 | InsufficientPoolBalance | ≤0.2.0 |
+/// | 32 | InvalidAddress | ≤0.2.0 |
+/// | 33 | InvalidEscrowParticipants | ≤0.2.0 |
+/// | 36 | ReleaseConditionNotSet | ≤0.2.0 |
+/// | 37 | OracleCallFailed | ≤0.2.0 |
+/// | 38 | ConditionNotMet | ≤0.2.0 |
+/// | 39 | InvalidYieldConfig | ≤0.2.0 |
+/// | 40 | AmountLimitsNotSet | ≤0.2.0 |
+/// | 41 | FeeConfigNotSet | ≤0.2.0 |
+/// | 201 | InvalidReleaseRecipient | ≤0.2.0 |
+/// | 400+ | Reserved for new variants | next major |
+///
+/// # Allocating new variants
+///
+/// New variants MUST use codes in the reserved contiguous range starting at
+/// 400. Do not fill historical gaps or reuse codes from the registry above.
+///
+/// # Renumber plan
+///
+/// The next `ContractVersion` major bump (1.0.0) is the planned breaking
+/// release for renumbering `EscrowError` contiguously from 1 to N, removing
+/// gaps and sorting declaration order by code. Until that release, the codes
+/// in the registry above are stable.
 pub enum EscrowError {
     /// Contract already initialized
     AlreadyInitialized = 1,
