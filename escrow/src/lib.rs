@@ -488,6 +488,10 @@ pub enum DataKey {
     /// Admin flag: when `true`, buyer-originated releases on the escrow must
     /// pass `get_release_eligibility` (issue #48).
     RequireReleaseCondition(u64),
+    /// Append-only list of all escrow IDs, used for paginated enumeration (issue #49).
+    EscrowIds,
+    /// Per-buyer append-only list of escrow IDs (issue #49).
+    BuyerEscrowIds(Address),
 }
 
 #[contracterror]
@@ -709,6 +713,24 @@ pub struct EscrowSummary {
     pub amount: i128,
     pub status: EscrowStatus,
 }
+
+/// Paginated result returned by `list_escrows` and `list_escrows_by_buyer`
+/// (issue #49). `items` contains up to `limit` escrow records starting at
+/// `offset`. `total` is the total number of escrows in the queried index.
+/// `next_offset` is `Some(offset + items.len())` when more records follow,
+/// or `None` when the last page has been reached.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowListPage {
+    pub items: soroban_sdk::Vec<EscrowRecord>,
+    pub total: u32,
+    pub next_offset: Option<u32>,
+}
+
+/// Maximum number of escrows returned in a single page from `list_escrows`
+/// or `list_escrows_by_buyer`. Callers requesting a larger `limit` will
+/// silently receive at most this many records.
+pub const MAX_PAGE_LIMIT: u32 = 50;
 
 /// Seconds in a 365-day year, used to prorate `YieldConfig::apr_bps` down to
 /// the actual holding period of an escrow.
@@ -1703,6 +1725,27 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(last_id), &record);
+
+        // Maintain global escrow ID index for list_escrows (issue #49).
+        let mut all_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowIds)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        all_ids.push_back(last_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowIds, &all_ids);
+
+        // Maintain per-buyer index for list_escrows_by_buyer (issue #49).
+        let buyer_ids_key = DataKey::BuyerEscrowIds(buyer.clone());
+        let mut buyer_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&buyer_ids_key)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        buyer_ids.push_back(last_id);
+        env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
 
         if let (Some(hash), Some(sch)) = (order_hash, schema) {
             let metadata = EscrowMetadata {
@@ -3292,6 +3335,105 @@ impl EscrowContract {
         );
 
         Ok(true)
+    }
+
+    /// Paginated enumeration of all escrows (issue #49).
+    ///
+    /// Returns up to `min(limit, MAX_PAGE_LIMIT)` [`EscrowRecord`]s starting
+    /// at zero-based `offset`. The global escrow ID list is maintained by
+    /// `create_internal`, so records are returned in creation order.
+    ///
+    /// `page.total`       — total number of escrows ever created.
+    /// `page.next_offset` — `Some(next)` when another page follows; `None` on
+    ///                      the last page.
+    pub fn list_escrows(env: Env, offset: u32, limit: u32) -> EscrowListPage {
+        let all_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowIds)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let total = all_ids.len();
+        let capped_limit = limit.min(MAX_PAGE_LIMIT);
+        let start = offset.min(total);
+        let end = (start + capped_limit).min(total);
+
+        let mut items = soroban_sdk::Vec::new(&env);
+        for i in start..end {
+            let escrow_id = all_ids.get(i).unwrap();
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, EscrowRecord>(&DataKey::Escrow(escrow_id))
+            {
+                items.push_back(record);
+            }
+        }
+
+        let count = (end - start) as u32;
+        let next_offset = if end < total {
+            Some(start + count)
+        } else {
+            None
+        };
+
+        EscrowListPage {
+            items,
+            total,
+            next_offset,
+        }
+    }
+
+    /// Paginated enumeration of escrows for a specific buyer (issue #49).
+    ///
+    /// Returns up to `min(limit, MAX_PAGE_LIMIT)` [`EscrowRecord`]s belonging
+    /// to `buyer`, starting at zero-based `offset` within that buyer's index.
+    /// The per-buyer index is maintained by `create_internal` in creation order.
+    ///
+    /// `page.total`       — total number of escrows created by this buyer.
+    /// `page.next_offset` — `Some(next)` when another page follows; `None` on
+    ///                      the last page.
+    pub fn list_escrows_by_buyer(
+        env: Env,
+        buyer: Address,
+        offset: u32,
+        limit: u32,
+    ) -> EscrowListPage {
+        let buyer_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BuyerEscrowIds(buyer))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let total = buyer_ids.len();
+        let capped_limit = limit.min(MAX_PAGE_LIMIT);
+        let start = offset.min(total);
+        let end = (start + capped_limit).min(total);
+
+        let mut items = soroban_sdk::Vec::new(&env);
+        for i in start..end {
+            let escrow_id = buyer_ids.get(i).unwrap();
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, EscrowRecord>(&DataKey::Escrow(escrow_id))
+            {
+                items.push_back(record);
+            }
+        }
+
+        let count = (end - start) as u32;
+        let next_offset = if end < total {
+            Some(start + count)
+        } else {
+            None
+        };
+
+        EscrowListPage {
+            items,
+            total,
+            next_offset,
+        }
     }
 
     pub fn is_admin(env: Env, address: Address) -> bool {

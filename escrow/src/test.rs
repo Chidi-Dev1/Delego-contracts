@@ -1793,4 +1793,268 @@ mod test {
             "updated_at must advance through resolve"
         );
     }
+
+    // ─── Issue #49: Paginated list_escrows enumeration ───────────────────────
+
+    /// Helper: deposit a single escrow and return its id.
+    fn deposit_one(
+        env: &Env,
+        client: &EscrowContractClient<'_>,
+        admin: &Address,
+        buyer: &Address,
+        seller: &Address,
+        seed: u8,
+    ) -> u64 {
+        let token_admin = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(env, &token).mint(buyer, &10_000i128);
+        client.add_token(admin, &token);
+        let order_id = BytesN::from_array(env, &[seed; 32]);
+        client.deposit(
+            buyer, seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        )
+    }
+
+    #[test]
+    fn test_list_escrows_empty_before_any_deposit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+
+        let page = client.list_escrows(&0u32, &10u32);
+        assert_eq!(page.total, 0);
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_list_escrows_returns_correct_total_and_items() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        let id1 = deposit_one(&env, &client, &admin, &buyer, &seller, 1);
+        let id2 = deposit_one(&env, &client, &admin, &buyer, &seller, 2);
+        let id3 = deposit_one(&env, &client, &admin, &buyer, &seller, 3);
+
+        let page = client.list_escrows(&0u32, &10u32);
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 3);
+        assert!(page.next_offset.is_none());
+
+        // IDs must appear in creation order.
+        assert_eq!(page.items.get(0).unwrap().escrow_id, id1);
+        assert_eq!(page.items.get(1).unwrap().escrow_id, id2);
+        assert_eq!(page.items.get(2).unwrap().escrow_id, id3);
+    }
+
+    #[test]
+    fn test_list_escrows_pagination_first_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        for seed in 1u8..=5 {
+            deposit_one(&env, &client, &admin, &buyer, &seller, seed);
+        }
+
+        // Request page size 2 starting at offset 0.
+        let page = client.list_escrows(&0u32, &2u32);
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.next_offset, Some(2u32));
+    }
+
+    #[test]
+    fn test_list_escrows_pagination_middle_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        for seed in 1u8..=5 {
+            deposit_one(&env, &client, &admin, &buyer, &seller, seed);
+        }
+
+        // Request 2 items starting at offset 2.
+        let page = client.list_escrows(&2u32, &2u32);
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.next_offset, Some(4u32));
+    }
+
+    #[test]
+    fn test_list_escrows_pagination_last_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        for seed in 1u8..=5 {
+            deposit_one(&env, &client, &admin, &buyer, &seller, seed);
+        }
+
+        // Offset 4 → only 1 item left; no next page.
+        let page = client.list_escrows(&4u32, &2u32);
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items.len(), 1);
+        assert!(page.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_list_escrows_offset_beyond_total_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        deposit_one(&env, &client, &admin, &buyer, &seller, 1);
+
+        let page = client.list_escrows(&100u32, &10u32);
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_list_escrows_caps_at_max_page_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        // Deposit 10 escrows — requesting 9999 should be capped at MAX_PAGE_LIMIT (50).
+        for seed in 1u8..=10 {
+            deposit_one(&env, &client, &admin, &buyer, &seller, seed);
+        }
+
+        let page = client.list_escrows(&0u32, &9999u32);
+        // All 10 fit within the cap, so we get all 10 back.
+        assert_eq!(page.total, 10);
+        assert_eq!(page.items.len(), 10);
+        assert!(page.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_list_escrows_by_buyer_empty_for_new_buyer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _contract_id) = setup_client(&env);
+
+        let random_buyer = Address::generate(&env);
+        let page = client.list_escrows_by_buyer(&random_buyer, &0u32, &10u32);
+        assert_eq!(page.total, 0);
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_list_escrows_by_buyer_only_returns_that_buyers_escrows() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer_a = Address::generate(&env);
+        let buyer_b = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        let id_a1 = deposit_one(&env, &client, &admin, &buyer_a, &seller, 10);
+        let id_a2 = deposit_one(&env, &client, &admin, &buyer_a, &seller, 11);
+        let _id_b1 = deposit_one(&env, &client, &admin, &buyer_b, &seller, 20);
+
+        let page_a = client.list_escrows_by_buyer(&buyer_a, &0u32, &10u32);
+        assert_eq!(page_a.total, 2, "buyer_a should have exactly 2 escrows");
+        assert_eq!(page_a.items.len(), 2);
+        assert_eq!(page_a.items.get(0).unwrap().escrow_id, id_a1);
+        assert_eq!(page_a.items.get(1).unwrap().escrow_id, id_a2);
+
+        let page_b = client.list_escrows_by_buyer(&buyer_b, &0u32, &10u32);
+        assert_eq!(page_b.total, 1, "buyer_b should have exactly 1 escrow");
+    }
+
+    #[test]
+    fn test_list_escrows_by_buyer_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        for seed in 1u8..=5 {
+            deposit_one(&env, &client, &admin, &buyer, &seller, seed);
+        }
+
+        let page1 = client.list_escrows_by_buyer(&buyer, &0u32, &3u32);
+        assert_eq!(page1.total, 5);
+        assert_eq!(page1.items.len(), 3);
+        assert_eq!(page1.next_offset, Some(3u32));
+
+        let page2 = client.list_escrows_by_buyer(&buyer, &3u32, &3u32);
+        assert_eq!(page2.total, 5);
+        assert_eq!(page2.items.len(), 2);
+        assert!(page2.next_offset.is_none());
+    }
+
+    #[test]
+    fn test_buyer_index_maintained_on_batch_deposit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+
+        // Set up two different tokens (batch_deposit allows multiple tokens).
+        let token_admin1 = Address::generate(&env);
+        let token1 = env
+            .register_stellar_asset_contract_v2(token_admin1.clone())
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token1).mint(&buyer, &100_000i128);
+        client.add_token(&admin, &token1);
+
+        let token_admin2 = Address::generate(&env);
+        let token2 = env
+            .register_stellar_asset_contract_v2(token_admin2.clone())
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token2).mint(&buyer, &100_000i128);
+        client.add_token(&admin, &token2);
+
+        let mut orders = soroban_sdk::Vec::new(&env);
+        orders.push_back(crate::BatchDepositParams {
+            seller: seller.clone(),
+            token: token1.clone(),
+            amount: 1_000i128,
+            order_id: BytesN::from_array(&env, &[30u8; 32]),
+            timeout_ledgers: 1_000u32,
+            order_hash: None,
+            schema: None,
+        });
+        orders.push_back(crate::BatchDepositParams {
+            seller: seller.clone(),
+            token: token2.clone(),
+            amount: 1_000i128,
+            order_id: BytesN::from_array(&env, &[31u8; 32]),
+            timeout_ledgers: 1_000u32,
+            order_hash: None,
+            schema: None,
+        });
+
+        client.batch_deposit(&buyer, &orders);
+
+        // Buyer index should contain both escrows created via batch_deposit.
+        let page = client.list_escrows_by_buyer(&buyer, &0u32, &10u32);
+        assert_eq!(page.total, 2, "batch_deposit should maintain buyer index for each order");
+        assert_eq!(page.items.len(), 2);
+    }
 }
