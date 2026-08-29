@@ -576,10 +576,17 @@ fn test_two_step_admin_transfer() {
         MarketplaceError::Unauthorized
     );
 
+    // Accept with no proposal -> distinct NoPendingAdmin error (issue #113)
+    let no_proposal_acc = f.client.try_accept_admin(&new_admin);
+    assert_eq!(
+        no_proposal_acc.unwrap_err().unwrap(),
+        MarketplaceError::NoPendingAdmin
+    );
+
     // Current admin proposes new admin
     f.client.propose_admin(&f.admin, &new_admin);
 
-    // Stranger cannot accept
+    // Stranger (wrong caller, proposal exists) -> Unauthorized
     let stranger_acc = f.client.try_accept_admin(&stranger);
     assert_eq!(
         stranger_acc.unwrap_err().unwrap(),
@@ -589,6 +596,13 @@ fn test_two_step_admin_transfer() {
     // New admin accepts
     f.client.accept_admin(&new_admin);
     assert_eq!(f.client.get_admin(), new_admin);
+
+    // After acceptance the pending admin is cleared -> NoPendingAdmin again
+    let cleared_acc = f.client.try_accept_admin(&new_admin);
+    assert_eq!(
+        cleared_acc.unwrap_err().unwrap(),
+        MarketplaceError::NoPendingAdmin
+    );
 }
 
 #[test]
