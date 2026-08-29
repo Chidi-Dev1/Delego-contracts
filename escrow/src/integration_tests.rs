@@ -3,6 +3,7 @@
 use crate::{
     BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowContract,
     EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState,
+    MAX_TREASURIES, TreasuryShare,
 };
 use soroban_sdk::{
     symbol_short,
@@ -951,6 +952,89 @@ fn test_version_callable_without_auth() {
     let version = client.version();
     assert_eq!(version.name, symbol_short!("escrow"));
     assert_eq!(version.semver, symbol_short!("0_2_0"));
+}
+
+// ── Fee distribution validation (treasury addresses and shares) ──────────
+
+#[test]
+fn test_set_fee_distribution_accepts_valid_multi_treasury_config() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let mut config = Vec::new(&t.env);
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 6000,
+    });
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 4000,
+    });
+
+    let _ = escrow_client.set_fee_distribution(&t.admin, &config);
+}
+
+#[test]
+fn test_set_fee_distribution_rejects_zero_address_treasury() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let zero_address = Address::from_contract_id(&BytesN::from_array(&t.env, &[0u8; 32]));
+    let mut config = Vec::new(&t.env);
+    config.push_back(TreasuryShare {
+        treasury: zero_address,
+        bps: 10000,
+    });
+
+    assert!(matches!(
+        escrow_client.try_set_fee_distribution(&t.admin, &config),
+        Err(Ok(_))
+    ));
+}
+
+#[test]
+fn test_set_fee_distribution_rejects_zero_bps_share() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let mut config = Vec::new(&t.env);
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 0,
+    });
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 10000,
+    });
+
+    assert!(matches!(
+        escrow_client.try_set_fee_distribution(&t.admin, &config),
+        Err(Ok(_))
+    ));
+}
+
+#[test]
+fn test_set_fee_distribution_rejects_too_many_treasuries() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let max_treasuries = MAX_TREASURIES as u32;
+    let mut config = Vec::new(&t.env);
+    for _ in 0..max_treasuries {
+        config.push_back(TreasuryShare {
+            treasury: Address::generate(&t.env),
+            bps: 1,
+        });
+    }
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 10000 - max_treasuries,
+    });
+
+    assert!(matches!(
+        escrow_client.try_set_fee_distribution(&t.admin, &config),
+        Err(Ok(_))
+    ));
 }
 
 // ── Partial release tests ──────────────────────────────────────────────────
