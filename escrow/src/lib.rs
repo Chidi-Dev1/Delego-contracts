@@ -300,7 +300,7 @@ pub struct FeeConfig {
 }
 
 /// Complete escrow configuration including admin and fee parameters.
-/// Used by `__constructor` to atomically initialize the contract at deploy time
+/// Used by `initialize_from_config` to atomically initialize the contract at deploy time
 /// without requiring post-deployment initialization calls that could be front-run.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -856,9 +856,9 @@ pub struct EscrowContract;
 impl EscrowContract {
     /// Constructor: Initialize the escrow contract at deploy time with atomic admin + config setup.
     ///
-    /// The host guarantees this function runs exactly once during contract deployment,
-    /// eliminating the front-run vulnerability where the first mempool caller could seize admin
-    /// by calling `initialize` without authentication.
+    /// Unlike `initialize` (which can be called by anyone before admin is set),
+    /// this function provides a named atomic initializer that can be called once
+    /// to set up admin and configuration together.
     ///
     /// # Arguments
     /// * `env` - The contract environment
@@ -868,7 +868,10 @@ impl EscrowContract {
     /// Returns [`EscrowError::InvalidFeeBps`] if fee_bps > 1000.
     /// Returns [`EscrowError::InvalidLimits`] if min_amount <= 0 or max_amount < min_amount.
     /// Returns [`EscrowError::InvalidAddress`] if treasury is a zero address.
-    pub fn __constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
+    pub fn initialize_from_config(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(EscrowError::AlreadyInitialized);
+        }
         // Validate configuration
         if config.fee_bps > 1000 {
             return Err(EscrowError::InvalidFeeBps);
@@ -903,10 +906,10 @@ impl EscrowContract {
 
     /// Initialize the escrow contract with the admin, fee config, and amount limits.
     ///
-    /// # Deprecation Note
-    /// For new deployments, prefer [`__constructor`] which is called atomically at deploy time
-    /// and cannot be front-run. This function exists for backward compatibility with legacy
-    /// contracts deployed before the constructor pattern was available.
+    /// # Note
+    /// For new deployments, prefer [`initialize_from_config`] which initializes atomically
+    /// with a single [`EscrowConfig`] struct. This function remains available for backward
+    /// compatibility with contracts deployed before `initialize_from_config` was available.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -1962,12 +1965,12 @@ impl EscrowContract {
         if let Some(hash) = order_hash.clone() {
             env.storage()
                 .persistent()
-                .set(&DataKey::EscrowMetadataHash(last_id), &hash);
+                .set(&DataKey::EscrowMetadataHash(last_id), hash);
         }
-        if let Some(sch) = schema.clone() {
+        if let Some(ref sch) = schema {
             env.storage()
                 .persistent()
-                .set(&DataKey::EscrowMetadataSchema(last_id), &sch);
+                .set(&DataKey::EscrowMetadataSchema(last_id), sch);
         }
 
         // The metadata event is only emitted once both halves are present.

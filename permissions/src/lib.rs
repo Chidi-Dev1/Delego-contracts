@@ -1644,6 +1644,9 @@ impl PermissionsContract {
             merchant.clone(),
         )?;
 
+        // #54: Apply the same velocity check as execute_spend.
+        Self::check_velocity(&env, &owner, &delegate)?;
+
         // Advance the nonce before mutating spend state so a replay attempt
         // within the same ledger is rejected even if apply_spend panics.
         env.storage().persistent().set(&nonce_key, &(nonce + 1));
