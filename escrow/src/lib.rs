@@ -1959,7 +1959,7 @@ impl EscrowContract {
         env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
 
         if let (Some(hash), Some(sch)) = (order_hash.clone(), schema.clone()) {
-            let metadata = EscrowMetadata {
+            let _metadata = EscrowMetadata {
                 order_hash: hash.clone(),
                 schema: sch.clone(),
             };

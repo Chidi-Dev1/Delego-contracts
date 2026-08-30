@@ -1504,7 +1504,7 @@ impl PermissionsContract {
         owner: &Address,
         delegate: &Address,
     ) -> Result<(), PermissionError> {
-        let _velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
+        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
         if let Some(last_ledger) = env
             .storage()
             .persistent()
