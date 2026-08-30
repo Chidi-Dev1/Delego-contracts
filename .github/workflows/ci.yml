@@ -99,5 +99,10 @@ jobs:
           restore-keys: |
             cargo-wasm-${{ runner.os }}-
 
-      - name: Build contracts
-        run: cargo build --target wasm32-unknown-unknown --release
+      - name: Build every workspace member for WASM
+        run: |
+          set -euo pipefail
+          for package in $(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print("\\n".join(package["name"] for package in json.load(sys.stdin)["packages"]))'); do
+            echo "Building ${package}"
+            cargo build --package "${package}" --target wasm32-unknown-unknown --release
+          done
