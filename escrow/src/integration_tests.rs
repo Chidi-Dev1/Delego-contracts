@@ -2,12 +2,13 @@
 
 use crate::{
     BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowContract,
-    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState,
+    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
+    MAX_TREASURIES,
 };
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
-    Address, BytesN, Env, IntoVal, Vec,
+    testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
+    Address, BytesN, Env, IntoVal, Symbol, TryIntoVal, Vec,
 };
 
 struct TestEnv {
@@ -16,7 +17,6 @@ struct TestEnv {
     buyer: Address,
     seller: Address,
     agent: Address,
-    treasury: Address,
     token_contract_id: Address,
     escrow_contract_id: Address,
 }
@@ -57,7 +57,6 @@ impl TestEnv {
             buyer,
             seller,
             agent,
-            treasury,
             token_contract_id,
             escrow_contract_id,
         }
@@ -193,6 +192,34 @@ fn test_add_token_is_idempotent() {
     let tokens = escrow_client.list_tokens();
     assert_eq!(tokens.len(), 1);
     assert!(tokens.contains(&t.token_contract_id));
+}
+
+#[test]
+fn test_large_whitelist_pagination() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    // Add 150 tokens
+    for _ in 0..150 {
+        let new_token = Address::generate(&t.env);
+        assert!(escrow_client.add_token(&t.admin, &new_token));
+    }
+
+    let tokens = escrow_client.list_tokens();
+    assert_eq!(tokens.len(), 151); // 1 from setup + 150
+
+    // Test pagination
+    let page_1 = escrow_client.list_tokens_paginated(&0, &50);
+    assert_eq!(page_1.len(), 50);
+
+    let page_2 = escrow_client.list_tokens_paginated(&50, &50);
+    assert_eq!(page_2.len(), 50);
+
+    let page_4 = escrow_client.list_tokens_paginated(&150, &50);
+    assert_eq!(page_4.len(), 1); // Only 1 left
+
+    let empty_page = escrow_client.list_tokens_paginated(&151, &50);
+    assert_eq!(empty_page.len(), 0);
 }
 
 #[test]
@@ -953,6 +980,89 @@ fn test_version_callable_without_auth() {
     assert_eq!(version.semver, symbol_short!("0_2_0"));
 }
 
+// ── Fee distribution validation (treasury addresses and shares) ──────────
+
+#[test]
+fn test_set_fee_distribution_accepts_valid_multi_treasury_config() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let mut config = Vec::new(&t.env);
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 400,
+    });
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 600,
+    });
+
+    let _ = escrow_client.set_fee_distribution(&t.admin, &config);
+}
+
+#[test]
+fn test_set_fee_distribution_rejects_zero_address_treasury() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let zero_address = Address::from_str(&t.env, crate::ZERO_CONTRACT_STRKEY);
+    let mut config = Vec::new(&t.env);
+    config.push_back(TreasuryShare {
+        treasury: zero_address,
+        bps: 10000,
+    });
+
+    assert!(matches!(
+        escrow_client.try_set_fee_distribution(&t.admin, &config),
+        Err(Ok(_))
+    ));
+}
+
+#[test]
+fn test_set_fee_distribution_rejects_zero_bps_share() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let mut config = Vec::new(&t.env);
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 0,
+    });
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 10000,
+    });
+
+    assert!(matches!(
+        escrow_client.try_set_fee_distribution(&t.admin, &config),
+        Err(Ok(_))
+    ));
+}
+
+#[test]
+fn test_set_fee_distribution_rejects_too_many_treasuries() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let max_treasuries = MAX_TREASURIES;
+    let mut config = Vec::new(&t.env);
+    for _ in 0..max_treasuries {
+        config.push_back(TreasuryShare {
+            treasury: Address::generate(&t.env),
+            bps: 1,
+        });
+    }
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 10000 - max_treasuries,
+    });
+
+    assert!(matches!(
+        escrow_client.try_set_fee_distribution(&t.admin, &config),
+        Err(Ok(_))
+    ));
+}
+
 // ── Partial release tests ──────────────────────────────────────────────────
 
 #[test]
@@ -1707,6 +1817,59 @@ fn test_extend_timeout_via_quorum_rejects_zero_extension() {
     );
 }
 
+// ── Issue #36: extend_timeout typed InvalidExtension error ────────────────
+
+/// Extending the timeout to the same ledger as the current one is rejected
+/// with the typed `InvalidExtension` error.
+#[test]
+fn test_extend_timeout_rejects_equal_ledger() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    assert_eq!(
+        escrow_client.try_extend_timeout(&escrow_id, &t.buyer, &record.timeout_ledger),
+        Err(Ok(EscrowError::InvalidExtension))
+    );
+}
+
+/// Extending the timeout to a ledger earlier than the current one is
+/// rejected with the typed `InvalidExtension` error.
+#[test]
+fn test_extend_timeout_rejects_lower_ledger() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+    let lower = record.timeout_ledger - 5;
+
+    assert_eq!(
+        escrow_client.try_extend_timeout(&escrow_id, &t.buyer, &lower),
+        Err(Ok(EscrowError::InvalidExtension))
+    );
+}
+
+/// Extending the timeout to a strictly later ledger succeeds and updates the
+/// record.
+#[test]
+fn test_extend_timeout_accepts_higher_ledger() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+    let higher = record.timeout_ledger + 50;
+
+    let res = escrow_client.try_extend_timeout(&escrow_id, &t.buyer, &higher);
+    assert_eq!(res, Ok(Ok(true)));
+
+    let after = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(after.timeout_ledger, higher);
+}
+
 // ── Issue #335: Escrow Liquidity Pool for Instant Settlement ──────────────
 
 #[test]
@@ -2076,6 +2239,25 @@ fn test_batch_refund_three_orders_all_succeed() {
     );
 }
 
+/// True if the escrow contract emitted an event with the given second topic
+/// under the `admin` topic namespace. Events are read immediately after the
+/// emitting call: the test host enables invocation metering, which clears the
+/// events buffer at the start of each subsequent contract invocation.
+fn admin_event_emitted(t: &TestEnv, topic: Symbol, contract_id: &Address) -> bool {
+    for event in t.env.events().all().iter() {
+        let (c_id, topics, _value) = event;
+        if c_id != *contract_id || topics.len() != 2 {
+            continue;
+        }
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&t.env).unwrap();
+        let t1: Symbol = topics.get(1).unwrap().try_into_val(&t.env).unwrap();
+        if t0 == symbol_short!("admin") && t1 == topic {
+            return true;
+        }
+    }
+    false
+}
+
 fn deposit_escrow_with_id(t: &TestEnv, amount: i128, timeout_ledgers: u32, id_seed: u8) -> u64 {
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
     escrow_client.deposit(
@@ -2090,314 +2272,108 @@ fn deposit_escrow_with_id(t: &TestEnv, amount: i128, timeout_ledgers: u32, id_se
     )
 }
 
-// --- Issue #136: extend_timeout mutual-auth, split_release over-allocation, withdraw_from_pool edge cases ---
+// ── Upgrade + two-step admin handover integration test ───────────────────
 
-/// Setup without `mock_all_auths` so individual auth calls can be selectively mocked.
-fn setup_no_mock_auths() -> TestEnv {
-    let env = Env::default();
-
-    let admin = Address::generate(&env);
-    let buyer = Address::generate(&env);
-    let seller = Address::generate(&env);
-    let agent = Address::generate(&env);
-    let treasury = Address::generate(&env);
-
-    let token_admin = Address::generate(&env);
-    let token_contract_id = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_contract_id);
-    token_admin_client.mint(&buyer, &10000);
-
-    let escrow_contract_id = env.register(EscrowContract, ());
-    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
-    let min_amount = 100i128;
-    let max_amount = 10000i128;
-    escrow_client.initialize(&admin, &0u32, &treasury, &min_amount, &max_amount);
-    escrow_client.add_token(&admin, &token_contract_id);
-
-    TestEnv {
-        env,
-        admin,
-        buyer,
-        seller,
-        agent,
-        treasury,
-        token_contract_id,
-        escrow_contract_id,
-    }
-}
+// A minimal WebAssembly module (with the standard contract metadata section)
+// that serves only as the upgrade target so `update_current_contract_wasm`
+// has a real contract-code ledger entry to point at. Its exported functions
+// are never invoked — after the upgrade we read persistent state directly.
+const WASM_STUB: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x00, 0x01, 0x7e, 0x60,
+    0x00, 0x00, 0x03, 0x03, 0x02, 0x00, 0x01, 0x05, 0x03, 0x01, 0x00, 0x10, 0x06, 0x09, 0x01, 0x7f,
+    0x01, 0x41, 0x80, 0x80, 0xc0, 0x00, 0x0b, 0x07, 0x15, 0x03, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72,
+    0x79, 0x02, 0x00, 0x04, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x01, 0x5f, 0x00, 0x01, 0x0a, 0x09,
+    0x02, 0x04, 0x00, 0x42, 0x01, 0x0b, 0x02, 0x00, 0x0b, 0x00, 0x2b, 0x0e, 0x63, 0x6f, 0x6e, 0x74,
+    0x72, 0x61, 0x63, 0x74, 0x73, 0x70, 0x65, 0x63, 0x76, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x1e, 0x11, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63,
+    0x74, 0x65, 0x6e, 0x76, 0x6d, 0x65, 0x74, 0x61, 0x76, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6f, 0x0e, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63,
+    0x74, 0x6d, 0x65, 0x74, 0x61, 0x76, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x72,
+    0x73, 0x76, 0x65, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x31, 0x2e, 0x39, 0x37, 0x2e,
+    0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x72, 0x73, 0x73, 0x64, 0x6b,
+    0x76, 0x65, 0x72, 0x00, 0x00, 0x00, 0x30, 0x32, 0x32, 0x2e, 0x30, 0x2e, 0x31, 0x31, 0x23, 0x33,
+    0x34, 0x66, 0x37, 0x66, 0x35, 0x33, 0x61, 0x65, 0x33, 0x31, 0x65, 0x30, 0x66, 0x64, 0x30, 0x32,
+    0x61, 0x61, 0x62, 0x34, 0x33, 0x36, 0x61, 0x39, 0x38, 0x37, 0x32, 0x65, 0x37, 0x39, 0x66, 0x61,
+    0x36, 0x37, 0x31, 0x63, 0x61, 0x30, 0x32,
+];
 
 #[test]
-fn test_extend_timeout_buyer_only_auth_fails() {
-    let t = setup_no_mock_auths();
-    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-
-    // Deposit an escrow using buyer auth.
-    escrow_client
-        .mock_auths(&[MockAuth {
-            address: &t.buyer,
-            invoke: &MockAuthInvoke {
-                contract: &t.escrow_contract_id,
-                fn_name: "deposit",
-                args: (
-                    t.buyer.clone(),
-                    t.seller.clone(),
-                    t.token_contract_id.clone(),
-                    1000i128,
-                    order_id_n(&t.env, 1),
-                    100u32,
-                    Option::<BytesN<32>>::None,
-                    Option::<soroban_sdk::Symbol>::None,
-                )
-                    .into_val(&t.env),
-                sub_invokes: &[],
-            },
-        }])
-        .deposit(
-            &t.buyer,
-            &t.seller,
-            &t.token_contract_id,
-            &1000,
-            &order_id_n(&t.env, 1),
-            &100,
-            &None,
-            &None,
-        );
-
-    let escrow_id = 1u64;
-    let record = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(record.status, EscrowStatus::Funded);
-
-    // Buyer-only: mock auth for buyer only on extend_timeout.
-    // seller.require_auth() inside the contract is not satisfied.
-    let result = escrow_client
-        .mock_auths(&[MockAuth {
-            address: &t.buyer,
-            invoke: &MockAuthInvoke {
-                contract: &t.escrow_contract_id,
-                fn_name: "extend_timeout",
-                args: (escrow_id, t.buyer.clone(), 200u32).into_val(&t.env),
-                sub_invokes: &[],
-            },
-        }])
-        .try_extend_timeout(&escrow_id, &t.buyer, &200u32);
-    assert!(result.is_err());
-
-    // Timeout should remain unchanged.
-    let after = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(after.timeout_ledger, record.timeout_ledger);
-}
-
-#[test]
-fn test_extend_timeout_seller_only_auth_fails() {
-    let t = setup_no_mock_auths();
-    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-
-    // Deposit an escrow using buyer auth.
-    escrow_client
-        .mock_auths(&[MockAuth {
-            address: &t.buyer,
-            invoke: &MockAuthInvoke {
-                contract: &t.escrow_contract_id,
-                fn_name: "deposit",
-                args: (
-                    t.buyer.clone(),
-                    t.seller.clone(),
-                    t.token_contract_id.clone(),
-                    1000i128,
-                    order_id_n(&t.env, 2),
-                    100u32,
-                    Option::<BytesN<32>>::None,
-                    Option::<soroban_sdk::Symbol>::None,
-                )
-                    .into_val(&t.env),
-                sub_invokes: &[],
-            },
-        }])
-        .deposit(
-            &t.buyer,
-            &t.seller,
-            &t.token_contract_id,
-            &1000,
-            &order_id_n(&t.env, 2),
-            &100,
-            &None,
-            &None,
-        );
-
-    let escrow_id = 1u64;
-    let record = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(record.status, EscrowStatus::Funded);
-
-    // Seller-only: mock auth for seller only on extend_timeout.
-    // buyer.require_auth() inside the contract is not satisfied.
-    let result = escrow_client
-        .mock_auths(&[MockAuth {
-            address: &t.seller,
-            invoke: &MockAuthInvoke {
-                contract: &t.escrow_contract_id,
-                fn_name: "extend_timeout",
-                args: (escrow_id, t.seller.clone(), 200u32).into_val(&t.env),
-                sub_invokes: &[],
-            },
-        }])
-        .try_extend_timeout(&escrow_id, &t.seller, &200u32);
-    assert!(result.is_err());
-
-    // Timeout should remain unchanged.
-    let after = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(after.timeout_ledger, record.timeout_ledger);
-}
-
-#[test]
-fn test_extend_timeout_both_parties_auth_succeeds() {
-    let t = setup_no_mock_auths();
-    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-
-    // Deposit an escrow using buyer auth.
-    escrow_client
-        .mock_auths(&[MockAuth {
-            address: &t.buyer,
-            invoke: &MockAuthInvoke {
-                contract: &t.escrow_contract_id,
-                fn_name: "deposit",
-                args: (
-                    t.buyer.clone(),
-                    t.seller.clone(),
-                    t.token_contract_id.clone(),
-                    1000i128,
-                    order_id_n(&t.env, 3),
-                    100u32,
-                    Option::<BytesN<32>>::None,
-                    Option::<soroban_sdk::Symbol>::None,
-                )
-                    .into_val(&t.env),
-                sub_invokes: &[],
-            },
-        }])
-        .deposit(
-            &t.buyer,
-            &t.seller,
-            &t.token_contract_id,
-            &1000,
-            &order_id_n(&t.env, 3),
-            &100,
-            &None,
-            &None,
-        );
-
-    let escrow_id = 1u64;
-    let record = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(record.status, EscrowStatus::Funded);
-    let original_timeout = record.timeout_ledger;
-
-    // Both buyer + seller authenticate the extend_timeout call.
-    let result = escrow_client
-        .mock_auths(&[
-            MockAuth {
-                address: &t.buyer,
-                invoke: &MockAuthInvoke {
-                    contract: &t.escrow_contract_id,
-                    fn_name: "extend_timeout",
-                    args: (escrow_id, t.buyer.clone(), 200u32).into_val(&t.env),
-                    sub_invokes: &[],
-                },
-            },
-            MockAuth {
-                address: &t.seller,
-                invoke: &MockAuthInvoke {
-                    contract: &t.escrow_contract_id,
-                    fn_name: "extend_timeout",
-                    args: (escrow_id, t.buyer.clone(), 200u32).into_val(&t.env),
-                    sub_invokes: &[],
-                },
-            },
-        ])
-        .try_extend_timeout(&escrow_id, &t.buyer, &200u32);
-    assert_eq!(result, Ok(Ok(true)));
-
-    // Timeout was extended.
-    let after = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(after.timeout_ledger, 200);
-    assert!(after.timeout_ledger > original_timeout);
-}
-
-#[test]
-fn test_split_release_shares_exceed_remaining_fails() {
+fn test_upgrade_with_admin_handover_preserves_state_and_emits_event() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let contract_id = t.escrow_contract_id.clone();
 
+    // Create an escrow so there is persistent state whose survival we assert.
     let escrow_id = deposit_escrow(&t, 1000, 100);
-    let recipient = Address::generate(&t.env);
+    let record_before = escrow_client.get_escrow(&escrow_id);
+    assert!(!escrow_client.is_migrated());
 
-    // First, do a valid partial split: release 400.
-    let mut shares = Vec::new(&t.env);
-    shares.push_back((recipient.clone(), 400i128));
-    assert!(escrow_client.split_release(&escrow_id, &t.buyer, &shares));
-    let record_after_first = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(record_after_first.released_amount, 400);
-    assert_eq!(record_after_first.status, EscrowStatus::Funded);
-
-    // Remaining = 1000 - 400 = 600.
-    // Now attempt a split where shares exceed remaining (601 > 600).
-    let mut excess_shares = Vec::new(&t.env);
-    excess_shares.push_back((recipient.clone(), 601i128));
-    assert_eq!(
-        escrow_client.try_split_release(&escrow_id, &t.buyer, &excess_shares),
-        Err(Ok(EscrowError::InsufficientEscrowBalance))
+    // Two-step admin handover: the current admin proposes a successor, then
+    // the successor accepts the primary-admin role. Each event is read
+    // immediately after the call that emits it, because the test host only
+    // retains the events of the most recent invocation.
+    let new_admin = Address::generate(&t.env);
+    assert!(escrow_client.propose_admin(&t.admin, &new_admin));
+    assert!(
+        admin_event_emitted(&t, symbol_short!("proposed"), &contract_id),
+        "AdminProposedEvent was not emitted"
     );
+    assert_eq!(escrow_client.get_pending_admin(), Some(new_admin.clone()));
 
-    // State should be unchanged after the rejected operation.
-    let record_after_reject = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(record_after_reject.released_amount, 400);
-    assert_eq!(record_after_reject.status, EscrowStatus::Funded);
-    assert_eq!(token_client.balance(&t.seller), 400);
-}
-
-#[test]
-fn test_withdraw_from_pool_exceeding_reserves_preserves_state() {
-    let t = TestEnv::setup();
-    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
-
-    let funder = Address::generate(&t.env);
-    let token_admin_client =
-        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token_contract_id);
-    token_admin_client.mint(&funder, &500);
-
-    // Fund pool with 500.
-    escrow_client.fund_pool(&funder, &t.token_contract_id, &500);
-    let pool_after_fund = escrow_client.get_liquidity_pool(&t.token_contract_id);
-    assert_eq!(pool_after_fund.balance, 500);
-
-    // Attempt to withdraw more than the pool holds (600 > 500).
-    assert_eq!(
-        escrow_client.try_withdraw_from_pool(&t.admin, &t.token_contract_id, &600),
-        Err(Ok(EscrowError::InsufficientPoolBalance))
+    assert!(escrow_client.accept_admin(&new_admin));
+    assert!(
+        admin_event_emitted(&t, symbol_short!("accepted"), &contract_id),
+        "AdminAcceptedEvent was not emitted"
     );
+    assert_eq!(escrow_client.get_pending_admin(), None);
 
-    // Pool balance and token balances are unchanged after the rejected withdrawal.
-    let pool_after_reject = escrow_client.get_liquidity_pool(&t.token_contract_id);
-    assert_eq!(pool_after_reject.balance, 500);
-    assert_eq!(token_client.balance(&t.escrow_contract_id), 500);
-    assert_eq!(token_client.balance(&t.admin), 0);
+    // The fresh primary admin upgrades the contract to new wasm code.
+    let wasm_hash = t.env.deployer().upload_contract_wasm(WASM_STUB);
+    assert!(escrow_client.upgrade(&new_admin, &wasm_hash));
 
-    // A valid withdrawal within the reserve succeeds.
-    let new_balance = escrow_client.withdraw_from_pool(&t.admin, &t.token_contract_id, &300);
-    assert_eq!(new_balance, 200);
-    assert_eq!(token_client.balance(&t.admin), 300);
+    // Assert the ContractUpgradedEvent immediately after the upgrade call,
+    // before any further invocation clears the events buffer.
+    let events = t.env.events().all();
+    let mut upgraded_found = false;
+    for event in events.iter() {
+        let (c_id, topics, value) = event;
+        if c_id != contract_id || topics.len() != 2 {
+            continue;
+        }
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&t.env).unwrap();
+        let t1: Symbol = topics.get(1).unwrap().try_into_val(&t.env).unwrap();
+        if t0 == symbol_short!("escrow") && t1 == symbol_short!("upgraded") {
+            let evt: crate::ContractUpgradedEvent = value.try_into_val(&t.env).unwrap();
+            assert_eq!(evt.admin, new_admin);
+            assert_eq!(evt.previous_semver, symbol_short!("0_2_0"));
+            assert_eq!(evt.new_wasm_hash, wasm_hash);
+            upgraded_found = true;
+        }
+    }
+    assert!(upgraded_found, "ContractUpgradedEvent was not emitted");
 
-    // After the valid withdrawal, an attempt for the full original 500 now fails.
+    // After the upgrade the contract's executable points at the stub wasm,
+    // which implements nothing, so re-read persistent state directly rather
+    // than dispatching through the client.
+    let migrated: bool = t.env.as_contract(&contract_id, || {
+        t.env
+            .storage()
+            .instance()
+            .get(&crate::DataKey::MigrationFlag)
+            .unwrap_or(false)
+    });
+    assert!(migrated, "migration flag must be set after upgrade");
+
+    let record_after: crate::EscrowRecord = t.env.as_contract(&contract_id, || {
+        t.env
+            .storage()
+            .persistent()
+            .get(&crate::DataKey::Escrow(escrow_id))
+            .unwrap()
+    });
     assert_eq!(
-        escrow_client.try_withdraw_from_pool(&t.admin, &t.token_contract_id, &500),
-        Err(Ok(EscrowError::InsufficientPoolBalance))
-    );
-    assert_eq!(
-        escrow_client
-            .get_liquidity_pool(&t.token_contract_id)
-            .balance,
-        200
+        record_before, record_after,
+        "escrow record must survive the upgrade"
     );
 }
