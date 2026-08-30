@@ -9,6 +9,7 @@ Delego uses Soroban smart contracts to anchor trust-critical state on the Stella
 - [On-Chain vs Off-Chain](#on-chain-vs-off-chain)
 - [Contract Interactions](#contract-interactions)
 - [State Management](#state-management)
+- [Cold-Storage & State Maintenance Utilities](#cold-storage--state-maintenance-utilities)
 - [Upgrade Patterns](#upgrade-patterns)
 - [Security Considerations](#security-considerations)
 
@@ -378,6 +379,32 @@ e.storage().instance().set(
     &data
 );
 ```
+
+## Cold-Storage & State Maintenance Utilities
+
+To prevent dead state accumulation and bound storage costs on-chain, Delego contracts implement a standardized maintenance (sweep and prune) interface across all crates.
+
+### Design Principles
+
+1. **Bounded Batch Operations**: Maintenance operations are strictly bounded (e.g. `MAX_SWEEP_BATCH = 50` or `MAX_PAGE_LIMIT = 50`) to ensure deterministic gas and execution budgets per transaction.
+2. **Access Control**:
+   - **Public Expiry Sweeps**: State transitions gated strictly by deterministic rules (e.g. sequence number expiry or inactivity timestamp) can be triggered by any caller.
+   - **Admin-Gated Pruning**: Modifications to auxiliary indices and vote data require administrative authorization.
+3. **Idempotency & Safe No-ops**: Passing already-swept or non-eligible records safely increments no counts and emits no redundant events.
+4. **Indexer Observability**: Successful maintenance passes publish standard event topics (`(contract, "pruned")` or `(contract, "expired")`).
+
+### Contract Maintenance Specification
+
+| Contract | Function | Access | Batch Bound | Purpose |
+|---|---|---|---|---|
+| **Delegation Registry** | `sweep_expired(delegation_ids)` | Public | ≤ 50 IDs | Transitions expired delegations to inactive state |
+| **Permissions** | `sweep_expired(owner, delegate, caller)` | Public | 1 Pair | Transitions expired permission to `Expired` |
+| **Permissions** | `sweep_expired_batch(pairs, caller)` | Public | ≤ 50 Pairs | Batch transitions eligible expired permissions |
+| **Permissions** | `sweep_inactive(owner, delegate, caller)` | Public | 1 Pair | Auto-revokes permissions exceeding inactivity threshold |
+| **Permissions** | `sweep_inactive_batch(pairs, caller)` | Public | ≤ 50 Pairs | Batch revokes permissions exceeding inactivity threshold |
+| **Marketplace** | `prune_closed_merchants(admin, merchant_ids)` | Admin | ≤ 50 IDs | Prunes `Closed` merchants from `MerchantIds` and `CategoryIndex` |
+| **Reputation** | `prune_entity_history(admin, entity, max_records)` | Admin | ≤ 50 Records | Trims transaction history beyond the scoring window (`SCORE_WINDOW = 200`) |
+| **Escrow** | `prune_dispute_votes(admin, escrow_ids)` | Admin | ≤ 50 IDs | Cleans up `DisputeVotes` and `TimeoutExtensionVotes` for settled escrows |
 
 ## Upgrade Patterns
 

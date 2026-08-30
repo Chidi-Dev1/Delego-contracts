@@ -875,34 +875,52 @@ fn test_status_filtered_discovery() {
     f.client.suspend_merchant(&f.admin, &id2);
 
     // Close merchant 3
-    f.client.close_merchant(&f.admin, &id3, &symbol_short!("test"));
+    f.client
+        .close_merchant(&f.admin, &id3, &symbol_short!("test"));
 
     // Get merchants by Registered status (should be id1 and id4)
-    let registered = f.client.get_merchants_by_status(&MerchantStatus::Registered, &0, &10);
+    let registered = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Registered, &0, &10);
     assert_eq!(registered.items.len(), 2);
     assert_eq!(registered.total, 2);
     assert_eq!(registered.next_offset, None);
     assert_eq!(registered.items.get(0).unwrap().id, id1);
-    assert_eq!(registered.items.get(0).unwrap().status, MerchantStatus::Registered);
+    assert_eq!(
+        registered.items.get(0).unwrap().status,
+        MerchantStatus::Registered
+    );
     assert_eq!(registered.items.get(1).unwrap().id, id4);
-    assert_eq!(registered.items.get(1).unwrap().status, MerchantStatus::Registered);
+    assert_eq!(
+        registered.items.get(1).unwrap().status,
+        MerchantStatus::Registered
+    );
 
     // Get merchants by Suspended status (should be id2)
-    let suspended = f.client.get_merchants_by_status(&MerchantStatus::Suspended, &0, &10);
+    let suspended = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Suspended, &0, &10);
     assert_eq!(suspended.items.len(), 1);
     assert_eq!(suspended.total, 1);
     assert_eq!(suspended.items.get(0).unwrap().id, id2);
-    assert_eq!(suspended.items.get(0).unwrap().status, MerchantStatus::Suspended);
+    assert_eq!(
+        suspended.items.get(0).unwrap().status,
+        MerchantStatus::Suspended
+    );
 
     // Get merchants by Closed status (should be id3)
-    let closed = f.client.get_merchants_by_status(&MerchantStatus::Closed, &0, &10);
+    let closed = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Closed, &0, &10);
     assert_eq!(closed.items.len(), 1);
     assert_eq!(closed.total, 1);
     assert_eq!(closed.items.get(0).unwrap().id, id3);
     assert_eq!(closed.items.get(0).unwrap().status, MerchantStatus::Closed);
 
     // Get merchants by Verified status (should be empty)
-    let verified = f.client.get_merchants_by_status(&MerchantStatus::Verified, &0, &10);
+    let verified = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Verified, &0, &10);
     assert_eq!(verified.items.len(), 0);
     assert_eq!(verified.total, 0);
     assert_eq!(verified.next_offset, None);
@@ -967,7 +985,8 @@ fn test_status_filtered_discovery_by_category() {
 
     // Suspend id2, Close id3
     f.client.suspend_merchant(&f.admin, &id2);
-    f.client.close_merchant(&f.admin, &id3, &symbol_short!("test"));
+    f.client
+        .close_merchant(&f.admin, &id3, &symbol_short!("test"));
 
     // Get tech merchants by Registered status (should be id1 and id4)
     let registered = f.client.get_merchants_by_category_status(
@@ -1046,22 +1065,37 @@ fn test_discovery_page_cursor_fields() {
     let page1 = f.client.get_merchants(&0, &3);
     assert_eq!(page1.total, 10);
     assert_eq!(page1.items.len(), 3);
-    assert_eq!(page1.next_offset, Some(3), "First page should have next_offset = 3");
+    assert_eq!(
+        page1.next_offset,
+        Some(3),
+        "First page should have next_offset = 3"
+    );
 
     let page2 = f.client.get_merchants(&page1.next_offset.unwrap(), &3);
     assert_eq!(page2.total, 10);
     assert_eq!(page2.items.len(), 3);
-    assert_eq!(page2.next_offset, Some(6), "Second page should have next_offset = 6");
+    assert_eq!(
+        page2.next_offset,
+        Some(6),
+        "Second page should have next_offset = 6"
+    );
 
     let page3 = f.client.get_merchants(&page2.next_offset.unwrap(), &3);
     assert_eq!(page3.total, 10);
     assert_eq!(page3.items.len(), 3);
-    assert_eq!(page3.next_offset, Some(9), "Third page should have next_offset = 9");
+    assert_eq!(
+        page3.next_offset,
+        Some(9),
+        "Third page should have next_offset = 9"
+    );
 
     let page4 = f.client.get_merchants(&page3.next_offset.unwrap(), &3);
     assert_eq!(page4.total, 10);
     assert_eq!(page4.items.len(), 1, "Last page should have 1 item");
-    assert_eq!(page4.next_offset, None, "Last page should have None for next_offset");
+    assert_eq!(
+        page4.next_offset, None,
+        "Last page should have None for next_offset"
+    );
 }
 
 #[test]
@@ -1256,4 +1290,114 @@ fn test_flight_merchant_lifecycle_and_discovery() {
     assert_eq!(item.commission_rate_bps, 350);
     assert!(item.verified);
     assert_eq!(item.status, MerchantStatus::Verified);
+}
+
+// --- prune_closed_merchants tests ---
+
+#[test]
+fn test_prune_closed_merchants_removes_from_indices() {
+    let f = TestFixture::setup();
+    let owner1 = Address::generate(&f.env);
+    let owner2 = Address::generate(&f.env);
+
+    let id1 = f.client.register_merchant(
+        &owner1,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Store 1"),
+            description: String::from_str(&f.env, "Desc 1"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "1.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+
+    let id2 = f.client.register_merchant(
+        &owner2,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Store 2"),
+            description: String::from_str(&f.env, "Desc 2"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "2.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+
+    // Both are present in discovery
+    let disc_before = f.client.get_merchants(&0, &10);
+    assert_eq!(disc_before.total, 2);
+
+    // Close Store 1
+    f.client
+        .close_merchant(&f.admin, &id1, &symbol_short!("tos"));
+
+    // Prune closed merchant
+    let mut to_prune = soroban_sdk::Vec::new(&f.env);
+    to_prune.push_back(id1);
+    to_prune.push_back(id2); // id2 is not closed, so it won't be pruned
+
+    let pruned = f.client.prune_closed_merchants(&f.admin, &to_prune);
+    assert_eq!(pruned, 1);
+
+    // Discovery now only contains Store 2
+    let disc_after = f.client.get_merchants(&0, &10);
+    assert_eq!(disc_after.total, 1);
+    assert_eq!(disc_after.items.get(0).unwrap().id, id2);
+
+    // Category discovery also only contains Store 2
+    let cat_after = f
+        .client
+        .get_merchants_by_category(&symbol_short!("goods"), &0, &10);
+    assert_eq!(cat_after.total, 1);
+    assert_eq!(cat_after.items.get(0).unwrap().id, id2);
+}
+
+#[test]
+fn test_prune_closed_merchants_skips_active_and_nonexistent() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Store Active"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "logo.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+
+    let mut to_prune = soroban_sdk::Vec::new(&f.env);
+    to_prune.push_back(id);
+    to_prune.push_back(999); // nonexistent
+
+    let pruned = f.client.prune_closed_merchants(&f.admin, &to_prune);
+    assert_eq!(pruned, 0);
+
+    let disc = f.client.get_merchants(&0, &10);
+    assert_eq!(disc.total, 1);
+}
+
+#[test]
+fn test_prune_closed_merchants_rejects_over_cap_and_unauthorized() {
+    let f = TestFixture::setup();
+    let stranger = Address::generate(&f.env);
+
+    let mut over_cap = soroban_sdk::Vec::new(&f.env);
+    for i in 0..51 {
+        over_cap.push_back(i);
+    }
+
+    // Over cap rejected
+    let res_cap = f.client.try_prune_closed_merchants(&f.admin, &over_cap);
+    assert_eq!(res_cap, Err(Ok(MarketplaceError::InvalidParam)));
+
+    // Unauthorized rejected
+    let mut valid = soroban_sdk::Vec::new(&f.env);
+    valid.push_back(1);
+    let res_auth = f.client.try_prune_closed_merchants(&stranger, &valid);
+    assert_eq!(res_auth, Err(Ok(MarketplaceError::Unauthorized)));
 }

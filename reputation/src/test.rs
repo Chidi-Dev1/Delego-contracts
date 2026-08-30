@@ -913,7 +913,7 @@ fn test_resolve_flag_missing() {
     let reporter = Address::generate(&env);
 
     let res = client.try_resolve_flag(&admin, &reporter, &entity);
-    assert_eq!(res, Err(Ok(ReputationError::EntityNotFound)));
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
 }
 
 #[test]
@@ -1139,4 +1139,74 @@ fn test_recency_weight_decay_curve() {
         );
         prev = curr;
     }
+}
+
+// --- prune_entity_history tests ---
+
+#[test]
+fn test_prune_entity_history_noop_when_within_window() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Record 5 transactions (<= SCORE_WINDOW which is 200)
+    for i in 1..=5 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let pruned = client.prune_entity_history(&admin, &entity, &50);
+    assert_eq!(pruned, 0);
+
+    let breakdown = client.get_reputation_breakdown(&entity, &0, &10);
+    assert_eq!(breakdown.len(), 5);
+}
+
+#[test]
+fn test_prune_entity_history_beyond_score_window() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Record 205 transactions (> SCORE_WINDOW = 200)
+    for i in 1..=205 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let breakdown_before = client.get_reputation_breakdown(&entity, &0, &250);
+    assert_eq!(breakdown_before.len(), 205);
+
+    // Prune up to 50 excess records (excess = 5)
+    let pruned = client.prune_entity_history(&admin, &entity, &50);
+    assert_eq!(pruned, 5);
+
+    let breakdown_after = client.get_reputation_breakdown(&entity, &0, &250);
+    assert_eq!(breakdown_after.len(), 200);
+    assert_eq!(breakdown_after.get(0).unwrap().escrow_id, 6);
+}
+
+#[test]
+fn test_prune_entity_history_unauthorized() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let stranger = Address::generate(&env);
+    let entity = Address::generate(&env);
+
+    let res = client.try_prune_entity_history(&stranger, &entity, &50);
+    assert_eq!(res, Err(Ok(ReputationError::Unauthorized)));
 }
