@@ -7,6 +7,23 @@ mod test {
         Address, Env, IntoVal, TryIntoVal, Vec,
     };
 
+    const MAX_SPEND_CPU_INSTRUCTIONS: u64 = 2_000_000;
+    const MAX_SPEND_MEMORY_BYTES: u64 = 2_000_000;
+
+    fn assert_cost_within_thresholds(env: &Env) {
+        let cost = env.cost_estimate().budget();
+        assert!(
+            cost.cpu_instruction_count() <= MAX_SPEND_CPU_INSTRUCTIONS,
+            "spend CPU budget exceeded: {}",
+            cost.cpu_instruction_count()
+        );
+        assert!(
+            cost.memory_bytes() <= MAX_SPEND_MEMORY_BYTES,
+            "spend memory budget exceeded: {}",
+            cost.memory_bytes()
+        );
+    }
+
     #[test]
     fn test_merchant_in_whitelist_succeeds() {
         let env = Env::default();
@@ -301,6 +318,21 @@ mod test {
     }
 
     // --- Issue #99: PermissionSpendEvent snapshot tests ---
+
+    #[test]
+    fn test_spend_cost_stays_within_thresholds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+        client.execute_spend(&owner, &delegate, &60, &merchant);
+        assert_cost_within_thresholds(&env);
+    }
 
     #[test]
     fn test_spend_event_emitted_on_success() {

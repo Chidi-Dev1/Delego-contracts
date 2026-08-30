@@ -11,6 +11,15 @@ use soroban_sdk::{
     Address, Env, String,
 };
 
+const MAX_DISCOVERY_CPU_INSTRUCTIONS: u64 = 2_000_000;
+const MAX_DISCOVERY_MEMORY_BYTES: u64 = 2_000_000;
+
+fn assert_discovery_cost_within_thresholds(env: &Env) {
+    let budget = env.cost_estimate().budget();
+    assert!(budget.cpu_instruction_count() <= MAX_DISCOVERY_CPU_INSTRUCTIONS);
+    assert!(budget.memory_bytes() <= MAX_DISCOVERY_MEMORY_BYTES);
+}
+
 struct TestFixture<'a> {
     env: Env,
     admin: Address,
@@ -724,6 +733,22 @@ fn test_suspension_closing_and_mutation_locking() {
         unsusp_err.unwrap_err().unwrap(),
         MarketplaceError::MerchantClosed
     );
+}
+
+#[test]
+fn test_paginated_discovery_cost_stays_within_thresholds() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    f.client.register_merchant(&owner, &RegisterParams {
+        name: String::from_str(&f.env, "Cost Store"),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("tech"),
+        image_url: String::from_str(&f.env, "url"),
+        metadata: None,
+        required_verifications: 1,
+    });
+    let _ = f.client.get_merchants(&0, &10);
+    assert_discovery_cost_within_thresholds(&f.env);
 }
 
 #[test]

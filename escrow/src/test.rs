@@ -2,7 +2,16 @@
 #[allow(clippy::module_inception)]
 mod test {
     use crate::{DataKey, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError, EscrowMetadataEvent};
-    use soroban_sdk::{
+    const MAX_DEPOSIT_CPU_INSTRUCTIONS: u64 = 3_000_000;
+const MAX_DEPOSIT_MEMORY_BYTES: u64 = 3_000_000;
+
+fn assert_deposit_cost_within_thresholds(env: &soroban_sdk::Env) {
+    let budget = env.cost_estimate().budget();
+    assert!(budget.cpu_instruction_count() <= MAX_DEPOSIT_CPU_INSTRUCTIONS);
+    assert!(budget.memory_bytes() <= MAX_DEPOSIT_MEMORY_BYTES);
+}
+
+use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events, Ledger},
         Address, BytesN, Env, IntoVal, TryIntoVal,
@@ -2230,6 +2239,13 @@ mod test {
     // ─── Issue #49: Paginated list_escrows enumeration ───────────────────────
 
     /// Helper: deposit a single escrow and return its id.
+    #[test]
+    fn deposit_cost_stays_within_thresholds() {
+        let t = TestEnv::setup();
+        let _ = deposit_escrow(&t, 100, 3600);
+        assert_deposit_cost_within_thresholds(&t.env);
+    }
+
     fn deposit_one(
         env: &Env,
         client: &EscrowContractClient<'_>,
