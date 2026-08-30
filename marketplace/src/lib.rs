@@ -69,6 +69,15 @@ pub struct NameRelease {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
+pub struct CategoryEntry {
+    pub key: Symbol,
+    pub normalized: Symbol,
+    pub display: String,
+    pub added_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct RegisterParams {
     pub name: String,
     pub description: String,
@@ -245,6 +254,21 @@ pub struct MerchantReputationSetEvent {
     pub set_by: Address,
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CategoryAddedEvent {
+    pub key: Symbol,
+    pub normalized: Symbol,
+    pub added_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CategoryRemovedEvent {
+    pub key: Symbol,
+    pub removed_by: Address,
+}
+
 // --- Storage Keys ---
 
 #[contracttype]
@@ -267,6 +291,7 @@ pub enum DataKey {
     VerificationPolicy(u64),
     LastMetadataUpdate(u64),
     GlobalReputationContract,
+    Categories,
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -291,6 +316,31 @@ const MAX_PAGE_LIMIT: u32 = 50;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
 
+pub(crate) fn normalize_symbol(env: &Env, sym: &Symbol) -> Symbol {
+    use soroban_sdk::xdr::ToXdr;
+    let xdr = sym.clone().to_xdr(env);
+    let xdr_len = xdr.len() as usize;
+    // XDR encoding of ScVal::Symbol:
+    // 4-byte tag (ScValType::Symbol = 10) + 4-byte big-endian length + characters + 0..3 padding bytes
+    if xdr_len >= 8 {
+        let mut xdr_bytes = [0u8; 48];
+        let read_len = xdr_len.min(48);
+        xdr.copy_into_slice(&mut xdr_bytes[..read_len]);
+        let sym_len =
+            u32::from_be_bytes([xdr_bytes[4], xdr_bytes[5], xdr_bytes[6], xdr_bytes[7]]) as usize;
+        if sym_len <= 32 && 8 + sym_len <= read_len {
+            let mut lower_buf = [0u8; 32];
+            for i in 0..sym_len {
+                lower_buf[i] = xdr_bytes[8 + i].to_ascii_lowercase();
+            }
+            if let Ok(lower_str) = core::str::from_utf8(&lower_buf[..sym_len]) {
+                return Symbol::new(env, lower_str);
+            }
+        }
+    }
+    sym.clone()
+}
+
 #[contract]
 pub struct MarketplaceContract;
 
@@ -314,6 +364,9 @@ impl MarketplaceContract {
         env.storage()
             .instance()
             .set(&DataKey::Verifiers, &Vec::<Verifier>::new(&env));
+        env.storage()
+            .instance()
+            .set(&DataKey::Categories, &Vec::<CategoryEntry>::new(&env));
         env.storage()
             .instance()
             .set(&DataKey::MetadataCooldown, &DEFAULT_METADATA_COOLDOWN_SECS);
@@ -353,6 +406,23 @@ impl MarketplaceContract {
             env.storage().persistent().remove(&freed_key);
         }
 
+        let normalized_category = normalize_symbol(&env, &params.category);
+
+        // Allowlist gating: When non-empty, only allowlisted categories are accepted
+        let categories = Self::get_categories(env.clone());
+        if !categories.is_empty() {
+            let mut allowed = false;
+            for c in categories.iter() {
+                if c.normalized == normalized_category {
+                    allowed = true;
+                    break;
+                }
+            }
+            if !allowed {
+                return Err(MarketplaceError::InvalidCategory);
+            }
+        }
+
         let now = env.ledger().timestamp();
         let next_id: u64 = env
             .storage()
@@ -380,7 +450,7 @@ impl MarketplaceContract {
             owner: Some(merchant.clone()),
             name: params.name.clone(),
             description: params.description,
-            category: params.category.clone(),
+            category: normalized_category.clone(),
             image_url: params.image_url,
             commission_rate_bps: 0,
             metadata: params.metadata.clone(),
@@ -426,7 +496,7 @@ impl MarketplaceContract {
             .set(&DataKey::MerchantIds, &merchant_ids);
 
         // Append to category index
-        let cat_key = DataKey::CategoryIndex(params.category.clone());
+        let cat_key = DataKey::CategoryIndex(normalized_category.clone());
         let mut cat_ids: Vec<u64> = env
             .storage()
             .persistent()
@@ -605,6 +675,106 @@ impl MarketplaceContract {
         );
 
         Ok(())
+    }
+
+    // --- Category Management ---
+
+    pub fn add_category(
+        env: Env,
+        admin: Address,
+        category: CategoryEntry,
+    ) -> Result<(), MarketplaceError> {
+        admin.require_auth();
+        let current_admin = Self::get_admin(env.clone())?;
+        if admin != current_admin {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        let normalized = normalize_symbol(&env, &category.key);
+        let mut categories = Self::get_categories(env.clone());
+        for c in categories.iter() {
+            if c.normalized == normalized || c.key == category.key {
+                return Err(MarketplaceError::InvalidCategory);
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        let entry = CategoryEntry {
+            key: category.key.clone(),
+            normalized: normalized.clone(),
+            display: category.display,
+            added_at: if category.added_at == 0 {
+                now
+            } else {
+                category.added_at
+            },
+        };
+
+        categories.push_back(entry);
+        env.storage()
+            .instance()
+            .set(&DataKey::Categories, &categories);
+
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("cat_add")),
+            CategoryAddedEvent {
+                key: category.key,
+                normalized,
+                added_by: admin,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn remove_category(
+        env: Env,
+        admin: Address,
+        category: Symbol,
+    ) -> Result<(), MarketplaceError> {
+        admin.require_auth();
+        let current_admin = Self::get_admin(env.clone())?;
+        if admin != current_admin {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        let normalized = normalize_symbol(&env, &category);
+        let categories = Self::get_categories(env.clone());
+        let mut new_categories = Vec::new(&env);
+        let mut found = false;
+
+        for c in categories.iter() {
+            if c.key == category || c.normalized == normalized {
+                found = true;
+            } else {
+                new_categories.push_back(c);
+            }
+        }
+
+        if !found {
+            return Err(MarketplaceError::InvalidCategory);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Categories, &new_categories);
+
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("cat_rem")),
+            CategoryRemovedEvent {
+                key: category,
+                removed_by: admin,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn get_categories(env: Env) -> Vec<CategoryEntry> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Categories)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     // --- Verification ---
@@ -958,7 +1128,7 @@ impl MarketplaceContract {
         if offset >= total || limit == 0 {
             return Ok(DiscoveryPage {
                 items: Vec::new(&env),
-                total: total as u32,
+                total,
                 next_offset: None,
             });
         }
@@ -977,7 +1147,7 @@ impl MarketplaceContract {
 
         Ok(DiscoveryPage {
             items,
-            total: total as u32,
+            total,
             next_offset,
         })
     }
@@ -1011,11 +1181,24 @@ impl MarketplaceContract {
         status_filter: Option<MerchantStatus>,
     ) -> Result<DiscoveryPage, MarketplaceError> {
         let limit = limit.min(MAX_PAGE_LIMIT);
-        let cat_ids: Vec<u64> = env
+        let normalized = normalize_symbol(&env, &category);
+        let mut cat_ids: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::CategoryIndex(category))
+            .get(&DataKey::CategoryIndex(normalized.clone()))
             .unwrap_or_else(|| Vec::new(&env));
+
+        // Backward compatibility: If no merchants found under normalized key,
+        // and raw category differs from normalized, check raw category index.
+        if cat_ids.is_empty() && normalized != category {
+            if let Some(legacy_ids) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::CategoryIndex(category))
+            {
+                cat_ids = legacy_ids;
+            }
+        }
 
         // Filter merchants by status if provided
         let mut filtered_ids = Vec::new(&env);
@@ -1036,7 +1219,7 @@ impl MarketplaceContract {
         if offset >= total || limit == 0 {
             return Ok(DiscoveryPage {
                 items: Vec::new(&env),
-                total: total as u32,
+                total,
                 next_offset: None,
             });
         }
@@ -1055,7 +1238,7 @@ impl MarketplaceContract {
 
         Ok(DiscoveryPage {
             items,
-            total: total as u32,
+            total,
             next_offset,
         })
     }

@@ -1,6 +1,7 @@
 use crate::{
-    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantRegisteredEvent,
-    MerchantStatus, RegisterParams, Verifier,
+    normalize_symbol, CategoryEntry, DataKey, MarketplaceContract, MarketplaceContractClient,
+    MarketplaceError, Merchant, MerchantRegisteredEvent, MerchantStatus, RegisterParams,
+    VerificationPolicy, Verifier,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -1256,4 +1257,507 @@ fn test_flight_merchant_lifecycle_and_discovery() {
     assert_eq!(item.commission_rate_bps, 350);
     assert!(item.verified);
     assert_eq!(item.status, MerchantStatus::Verified);
+}
+
+#[test]
+fn test_category_management_admin_auth_and_duplicates() {
+    let f = TestFixture::setup();
+    let stranger = Address::generate(&f.env);
+
+    let cat1 = CategoryEntry {
+        key: symbol_short!("Crypto"),
+        normalized: symbol_short!("crypto"),
+        display: String::from_str(&f.env, "Crypto & Digital Assets"),
+        added_at: 100,
+    };
+
+    // Non-admin cannot add category
+    let res_stranger = f.client.try_add_category(&stranger, &cat1);
+    assert_eq!(res_stranger, Err(Ok(MarketplaceError::Unauthorized)));
+
+    // Admin can add category
+    f.client.add_category(&f.admin, &cat1);
+
+    let categories = f.client.get_categories();
+    assert_eq!(categories.len(), 1);
+    let entry = categories.get(0).unwrap();
+    assert_eq!(entry.key, symbol_short!("Crypto"));
+    assert_eq!(entry.normalized, symbol_short!("crypto"));
+    assert_eq!(
+        entry.display,
+        String::from_str(&f.env, "Crypto & Digital Assets")
+    );
+    assert_eq!(entry.added_at, 100);
+
+    // Duplicate key rejection
+    let res_dup_key = f.client.try_add_category(&f.admin, &cat1);
+    assert_eq!(res_dup_key, Err(Ok(MarketplaceError::InvalidCategory)));
+
+    // Duplicate normalized case-variant rejection (e.g. "crypto")
+    let cat1_variant = CategoryEntry {
+        key: symbol_short!("crypto"),
+        normalized: symbol_short!("crypto"),
+        display: String::from_str(&f.env, "Crypto lowercase"),
+        added_at: 101,
+    };
+    let res_dup_norm = f.client.try_add_category(&f.admin, &cat1_variant);
+    assert_eq!(res_dup_norm, Err(Ok(MarketplaceError::InvalidCategory)));
+
+    // Add second category
+    let cat2 = CategoryEntry {
+        key: symbol_short!("tools"),
+        normalized: symbol_short!("tools"),
+        display: String::from_str(&f.env, "Tools & Equipment"),
+        added_at: 102,
+    };
+    f.client.add_category(&f.admin, &cat2);
+    assert_eq!(f.client.get_categories().len(), 2);
+
+    // Non-admin cannot remove category
+    let res_rem_stranger = f
+        .client
+        .try_remove_category(&stranger, &symbol_short!("crypto"));
+    assert_eq!(res_rem_stranger, Err(Ok(MarketplaceError::Unauthorized)));
+
+    // Remove non-existent category
+    let res_rem_missing = f
+        .client
+        .try_remove_category(&f.admin, &symbol_short!("nonexist"));
+    assert_eq!(res_rem_missing, Err(Ok(MarketplaceError::InvalidCategory)));
+
+    // Admin can remove category by key or normalized symbol
+    f.client.remove_category(&f.admin, &symbol_short!("Crypto"));
+    let remaining = f.client.get_categories();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining.get(0).unwrap().key, symbol_short!("tools"));
+}
+
+#[test]
+fn test_category_allowlist_gating_disabled_and_enabled() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    // 1. Allowlist is initially empty -> gating disabled, arbitrary category accepted
+    let params_custom = RegisterParams {
+        name: String::from_str(&f.env, "Free Market Shop"),
+        description: String::from_str(&f.env, "Any category allowed"),
+        category: symbol_short!("custom"),
+        image_url: String::from_str(&f.env, "https://cdn.example.com/logo1.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+    let m1 = f.client.register_merchant(&merchant_addr, &params_custom);
+    assert_eq!(m1, 1);
+
+    // 2. Enable allowlist by adding an approved category
+    let approved_cat = CategoryEntry {
+        key: symbol_short!("retail"),
+        normalized: symbol_short!("retail"),
+        display: String::from_str(&f.env, "Retail Goods"),
+        added_at: 0,
+    };
+    f.client.add_category(&f.admin, &approved_cat);
+
+    // 3. Registering with unlisted category is now rejected
+    let params_rejected = RegisterParams {
+        name: String::from_str(&f.env, "Disallowed Shop"),
+        description: String::from_str(&f.env, "Category not on allowlist"),
+        category: symbol_short!("gaming"),
+        image_url: String::from_str(&f.env, "https://cdn.example.com/logo2.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+    let res_rejected = f
+        .client
+        .try_register_merchant(&merchant_addr, &params_rejected);
+    assert_eq!(res_rejected, Err(Ok(MarketplaceError::InvalidCategory)));
+
+    // 4. Registering with allowlisted category succeeds
+    let params_approved = RegisterParams {
+        name: String::from_str(&f.env, "Approved Retail Shop"),
+        description: String::from_str(&f.env, "Category on allowlist"),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, "https://cdn.example.com/logo3.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+    let m2 = f.client.register_merchant(&merchant_addr, &params_approved);
+    assert_eq!(m2, 2);
+
+    // 5. Remove all categories -> allowlist gating becomes disabled again
+    f.client.remove_category(&f.admin, &symbol_short!("retail"));
+    assert_eq!(f.client.get_categories().len(), 0);
+
+    let params_unrestricted = RegisterParams {
+        name: String::from_str(&f.env, "Again Free Shop"),
+        description: String::from_str(&f.env, "Allowlist empty again"),
+        category: symbol_short!("gaming"),
+        image_url: String::from_str(&f.env, "https://cdn.example.com/logo4.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+    let m3 = f
+        .client
+        .register_merchant(&merchant_addr, &params_unrestricted);
+    assert_eq!(m3, 3);
+}
+
+#[test]
+fn test_category_normalization_collapsing_case_variants() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    // Add allowlisted category with mixed case
+    let cat = CategoryEntry {
+        key: symbol_short!("Crypto"),
+        normalized: symbol_short!("crypto"),
+        display: String::from_str(&f.env, "Cryptocurrency"),
+        added_at: 0,
+    };
+    f.client.add_category(&f.admin, &cat);
+
+    // Register with "Crypto" (matching key)
+    let p1 = RegisterParams {
+        name: String::from_str(&f.env, "Shop 1"),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("Crypto"),
+        image_url: String::from_str(&f.env, "https://example.com/1.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+    let id1 = f.client.register_merchant(&merchant_addr, &p1);
+
+    // Register with "crypto" (all lowercase)
+    let p2 = RegisterParams {
+        name: String::from_str(&f.env, "Shop 2"),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("crypto"),
+        image_url: String::from_str(&f.env, "https://example.com/2.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+    let id2 = f.client.register_merchant(&merchant_addr, &p2);
+
+    // Register with "CRYPTO" (all uppercase)
+    let p3 = RegisterParams {
+        name: String::from_str(&f.env, "Shop 3"),
+        description: String::from_str(&f.env, "Desc"),
+        category: soroban_sdk::Symbol::new(&f.env, "CRYPTO"),
+        image_url: String::from_str(&f.env, "https://example.com/3.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+    let id3 = f.client.register_merchant(&merchant_addr, &p3);
+
+    // All 3 merchants store the normalized category symbol
+    assert_eq!(
+        f.client.get_merchant(&id1).category,
+        symbol_short!("crypto")
+    );
+    assert_eq!(
+        f.client.get_merchant(&id2).category,
+        symbol_short!("crypto")
+    );
+    assert_eq!(
+        f.client.get_merchant(&id3).category,
+        symbol_short!("crypto")
+    );
+
+    // Querying with any case variant discovers all 3 merchants
+    let q_mixed = f
+        .client
+        .get_merchants_by_category(&symbol_short!("Crypto"), &0, &10);
+    assert_eq!(q_mixed.items.len(), 3);
+    assert_eq!(q_mixed.total, 3);
+
+    let q_lower = f
+        .client
+        .get_merchants_by_category(&symbol_short!("crypto"), &0, &10);
+    assert_eq!(q_lower.items.len(), 3);
+
+    let q_upper =
+        f.client
+            .get_merchants_by_category(&soroban_sdk::Symbol::new(&f.env, "CRYPTO"), &0, &10);
+    assert_eq!(q_upper.items.len(), 3);
+}
+
+#[test]
+fn test_category_backward_compatibility_pre_existing_arbitrary() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    // 1. Merchant registered under arbitrary category before allowlist is configured
+    let legacy_params = RegisterParams {
+        name: String::from_str(&f.env, "Legacy Antique Store"),
+        description: String::from_str(&f.env, "Registered in legacy system"),
+        category: symbol_short!("antique"),
+        image_url: String::from_str(&f.env, "https://example.com/antique.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+    let legacy_id = f.client.register_merchant(&merchant_addr, &legacy_params);
+    assert_eq!(legacy_id, 1);
+
+    // 2. Later, admin configures an allowlist that does NOT contain "antique"
+    let tech_cat = CategoryEntry {
+        key: symbol_short!("tech"),
+        normalized: symbol_short!("tech"),
+        display: String::from_str(&f.env, "Technology"),
+        added_at: 0,
+    };
+    f.client.add_category(&f.admin, &tech_cat);
+
+    // 3. Verify existing legacy merchant record still loads and functions perfectly
+    let merchant = f.client.get_merchant(&legacy_id);
+    assert_eq!(merchant.id, 1);
+    assert_eq!(merchant.category, symbol_short!("antique"));
+
+    let view = f.client.get_merchant_view(&legacy_id);
+    assert_eq!(view.id, 1);
+    assert_eq!(view.category, symbol_short!("antique"));
+
+    // 4. Discovery for the legacy category still returns the legacy merchant
+    let query = f
+        .client
+        .get_merchants_by_category(&symbol_short!("antique"), &0, &10);
+    assert_eq!(query.items.len(), 1);
+    assert_eq!(query.items.get(0).unwrap().id, legacy_id);
+
+    // 5. Global discovery still includes the legacy merchant
+    let all_merchants = f.client.get_merchants(&0, &10);
+    assert_eq!(all_merchants.items.len(), 1);
+    assert_eq!(all_merchants.items.get(0).unwrap().id, legacy_id);
+}
+
+#[test]
+fn test_normalize_symbol_direct_boundary_cases() {
+    let env = Env::default();
+
+    // 1 char (len % 4 = 1, 3 padding bytes)
+    let s1 = soroban_sdk::Symbol::new(&env, "A");
+    assert_eq!(
+        normalize_symbol(&env, &s1),
+        soroban_sdk::Symbol::new(&env, "a")
+    );
+
+    // 2 chars (len % 4 = 2, 2 padding bytes)
+    let s2 = soroban_sdk::Symbol::new(&env, "Ab");
+    assert_eq!(
+        normalize_symbol(&env, &s2),
+        soroban_sdk::Symbol::new(&env, "ab")
+    );
+
+    // 3 chars (len % 4 = 3, 1 padding byte)
+    let s3 = soroban_sdk::Symbol::new(&env, "AbC");
+    assert_eq!(
+        normalize_symbol(&env, &s3),
+        soroban_sdk::Symbol::new(&env, "abc")
+    );
+
+    // 4 chars (len % 4 = 0, 0 padding bytes)
+    let s4 = soroban_sdk::Symbol::new(&env, "AbCd");
+    assert_eq!(
+        normalize_symbol(&env, &s4),
+        soroban_sdk::Symbol::new(&env, "abcd")
+    );
+
+    // 5 chars (len % 4 = 1, 3 padding bytes)
+    let s5 = symbol_short!("Tools");
+    assert_eq!(normalize_symbol(&env, &s5), symbol_short!("tools"));
+
+    // 8 chars (len % 4 = 0, 0 padding bytes)
+    let s8 = symbol_short!("SoftWare");
+    assert_eq!(normalize_symbol(&env, &s8), symbol_short!("software"));
+
+    // 9 chars (max SymbolSmall boundary, len % 4 = 1, 3 padding bytes)
+    let s9 = symbol_short!("AbCdEfGhI");
+    assert_eq!(normalize_symbol(&env, &s9), symbol_short!("abcdefghi"));
+
+    // 10 chars (min SymbolObject boundary, len % 4 = 2, 2 padding bytes)
+    let s10 = soroban_sdk::Symbol::new(&env, "AbCdEfGhIj");
+    assert_eq!(
+        normalize_symbol(&env, &s10),
+        soroban_sdk::Symbol::new(&env, "abcdefghij")
+    );
+
+    // 16 chars (len % 4 = 0, 0 padding bytes)
+    let s16 = soroban_sdk::Symbol::new(&env, "A_B_C_D_E_F_G_H_");
+    assert_eq!(
+        normalize_symbol(&env, &s16),
+        soroban_sdk::Symbol::new(&env, "a_b_c_d_e_f_g_h_")
+    );
+
+    // 31 chars (max - 1, len % 4 = 3, 1 padding byte)
+    let s31_raw = "A_1234567890_1234567890_1234567";
+    assert_eq!(s31_raw.len(), 31);
+    let s31 = soroban_sdk::Symbol::new(&env, s31_raw);
+    let s31_expected = soroban_sdk::Symbol::new(&env, "a_1234567890_1234567890_1234567");
+    assert_eq!(normalize_symbol(&env, &s31), s31_expected);
+
+    // 32 chars (exact max symbol length in Soroban, len % 4 = 0, 0 padding bytes)
+    let s32_raw = "A_1234567890_1234567890_12345678";
+    assert_eq!(s32_raw.len(), 32);
+    let s32 = soroban_sdk::Symbol::new(&env, s32_raw);
+    let s32_expected = soroban_sdk::Symbol::new(&env, "a_1234567890_1234567890_12345678");
+    assert_eq!(normalize_symbol(&env, &s32), s32_expected);
+
+    // Underscores and numbers
+    let s_special = soroban_sdk::Symbol::new(&env, "_TEST_123_ABC_");
+    assert_eq!(
+        normalize_symbol(&env, &s_special),
+        soroban_sdk::Symbol::new(&env, "_test_123_abc_")
+    );
+
+    // Idempotency: normalizing already lowercase symbol returns equal symbol
+    assert_eq!(normalize_symbol(&env, &s32_expected), s32_expected);
+}
+
+#[test]
+fn test_category_max_length_32_chars_registration_and_discovery() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let max_len_key_str = "Very_Long_Category_Name_32_Chars";
+    assert_eq!(max_len_key_str.len(), 32);
+    let max_len_norm_str = "very_long_category_name_32_chars";
+    assert_eq!(max_len_norm_str.len(), 32);
+
+    let cat_32 = CategoryEntry {
+        key: soroban_sdk::Symbol::new(&f.env, max_len_key_str),
+        normalized: soroban_sdk::Symbol::new(&f.env, max_len_norm_str),
+        display: String::from_str(&f.env, "32-character maximum category name"),
+        added_at: 0,
+    };
+    f.client.add_category(&f.admin, &cat_32);
+
+    // Register with mixed-case 32-char category
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Boundary Merchant"),
+        description: String::from_str(&f.env, "Testing 32-char category"),
+        category: soroban_sdk::Symbol::new(&f.env, max_len_key_str),
+        image_url: String::from_str(&f.env, "https://example.com/logo.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+    let merchant_id = f.client.register_merchant(&merchant_addr, &params);
+    assert_eq!(merchant_id, 1);
+
+    // Verify stored merchant record holds normalized 32-char category without truncation
+    let merchant = f.client.get_merchant(&merchant_id);
+    assert_eq!(
+        merchant.category,
+        soroban_sdk::Symbol::new(&f.env, max_len_norm_str)
+    );
+
+    // Discover via mixed-case 32-char category query
+    let page_mixed = f.client.get_merchants_by_category(
+        &soroban_sdk::Symbol::new(&f.env, max_len_key_str),
+        &0,
+        &10,
+    );
+    assert_eq!(page_mixed.items.len(), 1);
+    assert_eq!(page_mixed.items.get(0).unwrap().id, merchant_id);
+
+    // Discover via lowercase 32-char category query
+    let page_lower = f.client.get_merchants_by_category(
+        &soroban_sdk::Symbol::new(&f.env, max_len_norm_str),
+        &0,
+        &10,
+    );
+    assert_eq!(page_lower.items.len(), 1);
+    assert_eq!(page_lower.items.get(0).unwrap().id, merchant_id);
+}
+
+#[test]
+fn test_category_backward_compatibility_unnormalized_mixed_case_raw_index() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+    let legacy_cat_raw = symbol_short!("Antique");
+    let legacy_id = 99u64;
+    let now = f.env.ledger().timestamp();
+
+    // Directly seed persistent storage simulating a pre-migration record
+    // created when unnormalized mixed-case symbols were written to storage.
+    f.env.as_contract(&f._contract_id, || {
+        let legacy_merchant = Merchant {
+            id: legacy_id,
+            owner: Some(merchant_addr.clone()),
+            name: String::from_str(&f.env, "Old Curiosity Shop"),
+            description: String::from_str(&f.env, "Vintage goods"),
+            category: legacy_cat_raw.clone(),
+            image_url: String::from_str(&f.env, "https://example.com/curiosity.png"),
+            commission_rate_bps: 0,
+            metadata: None,
+            status: MerchantStatus::Registered,
+            verified: false,
+            created_at: now,
+            updated_at: now,
+            reputation: None,
+        };
+
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::Merchant(legacy_id), &legacy_merchant);
+        f.env.storage().persistent().set(
+            &DataKey::MerchantName(legacy_merchant.name.clone()),
+            &legacy_id,
+        );
+
+        let policy = VerificationPolicy {
+            required: 1,
+            max_verifications: 0,
+        };
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::VerificationPolicy(legacy_id), &policy);
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::VerifiedCount(legacy_id), &0u32);
+        f.env.storage().persistent().set(
+            &DataKey::MerchantVerifierList(legacy_id),
+            &soroban_sdk::Vec::<Address>::new(&f.env),
+        );
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::LastMetadataUpdate(legacy_id), &now);
+
+        let mut merchant_ids = soroban_sdk::Vec::<u64>::new(&f.env);
+        merchant_ids.push_back(legacy_id);
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::MerchantIds, &merchant_ids);
+
+        // Index strictly under raw mixed-case symbol "Antique" (pre-normalization)
+        let mut cat_ids = soroban_sdk::Vec::<u64>::new(&f.env);
+        cat_ids.push_back(legacy_id);
+        f.env
+            .storage()
+            .persistent()
+            .set(&DataKey::CategoryIndex(legacy_cat_raw.clone()), &cat_ids);
+    });
+
+    // 1. Direct record retrieval works and preserves original raw symbol
+    let merchant = f.client.get_merchant(&legacy_id);
+    assert_eq!(merchant.id, legacy_id);
+    assert_eq!(merchant.category, legacy_cat_raw);
+
+    let view = f.client.get_merchant_view(&legacy_id);
+    assert_eq!(view.id, legacy_id);
+    assert_eq!(view.category, legacy_cat_raw);
+
+    // 2. Query with raw mixed-case symbol "Antique" engages the fallback branch
+    let page_raw = f.client.get_merchants_by_category(&legacy_cat_raw, &0, &10);
+    assert_eq!(page_raw.items.len(), 1);
+    assert_eq!(page_raw.items.get(0).unwrap().id, legacy_id);
+    assert_eq!(page_raw.items.get(0).unwrap().category, legacy_cat_raw);
+
+    // 3. Global discovery includes the legacy merchant
+    let all = f.client.get_merchants(&0, &10);
+    assert_eq!(all.items.len(), 1);
+    assert_eq!(all.items.get(0).unwrap().id, legacy_id);
 }
