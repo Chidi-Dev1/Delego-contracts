@@ -883,12 +883,13 @@ impl EscrowContract {
         // Atomically store admin and configuration at deploy time
         env.storage().instance().set(&DataKey::Admin, &config.admin);
         env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeConfig, &FeeConfig {
+        env.storage().instance().set(
+            &DataKey::FeeConfig,
+            &FeeConfig {
                 fee_bps: config.fee_bps,
                 treasury: config.treasury.clone(),
-            });
+            },
+        );
         env.storage().instance().set(
             &DataKey::AmountLimits,
             &EscrowAmountLimits {
@@ -1958,11 +1959,7 @@ impl EscrowContract {
         buyer_ids.push_back(last_id);
         env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
 
-        if let (Some(hash), Some(sch)) = (order_hash, schema) {
-            let metadata = EscrowMetadata {
-                order_hash: hash.clone(),
-                schema: sch.clone(),
-            };
+        if let Some(hash) = order_hash.clone() {
             env.storage()
                 .persistent()
                 .set(&DataKey::EscrowMetadataHash(last_id), &hash);
