@@ -875,34 +875,52 @@ fn test_status_filtered_discovery() {
     f.client.suspend_merchant(&f.admin, &id2);
 
     // Close merchant 3
-    f.client.close_merchant(&f.admin, &id3, &symbol_short!("test"));
+    f.client
+        .close_merchant(&f.admin, &id3, &symbol_short!("test"));
 
     // Get merchants by Registered status (should be id1 and id4)
-    let registered = f.client.get_merchants_by_status(&MerchantStatus::Registered, &0, &10);
+    let registered = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Registered, &0, &10);
     assert_eq!(registered.items.len(), 2);
     assert_eq!(registered.total, 2);
     assert_eq!(registered.next_offset, None);
     assert_eq!(registered.items.get(0).unwrap().id, id1);
-    assert_eq!(registered.items.get(0).unwrap().status, MerchantStatus::Registered);
+    assert_eq!(
+        registered.items.get(0).unwrap().status,
+        MerchantStatus::Registered
+    );
     assert_eq!(registered.items.get(1).unwrap().id, id4);
-    assert_eq!(registered.items.get(1).unwrap().status, MerchantStatus::Registered);
+    assert_eq!(
+        registered.items.get(1).unwrap().status,
+        MerchantStatus::Registered
+    );
 
     // Get merchants by Suspended status (should be id2)
-    let suspended = f.client.get_merchants_by_status(&MerchantStatus::Suspended, &0, &10);
+    let suspended = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Suspended, &0, &10);
     assert_eq!(suspended.items.len(), 1);
     assert_eq!(suspended.total, 1);
     assert_eq!(suspended.items.get(0).unwrap().id, id2);
-    assert_eq!(suspended.items.get(0).unwrap().status, MerchantStatus::Suspended);
+    assert_eq!(
+        suspended.items.get(0).unwrap().status,
+        MerchantStatus::Suspended
+    );
 
     // Get merchants by Closed status (should be id3)
-    let closed = f.client.get_merchants_by_status(&MerchantStatus::Closed, &0, &10);
+    let closed = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Closed, &0, &10);
     assert_eq!(closed.items.len(), 1);
     assert_eq!(closed.total, 1);
     assert_eq!(closed.items.get(0).unwrap().id, id3);
     assert_eq!(closed.items.get(0).unwrap().status, MerchantStatus::Closed);
 
     // Get merchants by Verified status (should be empty)
-    let verified = f.client.get_merchants_by_status(&MerchantStatus::Verified, &0, &10);
+    let verified = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Verified, &0, &10);
     assert_eq!(verified.items.len(), 0);
     assert_eq!(verified.total, 0);
     assert_eq!(verified.next_offset, None);
@@ -967,7 +985,8 @@ fn test_status_filtered_discovery_by_category() {
 
     // Suspend id2, Close id3
     f.client.suspend_merchant(&f.admin, &id2);
-    f.client.close_merchant(&f.admin, &id3, &symbol_short!("test"));
+    f.client
+        .close_merchant(&f.admin, &id3, &symbol_short!("test"));
 
     // Get tech merchants by Registered status (should be id1 and id4)
     let registered = f.client.get_merchants_by_category_status(
@@ -1046,22 +1065,37 @@ fn test_discovery_page_cursor_fields() {
     let page1 = f.client.get_merchants(&0, &3);
     assert_eq!(page1.total, 10);
     assert_eq!(page1.items.len(), 3);
-    assert_eq!(page1.next_offset, Some(3), "First page should have next_offset = 3");
+    assert_eq!(
+        page1.next_offset,
+        Some(3),
+        "First page should have next_offset = 3"
+    );
 
     let page2 = f.client.get_merchants(&page1.next_offset.unwrap(), &3);
     assert_eq!(page2.total, 10);
     assert_eq!(page2.items.len(), 3);
-    assert_eq!(page2.next_offset, Some(6), "Second page should have next_offset = 6");
+    assert_eq!(
+        page2.next_offset,
+        Some(6),
+        "Second page should have next_offset = 6"
+    );
 
     let page3 = f.client.get_merchants(&page2.next_offset.unwrap(), &3);
     assert_eq!(page3.total, 10);
     assert_eq!(page3.items.len(), 3);
-    assert_eq!(page3.next_offset, Some(9), "Third page should have next_offset = 9");
+    assert_eq!(
+        page3.next_offset,
+        Some(9),
+        "Third page should have next_offset = 9"
+    );
 
     let page4 = f.client.get_merchants(&page3.next_offset.unwrap(), &3);
     assert_eq!(page4.total, 10);
     assert_eq!(page4.items.len(), 1, "Last page should have 1 item");
-    assert_eq!(page4.next_offset, None, "Last page should have None for next_offset");
+    assert_eq!(
+        page4.next_offset, None,
+        "Last page should have None for next_offset"
+    );
 }
 
 #[test]
@@ -1256,4 +1290,42 @@ fn test_flight_merchant_lifecycle_and_discovery() {
     assert_eq!(item.commission_rate_bps, 350);
     assert!(item.verified);
     assert_eq!(item.status, MerchantStatus::Verified);
+}
+
+// Issue #142: merchant-scoped events carry the merchant id as their third
+// topic so indexers can route by merchant without deserializing the body.
+#[test]
+fn test_register_merchant_event_carries_merchant_id_topic() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{Symbol, TryIntoVal};
+
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Topic Store"),
+        description: String::from_str(&f.env, "Tests topic routing"),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, "https://example.com/topic.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+
+    let merchant_id = f.client.register_merchant(&merchant_addr, &params);
+
+    let mut found = false;
+    for event in f.env.events().all().iter() {
+        let (_c_id, topics, _value) = event;
+        if topics.len() != 3 {
+            continue;
+        }
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+        let t1: Symbol = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+        if t0 == symbol_short!("mkplc") && t1 == symbol_short!("reg") {
+            let t2: u64 = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+            assert_eq!(t2, merchant_id, "reg topic must carry the merchant id");
+            found = true;
+        }
+    }
+    assert!(found, "reg event with merchant_id topic not found");
 }

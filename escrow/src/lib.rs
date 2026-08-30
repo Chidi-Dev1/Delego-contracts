@@ -1,6 +1,18 @@
 //! Delego Escrow Contract
 //!
 //! Holds funds in escrow until order fulfillment is confirmed.
+//!
+//! # Event topic schema
+//!
+//! Entity-scoped lifecycle events are published as `(escrow, <action>,
+//! escrow_id)` so off-chain indexers and Soroban RPC subscriptions can filter
+//! by escrow directly from the topics, without deserializing the event body
+//! (issue #142). The id is also retained in the event data. The topic id type
+//! matches the event's own id field: it is the `u64` `escrow_id` for every
+//! action except `metadata` and `cancelled`, which carry the `BytesN<32>`
+//! order id. Contract-wide events that have no single escrow to route by
+//! (`upgraded`, `paused`, `feedist`, `pl_fund`, `pl_wdrw`, and the `admin`
+//! transfer events) keep the two-topic `(escrow|admin, <action>)` form.
 
 #![no_std]
 use soroban_sdk::{
@@ -883,12 +895,13 @@ impl EscrowContract {
         // Atomically store admin and configuration at deploy time
         env.storage().instance().set(&DataKey::Admin, &config.admin);
         env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeConfig, &FeeConfig {
+        env.storage().instance().set(
+            &DataKey::FeeConfig,
+            &FeeConfig {
                 fee_bps: config.fee_bps,
                 treasury: config.treasury.clone(),
-            });
+            },
+        );
         env.storage().instance().set(
             &DataKey::AmountLimits,
             &EscrowAmountLimits {
@@ -1147,7 +1160,7 @@ impl EscrowContract {
         let votes_for = votes.iter().filter(|v| v.release_to_seller).count() as u32;
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("vote")),
+            (symbol_short!("escrow"), symbol_short!("vote"), escrow_id),
             DisputeVotedEvent {
                 escrow_id,
                 arbiter,
@@ -1243,7 +1256,11 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("resolved")),
+            (
+                symbol_short!("escrow"),
+                symbol_short!("resolved"),
+                escrow_id,
+            ),
             EscrowResolvedEvent {
                 escrow_id,
                 release_to_seller,
@@ -1328,7 +1345,7 @@ impl EscrowContract {
         env.storage().persistent().remove(&votes_key);
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("tmo_ext")),
+            (symbol_short!("escrow"), symbol_short!("tmo_ext"), escrow_id),
             TimeoutExtendedEvent {
                 escrow_id,
                 previous_timeout_ledger,
@@ -1795,7 +1812,7 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("pl_stl")),
+            (symbol_short!("escrow"), symbol_short!("pl_stl"), escrow_id),
             PoolSettledEvent {
                 escrow_id,
                 token: record.token.clone(),
@@ -1958,25 +1975,30 @@ impl EscrowContract {
         buyer_ids.push_back(last_id);
         env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
 
-        if let (Some(hash), Some(sch)) = (order_hash, schema) {
-            let metadata = EscrowMetadata {
-                order_hash: hash.clone(),
-                schema: sch.clone(),
-            };
+        // Persist each metadata half independently so a later call can supply
+        // the missing one (issue #181). Borrow here; the combined match below
+        // moves the originals into the event.
+        if let Some(hash) = &order_hash {
             env.storage()
                 .persistent()
-                .set(&DataKey::EscrowMetadataHash(last_id), &hash);
+                .set(&DataKey::EscrowMetadataHash(last_id), hash);
         }
-        if let Some(sch) = schema.clone() {
+        if let Some(sch) = &schema {
             env.storage()
                 .persistent()
-                .set(&DataKey::EscrowMetadataSchema(last_id), &sch);
+                .set(&DataKey::EscrowMetadataSchema(last_id), sch);
         }
 
-        // The metadata event is only emitted once both halves are present.
+        // The metadata event is only emitted once both halves are present. The
+        // order id is carried as a topic so indexers can filter by escrow
+        // without deserializing the event body (issue #142).
         if let (Some(hash), Some(sch)) = (order_hash, schema) {
             env.events().publish(
-                (symbol_short!("escrow"), symbol_short!("metadata")),
+                (
+                    symbol_short!("escrow"),
+                    symbol_short!("metadata"),
+                    order_id.clone(),
+                ),
                 EscrowMetadataEvent {
                     escrow_id: order_id.clone(),
                     order_hash: hash,
@@ -2004,7 +2026,7 @@ impl EscrowContract {
             .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("created")),
+            (symbol_short!("escrow"), symbol_short!("created"), last_id),
             EscrowCreatedEvent {
                 escrow_id: last_id,
                 buyer: record.buyer.clone(),
@@ -2092,7 +2114,11 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("cancelled")),
+            (
+                symbol_short!("escrow"),
+                symbol_short!("cancelled"),
+                record.order_id.clone(),
+            ),
             EscrowCancelledEvent {
                 escrow_id: record.order_id.clone(),
                 cancelled_by: caller,
@@ -2392,7 +2418,11 @@ impl EscrowContract {
         env.storage().persistent().set(key, &record);
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("released")),
+            (
+                symbol_short!("escrow"),
+                symbol_short!("released"),
+                escrow_id,
+            ),
             EscrowReleasedEvent {
                 escrow_id,
                 seller: record.seller.clone(),
@@ -2409,7 +2439,7 @@ impl EscrowContract {
             if let Some(cfg) = &yield_config {
                 let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), env);
                 env.events().publish(
-                    (symbol_short!("escrow"), symbol_short!("yield")),
+                    (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
                     EscrowYieldAccruedEvent {
                         escrow_id,
                         seller: record.seller.clone(),
@@ -2540,7 +2570,11 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("refunded")),
+            (
+                symbol_short!("escrow"),
+                symbol_short!("refunded"),
+                escrow_id,
+            ),
             EscrowRefundedEvent {
                 escrow_id,
                 buyer: record.buyer.clone(),
@@ -2597,7 +2631,7 @@ impl EscrowContract {
         );
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("condset")),
+            (symbol_short!("escrow"), symbol_short!("condset"), escrow_id),
             ReleaseConditionSetEvent {
                 escrow_id,
                 condition_type,
@@ -2696,7 +2730,11 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("disputed")),
+            (
+                symbol_short!("escrow"),
+                symbol_short!("disputed"),
+                escrow_id,
+            ),
             EscrowDisputedEvent {
                 escrow_id,
                 disputed_by: caller,
@@ -2752,7 +2790,11 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("resolved")),
+            (
+                symbol_short!("escrow"),
+                symbol_short!("resolved"),
+                escrow_id,
+            ),
             EscrowResolvedEvent {
                 escrow_id,
                 release_to_seller,
@@ -3598,7 +3640,7 @@ impl EscrowContract {
             if let Some(cfg) = &yield_config {
                 let (yield_amount, held_seconds) = Self::compute_yield(&record, Some(cfg), &env);
                 env.events().publish(
-                    (symbol_short!("escrow"), symbol_short!("yield")),
+                    (symbol_short!("escrow"), symbol_short!("yield"), escrow_id),
                     EscrowYieldAccruedEvent {
                         escrow_id,
                         seller: record.seller.clone(),
@@ -3610,7 +3652,11 @@ impl EscrowContract {
         }
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("splitrel")),
+            (
+                symbol_short!("escrow"),
+                symbol_short!("splitrel"),
+                escrow_id,
+            ),
             EscrowSplitReleasedEvent {
                 escrow_id,
                 recipient_count: shares.len(),
@@ -3666,7 +3712,7 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &record);
 
         env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("exttime")),
+            (symbol_short!("escrow"), symbol_short!("exttime"), escrow_id),
             EscrowTimeoutExtendedEvent {
                 escrow_id,
                 old_timeout_ledger: old_timeout,
