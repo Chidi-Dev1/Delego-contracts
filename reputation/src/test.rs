@@ -2,8 +2,8 @@
 #![allow(clippy::module_inception)]
 
 use crate::{
-    ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
-    TransactionOutcome, SCORE_WINDOW,
+    DataKey, ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
+    TransactionOutcome, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD, SCORE_WINDOW,
 };
 use soroban_sdk::{
     symbol_short,
@@ -1140,3 +1140,150 @@ fn test_recency_weight_decay_curve() {
         prev = curr;
     }
 }
+
+// ── Read-path TTL Bumping Tests (#78) ────────────────────────────────────────
+
+#[test]
+fn test_read_paths_bump_entity_and_records_ttl() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &101,
+        &entity,
+        &counterparty,
+        &1_000,
+        &TransactionOutcome::Released,
+    );
+
+    client.flag_entity(
+        &counterparty,
+        &entity,
+        &symbol_short!("dispute"),
+        &Some(String::from_str(&env, "Delayed delivery")),
+    );
+
+    // Initial TTL check
+    let rep_ttl_initial = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Reputation(entity.clone()))
+    });
+    assert!(rep_ttl_initial >= PERSISTENT_BUMP_AMOUNT);
+
+    // Simulate ledger progression (close to threshold)
+    env.ledger().with_mut(|li| {
+        li.sequence_number += 100_000;
+    });
+
+    let rep_ttl_before = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Reputation(entity.clone()))
+    });
+    assert!(rep_ttl_before < rep_ttl_initial);
+
+    // Call get_reputation read path
+    let score = client.get_reputation(&entity);
+    assert_eq!(score.total_transactions, 1);
+
+    let rep_ttl_after = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Reputation(entity.clone()))
+    });
+    assert!(rep_ttl_after >= PERSISTENT_BUMP_AMOUNT);
+    assert!(rep_ttl_after > rep_ttl_before);
+
+    // Advance ledger again and test get_reputation_breakdown read path
+    env.ledger().with_mut(|li| {
+        li.sequence_number += 100_000;
+    });
+
+    let hist_ttl_before = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::TransactionHistory(entity.clone()))
+    });
+    let rec_ttl_before = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::TransactionRecord(101))
+    });
+
+    let breakdown = client.get_reputation_breakdown(&entity, &0, &10);
+    assert_eq!(breakdown.len(), 1);
+
+    let hist_ttl_after = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::TransactionHistory(entity.clone()))
+    });
+    let rec_ttl_after = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::TransactionRecord(101))
+    });
+    assert!(hist_ttl_after > hist_ttl_before);
+    assert!(rec_ttl_after > rec_ttl_before);
+
+    // Advance ledger again and test get_flags read path
+    env.ledger().with_mut(|li| {
+        li.sequence_number += 100_000;
+    });
+
+    let flags_ttl_before = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Flags(entity.clone()))
+    });
+
+    let flags = client.get_flags(&entity, &0, &10);
+    assert_eq!(flags.len(), 1);
+
+    let flags_ttl_after = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Flags(entity.clone()))
+    });
+    assert!(flags_ttl_after > flags_ttl_before);
+}
+
+#[test]
+fn test_slow_activity_liveness_keeps_entity_alive_on_read() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &201,
+        &entity,
+        &counterparty,
+        &5_000,
+        &TransactionOutcome::Released,
+    );
+
+    // Periodically perform read operations across multiple epochs
+    for _ in 0..5 {
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 200_000;
+        });
+
+        // Calling get_reputation refreshes the entity's TTL
+        let rep = client.get_reputation(&entity);
+        assert_eq!(rep.total_transactions, 1);
+
+        let ttl = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::Reputation(entity.clone()))
+        });
+        assert!(ttl >= PERSISTENT_BUMP_AMOUNT);
+    }
+}
+

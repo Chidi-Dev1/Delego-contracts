@@ -479,8 +479,11 @@ impl ReputationContract {
         let mut record: ReputationScore = env
             .storage()
             .persistent()
-            .get(&DataKey::Reputation(entity))
+            .get(&DataKey::Reputation(entity.clone()))
             .ok_or(ReputationError::EntityNotFound)?;
+
+        Self::bump_entity(&env, &entity);
+
         if record.total_transactions < config.min_transactions_threshold {
             record.score = 0;
             record.avg_rating = 0;
@@ -494,6 +497,8 @@ impl ReputationContract {
         offset: u32,
         limit: u32,
     ) -> Result<Vec<TransactionRecord>, ReputationError> {
+        Self::bump_entity(&env, &entity);
+
         let history: Vec<u64> = env
             .storage()
             .persistent()
@@ -523,6 +528,8 @@ impl ReputationContract {
         offset: u32,
         limit: u32,
     ) -> Result<Vec<Flag>, ReputationError> {
+        Self::bump_entity(&env, &entity);
+
         let flags: Vec<Flag> = env
             .storage()
             .persistent()
@@ -825,6 +832,62 @@ impl ReputationContract {
     /// problem `SCORE_WINDOW` guards against in `recompute_score`).
     fn has_transacted_with(env: &Env, entity: &Address, counterparty: &Address) -> bool {
         Self::has_relation(env.clone(), entity.clone(), counterparty.clone(), false)
+    }
+
+    /// Refreshes the persistent storage TTL on `entity`'s score record,
+    /// top-`SCORE_WINDOW` transaction history records, and flags.
+    fn bump_entity(env: &Env, entity: &Address) {
+        let rep_key = DataKey::Reputation(entity.clone());
+        if env.storage().persistent().has(&rep_key) {
+            env.storage().persistent().extend_ttl(
+                &rep_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        let hist_key = DataKey::TransactionHistory(entity.clone());
+        if env.storage().persistent().has(&hist_key) {
+            env.storage().persistent().extend_ttl(
+                &hist_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            if let Some(history) = env
+                .storage()
+                .persistent()
+                .get::<_, Vec<u64>>(&hist_key)
+            {
+                let len = history.len();
+                let start = len.saturating_sub(SCORE_WINDOW);
+                let mut i = start;
+                while i < len {
+                    let escrow_id = history.get(i).unwrap();
+                    let rec_key = DataKey::TransactionRecord(escrow_id);
+                    if env.storage().persistent().has(&rec_key) {
+                        env.storage().persistent().extend_ttl(
+                            &rec_key,
+                            PERSISTENT_BUMP_THRESHOLD,
+                            PERSISTENT_BUMP_AMOUNT,
+                        );
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        let flags_key = DataKey::Flags(entity.clone());
+        if env.storage().persistent().has(&flags_key) {
+            env.storage().persistent().extend_ttl(
+                &flags_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
     }
 
     fn load_or_default_reputation(env: &Env, entity: &Address) -> ReputationScore {
