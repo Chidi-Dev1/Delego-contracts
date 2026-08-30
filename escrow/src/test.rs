@@ -43,7 +43,7 @@ mod test {
         let max_amount = 10000i128;
 
         let res = client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
-        assert!(res);
+        assert_eq!(res, true);
 
         let res_try = client.try_initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
         assert_eq!(res_try, Err(Ok(EscrowError::AlreadyInitialized)));
@@ -78,7 +78,7 @@ mod test {
 
         // Call constructor
         let res = client.constructor(&config);
-        assert!(res);
+        assert_eq!(res, Ok(()));
 
         // Verify admin is set correctly
         let admin_view = client.get_admin();
@@ -113,7 +113,7 @@ mod test {
 
         // Initialize via constructor
         let res = client.constructor(&config);
-        assert!(res);
+        assert_eq!(res, Ok(()));
 
         // Attempt to call initialize after constructor should fail
         let res_try = client.try_initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
