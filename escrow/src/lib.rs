@@ -483,7 +483,10 @@ pub enum DataKey {
     AllowedTokenAt(u32),
     AllowedTokenCount,
     PauseState,
-    EscrowMetadata(u64),
+    /// Order metadata hash half, persisted independently (issue #39).
+    EscrowMetadataHash(u64),
+    /// Order metadata schema half, persisted independently (issue #39).
+    EscrowMetadataSchema(u64),
     LiquidityPool(Address),
     /// Set to `true` the first time the contract is upgraded via `upgrade`.
     MigrationFlag,
@@ -1962,8 +1965,16 @@ impl EscrowContract {
             };
             env.storage()
                 .persistent()
-                .set(&DataKey::EscrowMetadata(last_id), &metadata);
+                .set(&DataKey::EscrowMetadataHash(last_id), &hash);
+        }
+        if let Some(sch) = schema.clone() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::EscrowMetadataSchema(last_id), &sch);
+        }
 
+        // The metadata event is only emitted once both halves are present.
+        if let (Some(hash), Some(sch)) = (order_hash, schema) {
             env.events().publish(
                 (symbol_short!("escrow"), symbol_short!("metadata")),
                 EscrowMetadataEvent {
@@ -3253,11 +3264,69 @@ impl EscrowContract {
     /// returns NotFound. The metadata contains the order hash and schema identifier
     /// for off-chain order verification.
     pub fn get_escrow_metadata(env: Env, escrow_id: u64) -> Result<EscrowMetadata, EscrowError> {
-        let key = DataKey::EscrowMetadata(escrow_id);
+        let order_hash: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowMetadataHash(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        let schema: Symbol = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowMetadataSchema(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        Ok(EscrowMetadata { order_hash, schema })
+    }
+
+    /// Fill in (or overwrite) the order-hash half of an escrow's metadata
+    /// after creation (issue #39). Buyer or admin only. Useful when an escrow
+    /// was created with only a schema, or with no metadata at all.
+    pub fn set_escrow_metadata_hash(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+        order_hash: BytesN<32>,
+    ) -> Result<(), EscrowError> {
+        caller.require_auth();
+
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        if caller != record.buyer && !Self::is_admin(env.clone(), caller.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+
         env.storage()
             .persistent()
-            .get(&key)
-            .ok_or(EscrowError::NotFound)
+            .set(&DataKey::EscrowMetadataHash(escrow_id), &order_hash);
+        Ok(())
+    }
+
+    /// Fill in (or overwrite) the schema half of an escrow's metadata after
+    /// creation (issue #39). Buyer or admin only. Useful when an escrow was
+    /// created with only a hash, or with no metadata at all.
+    pub fn set_escrow_metadata_schema(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+        schema: Symbol,
+    ) -> Result<(), EscrowError> {
+        caller.require_auth();
+
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        if caller != record.buyer && !Self::is_admin(env.clone(), caller.clone()) {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowMetadataSchema(escrow_id), &schema);
+        Ok(())
     }
 
     /// Returns true if the address is the primary admin or a co-admin.
