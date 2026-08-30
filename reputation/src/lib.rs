@@ -107,9 +107,12 @@ pub enum ReputationError {
     /// Same reporter already flagged.
     AlreadyFlagged = 8,
     InvalidParam = 9,
-    /// No active (unresolved) flag from the given reporter found.
+    /// resolve_flag called for a reporter whose flag is already resolved
+    /// (or never existed) — distinguishes the "no active flag" case from
+    /// the generic entity-not-found case.
     NoActiveFlag = 10,
-    /// Caller is not the original flag reporter.
+    /// resolve_flag called with a reporter that has no flag on this entity
+    /// (someone else's flag cannot be resolved through this reporter).
     NotFlagReporter = 11,
 }
 
@@ -666,42 +669,41 @@ impl ReputationContract {
         Self::require_caller_is_admin(&env, &admin)?;
 
         let key = DataKey::Flags(entity.clone());
-        let maybe_flags: Option<Vec<Flag>> = env.storage().persistent().get(&key);
+        let mut flags: Vec<Flag> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
 
-        match maybe_flags {
-            None => {
-                // No flag entry. Distinguish between "entity unknown to the
-                // reputation system" and "entity known but never flagged".
-                let hist_key = DataKey::TransactionHistory(entity);
-                let entity_known = env.storage().persistent().has(&hist_key);
-                if entity_known {
-                    // Entity has transaction history but no flags at all.
-                    return Err(ReputationError::NoActiveFlag);
-                } else {
-                    // Entity is completely unknown.
-                    return Err(ReputationError::EntityNotFound);
-                }
-            }
-            Some(flags) => {
-                // Verify there is at least one active flag on this entity.
-                let has_any_active = flags.iter().any(|f| !f.resolved);
-                if !has_any_active {
-                    return Err(ReputationError::NoActiveFlag);
-                }
-
-                // Find the specific active flag from this reporter.
-                let idx = flags
-                    .iter()
-                    .position(|f| f.reporter == reporter && !f.resolved)
-                    .ok_or(ReputationError::NotFlagReporter)?;
-
-                let mut flags = flags;
-                let mut flag = flags.get(idx as u32).unwrap();
-                flag.resolved = true;
-                flags.set(idx as u32, flag);
-                env.storage().persistent().set(&key, &flags);
-            }
+        // Error taxonomy (see ReputationError):
+        // - entity never seen on-chain (no reputation record, no relation) → EntityNotFound
+        // - entity known, but there is no flag to resolve for it → NoActiveFlag
+        // - entity has flags, but none from this reporter → NotFlagReporter
+        // - reporter's flag exists but is already resolved → NoActiveFlag
+        if flags.is_empty() {
+            let entity_known = env
+                .storage()
+                .persistent()
+                .has(&DataKey::Reputation(entity.clone()))
+                || Self::has_transacted_with(&env, &entity, &reporter);
+            return Err(if entity_known {
+                ReputationError::NoActiveFlag
+            } else {
+                ReputationError::EntityNotFound
+            });
         }
+
+        let idx = flags
+            .iter()
+            .position(|f| f.reporter == reporter)
+            .ok_or(ReputationError::NotFlagReporter)?;
+        let mut flag = flags.get(idx as u32).unwrap();
+        if flag.resolved {
+            return Err(ReputationError::NoActiveFlag);
+        }
+        flag.resolved = true;
+        flags.set(idx as u32, flag);
+        env.storage().persistent().set(&key, &flags);
 
         Ok(())
     }

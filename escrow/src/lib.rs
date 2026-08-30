@@ -1962,9 +1962,7 @@ impl EscrowContract {
         buyer_ids.push_back(last_id);
         env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
 
-        // Store each metadata half independently so partial metadata can be
-        // completed later via set_escrow_metadata_hash / set_escrow_metadata_schema.
-        if let Some(ref hash) = order_hash {
+        if let Some(hash) = order_hash.clone() {
             env.storage()
                 .persistent()
                 .set(&DataKey::EscrowMetadataHash(last_id), hash);
