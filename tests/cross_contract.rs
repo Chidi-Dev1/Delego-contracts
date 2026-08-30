@@ -1,6 +1,10 @@
 #![cfg(test)]
 
 use delego_escrow::{BatchDepositParams, EscrowContract, EscrowContractClient, EscrowStatus};
+use delego_marketplace::{
+    ExternalReputationScore, MarketplaceContract, MarketplaceContractClient, MerchantView,
+    ReputationResolution,
+};
 use delego_permissions::{
     PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
     RelayedSpendMessage,
@@ -10,7 +14,8 @@ use delego_reputation::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
-    testutils::Address as _, testutils::Ledger as _, xdr::ToXdr, Address, BytesN, Env, Vec,
+    contractimpl, contracttype, testutils::Address as _, testutils::Ledger as _, xdr::ToXdr,
+    Address, BytesN, Env, Symbol, Vec,
 };
 
 /// Deterministic test keypair plus its raw ed25519 public key bytes, mirroring
@@ -90,6 +95,111 @@ impl TestEnv {
     fn order_id(&self) -> BytesN<32> {
         BytesN::from_array(&self.env, &[1u8; 32])
     }
+}
+// ------------------------------------------------------------------------
+// Mock reputation contract used by Marketplace::get_merchant_view tests.
+// ------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+enum MockReputationState {
+    Score(ExternalReputationScore),
+    Missing,
+    Revert,
+}
+
+struct MockReputationContract;
+
+#[contractimpl]
+impl MockReputationContract {
+    pub fn set_state(env: Env, state: MockReputationState) {
+        env.storage().instance().set(&Symbol::new(&env, "state"), &state);
+    }
+
+    pub fn get_score(env: Env, _entity: Address) -> Option<ExternalReputationScore> {
+        mock_reputation_score(env)
+    }
+
+    pub fn get_external_score(env: Env, _entity: Address) -> Option<ExternalReputationScore> {
+        mock_reputation_score(env)
+    }
+
+    pub fn get_reputation_score(env: Env, _entity: Address) -> Option<ExternalReputationScore> {
+        mock_reputation_score(env)
+    }
+}
+
+fn mock_reputation_score(env: Env) -> Option<ExternalReputationScore> {
+    let state: MockReputationState = env
+        .storage()
+        .instance()
+        .get(&Symbol::new(&env, "state"))
+        .unwrap_or(MockReputationState::Missing);
+    match state {
+        MockReputationState::Score(score) => Some(score),
+        MockReputationState::Missing => None,
+        MockReputationState::Revert => panic!("mock reputation contract reverted"),
+    }
+}
+
+fn setup_marketplace_with_mock_reputation(
+    env: &Env,
+    admin: &Address,
+) -> (MarketplaceContractClient, Address) {
+    let mock_id = env.register(MockReputationContract, ());
+    let marketplace_id = env.register(MarketplaceContract, ());
+    let marketplace_client = MarketplaceContractClient::new(env, &marketplace_id);
+    marketplace_client.set_reputation_source(admin, &mock_id);
+    (marketplace_client, mock_id)
+}
+
+#[test]
+fn test_marketplace_reputation_resolved() {
+    let t = TestEnv::setup();
+    let (marketplace, mock_id) = setup_marketplace_with_mock_reputation(&t.env, &t._admin);
+    let mock = MockReputationContractClient::new(&t.env, &mock_id);
+
+    let expected = ExternalReputationScore {
+        entity: t.seller.clone(),
+        score: 9876,
+        total_transactions: 42,
+        successful_transactions: 40,
+        disputed_transactions: 1,
+        avg_rating: 9500,
+        last_updated: 123456,
+    };
+    mock.set_state(MockReputationState::Score(expected.clone()));
+
+    let view = marketplace.get_merchant_view(&t.seller);
+    assert_eq!(view.reputation_score, Some(expected.clone()));
+    assert_eq!(
+        view.reputation_resolution,
+        ReputationResolution::Resolved(expected)
+    );
+}
+
+#[test]
+fn test_marketplace_reputation_missing_entity() {
+    let t = TestEnv::setup();
+    let (marketplace, mock_id) = setup_marketplace_with_mock_reputation(&t.env, &t._admin);
+    let mock = MockReputationContractClient::new(&t.env, &mock_id);
+    mock.set_state(MockReputationState::Missing);
+
+    let view = marketplace.get_merchant_view(&t.seller);
+    assert_eq!(view.reputation_score, None);
+    assert_eq!(view.reputation_resolution, ReputationResolution::NotFound);
+}
+
+#[test]
+fn test_marketplace_reputation_source_revert_is_swallowed() {
+    let t = TestEnv::setup();
+    let (marketplace, mock_id) = setup_marketplace_with_mock_reputation(&t.env, &t._admin);
+    let mock = MockReputationContractClient::new(&t.env, &mock_id);
+    mock.set_state(MockReputationState::Revert);
+
+    let view = marketplace.get_merchant_view(&t.seller);
+    assert_eq!(view.reputation_score, None);
+    assert_eq!(view.reputation_resolution, ReputationResolution::Unavailable);
 }
 
 /// Simulates a delegated purchase: agent executes spend via permissions, then buyer deposits.
