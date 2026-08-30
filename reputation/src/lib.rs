@@ -106,6 +106,8 @@ pub enum ReputationError {
     EntityFrozen = 7,
     /// Same reporter already flagged.
     AlreadyFlagged = 8,
+    NoActiveFlag = 10,
+    NotFlagReporter = 11,
     InvalidParam = 9,
 }
 
