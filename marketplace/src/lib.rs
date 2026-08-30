@@ -5,7 +5,6 @@
 //! status lifecycle controls, and reputation score snapshot integration.
 
 #![no_std]
-#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, InvokeError,
@@ -54,6 +53,22 @@ pub struct MerchantView {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
+pub struct DiscoveryPage {
+    pub items: Vec<MerchantView>,
+    pub total: u32,
+    pub next_offset: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct NameRelease {
+    pub name: String,
+    pub released_at: u64,
+    pub previous_merchant: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct RegisterParams {
     pub name: String,
     pub description: String,
@@ -61,6 +76,13 @@ pub struct RegisterParams {
     pub image_url: String,
     pub metadata: Option<String>,
     pub required_verifications: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct VerificationPolicy {
+    pub required: u32,
+    pub max_verifications: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,6 +119,7 @@ pub enum MarketplaceError {
     MetadataLockActive = 13,
     InvalidCategory = 14,
     InvalidParam = 15,
+    NoPendingAdmin = 16,
 }
 
 // --- Events ---
@@ -105,7 +128,7 @@ pub enum MarketplaceError {
 #[derive(Clone, Debug)]
 pub struct MerchantRegisteredEvent {
     pub merchant_id: u64,
-    pub merchant: Address,
+    pub owner: Address,
     pub name: String,
 }
 
@@ -129,6 +152,22 @@ pub struct MerchantProfileUpdatedEvent {
 pub struct MerchantMetadataUpdatedEvent {
     pub merchant_id: u64,
     pub new_metadata: Option<String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CooldownConfig {
+    pub value_seconds: u64,
+    pub min_seconds: u64,
+    pub max_seconds: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataCooldownSetEvent {
+    pub previous: Option<u64>,
+    pub current: u64,
+    pub set_by: Address,
 }
 
 #[contracttype]
@@ -158,6 +197,9 @@ pub struct MerchantUnsuspendedEvent {
 pub struct MerchantClosedEvent {
     pub merchant_id: u64,
     pub closed_by: Address,
+    pub reason: Symbol,
+    pub name: String,
+    pub category: Symbol,
 }
 
 #[contracttype]
@@ -213,14 +255,17 @@ pub enum DataKey {
     NextMerchantId,
     Merchant(u64),
     MerchantName(String),
+    FreedName(String),
+    ArchivedMerchant(u64),
     VerifiedCount(u64),
     Verifiers,
     MerchantIds,
     CategoryIndex(Symbol),
     MetadataCooldown,
+    MetadataCooldownConfig,
     MerchantVerifier(u64, Address),
     MerchantVerifierList(u64),
-    RequiredVerifications(u64),
+    VerificationPolicy(u64),
     LastMetadataUpdate(u64),
     GlobalReputationContract,
 }
@@ -239,7 +284,10 @@ pub struct ExternalReputationScore {
 }
 
 const MAX_COMMISSION_BPS: u32 = 10_000;
+const MAX_REQUIRED_VERIFICATIONS: u32 = 50;
 const DEFAULT_METADATA_COOLDOWN_SECS: u64 = 86_400; // 24 hours
+const MIN_METADATA_COOLDOWN_SECS: u64 = 60;
+const MAX_METADATA_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 const MAX_PAGE_LIMIT: u32 = 50;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
@@ -270,6 +318,14 @@ impl MarketplaceContract {
         env.storage()
             .instance()
             .set(&DataKey::MetadataCooldown, &DEFAULT_METADATA_COOLDOWN_SECS);
+        env.storage().instance().set(
+            &DataKey::MetadataCooldownConfig,
+            &CooldownConfig {
+                value_seconds: DEFAULT_METADATA_COOLDOWN_SECS,
+                min_seconds: MIN_METADATA_COOLDOWN_SECS,
+                max_seconds: MAX_METADATA_COOLDOWN_SECS,
+            },
+        );
 
         Ok(())
     }
@@ -292,6 +348,12 @@ impl MarketplaceContract {
             return Err(MarketplaceError::DuplicateMerchantName);
         }
 
+        // If the name was previously freed, clear the FreedName entry so it can be reused.
+        let freed_key = DataKey::FreedName(params.name.clone());
+        if env.storage().persistent().has(&freed_key) {
+            env.storage().persistent().remove(&freed_key);
+        }
+
         let now = env.ledger().timestamp();
         let next_id: u64 = env
             .storage()
@@ -304,6 +366,15 @@ impl MarketplaceContract {
         } else {
             params.required_verifications
         };
+
+        // Determine current verifier capacity and enforce bounds
+        let verifiers_len: u32 = Self::get_verifiers(env.clone()).len();
+        if required_verifications > MAX_REQUIRED_VERIFICATIONS {
+            return Err(MarketplaceError::InvalidParam);
+        }
+        if verifiers_len > 0 && required_verifications > verifiers_len {
+            return Err(MarketplaceError::InvalidParam);
+        }
 
         let new_merchant = Merchant {
             id: next_id,
@@ -326,10 +397,13 @@ impl MarketplaceContract {
             .persistent()
             .set(&DataKey::Merchant(next_id), &new_merchant);
         env.storage().persistent().set(&name_key, &next_id);
-        env.storage().persistent().set(
-            &DataKey::RequiredVerifications(next_id),
-            &required_verifications,
-        );
+        let policy = VerificationPolicy {
+            required: required_verifications,
+            max_verifications: verifiers_len.min(MAX_REQUIRED_VERIFICATIONS),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerificationPolicy(next_id), &policy);
         env.storage()
             .persistent()
             .set(&DataKey::VerifiedCount(next_id), &0u32);
@@ -371,7 +445,7 @@ impl MarketplaceContract {
         );
         storage.extend_ttl(&name_key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         storage.extend_ttl(
-            &DataKey::RequiredVerifications(next_id),
+            &DataKey::VerificationPolicy(next_id),
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -409,12 +483,17 @@ impl MarketplaceContract {
             (symbol_short!("mkplc"), symbol_short!("reg")),
             MerchantRegisteredEvent {
                 merchant_id: next_id,
-                merchant,
+                owner: merchant,
                 name: params.name,
             },
         );
 
         Ok(next_id)
+    }
+
+    pub fn is_name_available(env: Env, name: String) -> bool {
+        let live_key = DataKey::MerchantName(name);
+        !env.storage().persistent().has(&live_key)
     }
 
     pub fn update_merchant_profile(
@@ -486,6 +565,12 @@ impl MarketplaceContract {
 
         if !is_admin && !is_owner {
             return Err(MarketplaceError::Unauthorized);
+        }
+
+        // Change-detection: Compare incoming metadata against stored value
+        if merchant.metadata == new_metadata {
+            // No change detected; skip write and event emission
+            return Ok(());
         }
 
         let now = env.ledger().timestamp();
@@ -587,6 +672,25 @@ impl MarketplaceContract {
             return Err(MarketplaceError::VerifierNotFound);
         }
 
+        // Ensure removal won't invalidate any existing merchant verification policies
+        let new_verifiers_len: u32 = new_verifiers.len();
+        let merchant_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantIds)
+            .unwrap_or_else(|| Vec::new(&env));
+        for id in merchant_ids.iter() {
+            let policy: Option<VerificationPolicy> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::VerificationPolicy(id));
+            if let Some(p) = policy {
+                if p.required > new_verifiers_len {
+                    return Err(MarketplaceError::InvalidParam);
+                }
+            }
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::Verifiers, &new_verifiers);
@@ -656,11 +760,13 @@ impl MarketplaceContract {
             .persistent()
             .set(&DataKey::VerifiedCount(merchant_id), &new_count);
 
-        let required: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::RequiredVerifications(merchant_id))
-            .unwrap_or(1);
+        let required: u32 = {
+            let policy: Option<VerificationPolicy> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::VerificationPolicy(merchant_id));
+            policy.map(|p| p.required).unwrap_or(1)
+        };
 
         if new_count >= required {
             merchant.verified = true;
@@ -806,7 +912,27 @@ impl MarketplaceContract {
         env: Env,
         offset: u32,
         limit: u32,
-    ) -> Result<Vec<MerchantView>, MarketplaceError> {
+    ) -> Result<DiscoveryPage, MarketplaceError> {
+        // Return all merchants regardless of status (backward compatible)
+        Self::get_merchants_filtered(env, offset, limit, None)
+    }
+
+    pub fn get_merchants_by_status(
+        env: Env,
+        status: MerchantStatus,
+        offset: u32,
+        limit: u32,
+    ) -> Result<DiscoveryPage, MarketplaceError> {
+        // Filter merchants by specific status
+        Self::get_merchants_filtered(env, offset, limit, Some(status))
+    }
+
+    fn get_merchants_filtered(
+        env: Env,
+        offset: u32,
+        limit: u32,
+        status_filter: Option<MerchantStatus>,
+    ) -> Result<DiscoveryPage, MarketplaceError> {
         let limit = limit.min(MAX_PAGE_LIMIT);
         let merchant_ids: Vec<u64> = env
             .storage()
@@ -814,22 +940,47 @@ impl MarketplaceContract {
             .get(&DataKey::MerchantIds)
             .unwrap_or_else(|| Vec::new(&env));
 
-        let total = merchant_ids.len();
+        // Filter merchants by status if provided
+        let mut filtered_ids = Vec::new(&env);
+        for id in merchant_ids.iter() {
+            if let Ok(merchant) = Self::get_merchant(env.clone(), id) {
+                if let Some(status) = status_filter {
+                    if merchant.status == status {
+                        filtered_ids.push_back(id);
+                    }
+                } else {
+                    // No filter: include all
+                    filtered_ids.push_back(id);
+                }
+            }
+        }
+
+        let total = filtered_ids.len();
         if offset >= total || limit == 0 {
-            return Ok(Vec::new(&env));
+            return Ok(DiscoveryPage {
+                items: Vec::new(&env),
+                total: total as u32,
+                next_offset: None,
+            });
         }
 
         let end = offset.saturating_add(limit).min(total);
-        let mut result = Vec::new(&env);
+        let mut items = Vec::new(&env);
         let mut i = offset;
         while i < end {
-            let id = merchant_ids.get(i).unwrap();
+            let id = filtered_ids.get(i).unwrap();
             let view = Self::get_merchant_view(env.clone(), id)?;
-            result.push_back(view);
+            items.push_back(view);
             i += 1;
         }
 
-        Ok(result)
+        let next_offset = if end < total { Some(end) } else { None };
+
+        Ok(DiscoveryPage {
+            items,
+            total: total as u32,
+            next_offset,
+        })
     }
 
     pub fn get_merchants_by_category(
@@ -837,7 +988,29 @@ impl MarketplaceContract {
         category: Symbol,
         offset: u32,
         limit: u32,
-    ) -> Result<Vec<MerchantView>, MarketplaceError> {
+    ) -> Result<DiscoveryPage, MarketplaceError> {
+        // Return all merchants in category regardless of status (backward compatible)
+        Self::get_merchants_by_category_filtered(env, category, offset, limit, None)
+    }
+
+    pub fn get_merchants_by_category_status(
+        env: Env,
+        category: Symbol,
+        status: MerchantStatus,
+        offset: u32,
+        limit: u32,
+    ) -> Result<DiscoveryPage, MarketplaceError> {
+        // Filter merchants by category and specific status
+        Self::get_merchants_by_category_filtered(env, category, offset, limit, Some(status))
+    }
+
+    fn get_merchants_by_category_filtered(
+        env: Env,
+        category: Symbol,
+        offset: u32,
+        limit: u32,
+        status_filter: Option<MerchantStatus>,
+    ) -> Result<DiscoveryPage, MarketplaceError> {
         let limit = limit.min(MAX_PAGE_LIMIT);
         let cat_ids: Vec<u64> = env
             .storage()
@@ -845,22 +1018,47 @@ impl MarketplaceContract {
             .get(&DataKey::CategoryIndex(category))
             .unwrap_or_else(|| Vec::new(&env));
 
-        let total = cat_ids.len();
+        // Filter merchants by status if provided
+        let mut filtered_ids = Vec::new(&env);
+        for id in cat_ids.iter() {
+            if let Ok(merchant) = Self::get_merchant(env.clone(), id) {
+                if let Some(status) = status_filter {
+                    if merchant.status == status {
+                        filtered_ids.push_back(id);
+                    }
+                } else {
+                    // No filter: include all
+                    filtered_ids.push_back(id);
+                }
+            }
+        }
+
+        let total = filtered_ids.len();
         if offset >= total || limit == 0 {
-            return Ok(Vec::new(&env));
+            return Ok(DiscoveryPage {
+                items: Vec::new(&env),
+                total: total as u32,
+                next_offset: None,
+            });
         }
 
         let end = offset.saturating_add(limit).min(total);
-        let mut result = Vec::new(&env);
+        let mut items = Vec::new(&env);
         let mut i = offset;
         while i < end {
-            let id = cat_ids.get(i).unwrap();
+            let id = filtered_ids.get(i).unwrap();
             let view = Self::get_merchant_view(env.clone(), id)?;
-            result.push_back(view);
+            items.push_back(view);
             i += 1;
         }
 
-        Ok(result)
+        let next_offset = if end < total { Some(end) } else { None };
+
+        Ok(DiscoveryPage {
+            items,
+            total: total as u32,
+            next_offset,
+        })
     }
 
     // --- Commission ---
@@ -990,6 +1188,7 @@ impl MarketplaceContract {
         env: Env,
         admin: Address,
         merchant_id: u64,
+        reason: Symbol,
     ) -> Result<(), MarketplaceError> {
         admin.require_auth();
         let current_admin = Self::get_admin(env.clone())?;
@@ -1010,6 +1209,9 @@ impl MarketplaceContract {
             MerchantClosedEvent {
                 merchant_id,
                 closed_by: admin,
+                reason,
+                name: merchant.name.clone(),
+                category: merchant.category,
             },
         );
 
@@ -1107,6 +1309,12 @@ impl MarketplaceContract {
             .get(&DataKey::PendingAdmin)
             .unwrap_or(None);
 
+        // No proposal exists: distinct error so callers can tell this apart
+        // from "not the proposed successor" (Unauthorized).
+        if pending.is_none() {
+            return Err(MarketplaceError::NoPendingAdmin);
+        }
+
         if pending != Some(caller.clone()) {
             return Err(MarketplaceError::Unauthorized);
         }
@@ -1140,9 +1348,34 @@ impl MarketplaceContract {
             return Err(MarketplaceError::Unauthorized);
         }
 
+        let previous = Self::get_metadata_cooldown(env.clone());
+        let current =
+            cooldown_seconds.clamp(MIN_METADATA_COOLDOWN_SECS, MAX_METADATA_COOLDOWN_SECS);
+        if previous == current {
+            return Ok(());
+        }
+
+        env.storage().instance().set(
+            &DataKey::MetadataCooldownConfig,
+            &CooldownConfig {
+                value_seconds: current,
+                min_seconds: MIN_METADATA_COOLDOWN_SECS,
+                max_seconds: MAX_METADATA_COOLDOWN_SECS,
+            },
+        );
+        // Keep the original key populated for deployments upgraded from the
+        // pre-config format and older readers.
         env.storage()
             .instance()
-            .set(&DataKey::MetadataCooldown, &cooldown_seconds);
+            .set(&DataKey::MetadataCooldown, &current);
+        env.events().publish(
+            (symbol_short!("mkplc"), Symbol::new(&env, "cooldown_set")),
+            MetadataCooldownSetEvent {
+                previous: Some(previous),
+                current,
+                set_by: admin,
+            },
+        );
 
         Ok(())
     }
@@ -1150,7 +1383,9 @@ impl MarketplaceContract {
     pub fn get_metadata_cooldown(env: Env) -> u64 {
         env.storage()
             .instance()
-            .get(&DataKey::MetadataCooldown)
+            .get::<_, CooldownConfig>(&DataKey::MetadataCooldownConfig)
+            .map(|config| config.value_seconds)
+            .or_else(|| env.storage().instance().get(&DataKey::MetadataCooldown))
             .unwrap_or(DEFAULT_METADATA_COOLDOWN_SECS)
     }
 
@@ -1171,7 +1406,7 @@ impl MarketplaceContract {
     pub fn version(_env: Env) -> ContractVersion {
         ContractVersion {
             name: symbol_short!("market"),
-            semver: symbol_short!("0_1_0"),
+            semver: symbol_short!("0_2_0"),
         }
     }
 
