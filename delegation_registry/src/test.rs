@@ -535,3 +535,147 @@ fn test_revoke_paused_delegation_returns_true() {
     assert!(!repeat_result);
     assert_eq!(client.get_delegation_version(&id), 3);
 }
+
+// ── Lifecycle edge-case tests ─────────────────────────────────────────────
+
+/// Rollback must be rejected when the target snapshot was captured at or
+/// after expiry — reviving an expired delegation must never be allowed.
+///
+/// `sweep_expired` transitions the delegation to Expired and creates a
+/// versioned snapshot. We then bump to the next version via
+/// `revoke_delegation` so the Expired snapshot is a valid lower target,
+/// then verify the rollback is still refused.
+#[test]
+fn test_rollback_to_expired_snapshot_rejected() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Expired_Rollback");
+    let id = client.create_delegation(
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label,
+        &100, // expires at ledger 200
+    );
+    // v1 snapshot (Active)
+
+    client.pause_delegation(&id); // v2 snapshot (Paused)
+
+    // Advance past expiry and sweep — creates v3 Expired snapshot.
+    env.ledger().set_sequence_number(300);
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+    let swept = client.sweep_expired(&ids);
+    assert_eq!(swept.len(), 1);
+
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Expired);
+    assert_eq!(client.get_delegation_version(&id), 3);
+
+    // The history must contain an Expired snapshot at v3.
+    let history = client.get_delegation_history(&id);
+    assert_eq!(history.len(), 3);
+    assert_eq!(
+        history.get(2).unwrap().record.status,
+        DelegationStatus::Expired
+    );
+
+    // Revoke from Expired → bumps to v4 so v3 is now a valid lower target.
+    client.revoke_delegation(&id);
+    assert_eq!(client.get_delegation_version(&id), 4);
+    assert_eq!(client.get_delegation_history(&id).len(), 4);
+
+    // Rolling back to v3 (the Expired snapshot) must be rejected.
+    let result = client.try_rollback_delegation(&id, &3u32);
+    assert_eq!(result, Err(Ok(DelegationError::Expired)));
+
+    // Status must remain Revoked, version unchanged.
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Revoked);
+    assert_eq!(client.get_delegation_version(&id), 4);
+}
+
+/// History must grow by exactly one entry for each state transition.
+#[test]
+fn test_history_grows_across_transitions() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "History_Growth");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    // After creation: 1 snapshot (v1)
+    let history = client.get_delegation_history(&id);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history.get(0).unwrap().version, 1);
+
+    // After pause: 2 snapshots (v1, v2)
+    client.pause_delegation(&id);
+    let history = client.get_delegation_history(&id);
+    assert_eq!(history.len(), 2);
+    assert_eq!(history.get(1).unwrap().version, 2);
+
+    // After resume: 3 snapshots (v1, v2, v3)
+    client.resume_delegation(&id);
+    let history = client.get_delegation_history(&id);
+    assert_eq!(history.len(), 3);
+    assert_eq!(history.get(2).unwrap().version, 3);
+
+    // After revoke: 4 snapshots (v1, v2, v3, v4)
+    client.revoke_delegation(&id);
+    let history = client.get_delegation_history(&id);
+    assert_eq!(history.len(), 4);
+    assert_eq!(history.get(3).unwrap().version, 4);
+
+    // Each snapshot must carry the correct status.
+    assert_eq!(
+        history.get(0).unwrap().record.status,
+        DelegationStatus::Active
+    );
+    assert_eq!(
+        history.get(1).unwrap().record.status,
+        DelegationStatus::Paused
+    );
+    assert_eq!(
+        history.get(2).unwrap().record.status,
+        DelegationStatus::Active
+    );
+    assert_eq!(
+        history.get(3).unwrap().record.status,
+        DelegationStatus::Revoked
+    );
+}
+
+/// Delegation IDs must be strictly increasing even when created by
+/// different owners.
+#[test]
+fn test_cross_owner_delegation_id_monotonicity() {
+    let (env, client, _, _, _, _) = setup();
+    env.mock_all_auths();
+
+    let owner_a = Address::generate(&env);
+    let owner_b = Address::generate(&env);
+    let owner_c = Address::generate(&env);
+    let agent_id = BytesN::from_array(&env, &[1; 32]);
+    let permissions_contract = Address::generate(&env);
+
+    let label_a = Symbol::new(&env, "OwnerA_Agt");
+    let label_b = Symbol::new(&env, "OwnerB_Agt");
+    let label_c = Symbol::new(&env, "OwnerC_Agt");
+
+    let id_a =
+        client.create_delegation(&owner_a, &agent_id, &permissions_contract, &label_a, &1000);
+    let id_b =
+        client.create_delegation(&owner_b, &agent_id, &permissions_contract, &label_b, &1000);
+    let id_c =
+        client.create_delegation(&owner_c, &agent_id, &permissions_contract, &label_c, &1000);
+
+    // IDs must be strictly increasing: id_a < id_b < id_c
+    assert!(id_a < id_b, "id_a ({id_a}) must be < id_b ({id_b})");
+    assert!(id_b < id_c, "id_b ({id_b}) must be < id_c ({id_c})");
+
+    // Each delegation belongs to the correct owner.
+    assert_eq!(client.get_delegation(&id_a).owner, owner_a);
+    assert_eq!(client.get_delegation(&id_b).owner, owner_b);
+    assert_eq!(client.get_delegation(&id_c).owner, owner_c);
+}

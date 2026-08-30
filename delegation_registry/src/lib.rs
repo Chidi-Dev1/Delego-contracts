@@ -405,6 +405,12 @@ impl DelegationRegistry {
 
         let snapshot = target_snapshot.ok_or(DelegationError::SnapshotNotFound)?;
 
+        // Reject rollback to a snapshot whose delegation was already expired —
+        // reviving an expired delegation via rollback must never be allowed.
+        if snapshot.record.status == DelegationStatus::Expired {
+            return Err(DelegationError::Expired);
+        }
+
         record = snapshot.record;
         record.version = Self::increment_version(&env, delegation_id);
         record.updated_at = env.ledger().timestamp();
@@ -508,8 +514,11 @@ impl DelegationRegistry {
                     || record.status == DelegationStatus::Revoked;
                 if !already_terminal && current_ledger >= record.expires_at_ledger {
                     record.status = DelegationStatus::Expired;
+                    record.version = Self::increment_version(&env, id);
                     record.updated_at = env.ledger().timestamp();
                     env.storage().persistent().set(&key, &record);
+
+                    Self::store_snapshot(&env, id, &record);
 
                     env.events().publish(
                         (symbol_short!("deleg"), symbol_short!("expired")),
