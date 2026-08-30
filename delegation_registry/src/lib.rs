@@ -24,6 +24,7 @@ pub struct DelegationRecord {
     pub status: DelegationStatus,
     pub label: Symbol,
     pub created_at: u64,
+    pub updated_at: u64,
     pub expires_at_ledger: u32,
     pub version: u32,
 }
@@ -100,18 +101,34 @@ pub enum DataKey {
     DelegationHistory(u64),
 }
 
+/// # Error code allocation
+///
+/// Error codes are surfaced over bridges and must be unique across contracts.
+/// The following ranges are allocated protocol-wide and must not overlap:
+///
+/// | Contract | Reserved codes |
+/// | --- | --- |
+/// | `EscrowError` | 1..=100 |
+/// | `PermissionError` | 101..=200 |
+/// | `ReputationError` | 201..=300 |
+/// | `DelegationError` | 301..=400 |
+/// | `MarketplaceError` | 401..=500 |
+///
+/// `DelegationError` currently occupies the first nine codes in its range.
+/// New variants must use the next unused code within 301..=400.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum DelegationError {
-    NotFound = 1,
-    NotActive = 2,
-    NotPaused = 3,
-    Expired = 4,
-    AlreadyInitialized = 5,
-    InvalidVersion = 6,
-    VersionNotLower = 7,
-    SnapshotNotFound = 8,
+    NotFound = 301,
+    NotActive = 302,
+    NotPaused = 303,
+    Expired = 304,
+    AlreadyInitialized = 305,
+    InvalidVersion = 306,
+    VersionNotLower = 307,
+    SnapshotNotFound = 308,
+    InvalidAgentId = 309,
 }
 
 #[contract]
@@ -142,8 +159,15 @@ impl DelegationRegistry {
         permissions_contract: Address,
         label: Symbol,
         ttl_ledgers: u32,
-    ) -> u64 {
+    ) -> Result<u64, DelegationError> {
         owner.require_auth();
+
+        // Reject the all-zero sentinel agent id so authorization records
+        // can never be seeded with a dead id, keeping is_authorized
+        // failing closed.
+        if agent_id == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(DelegationError::InvalidAgentId);
+        }
 
         let id = env
             .storage()
@@ -163,6 +187,7 @@ impl DelegationRegistry {
             status: DelegationStatus::Active,
             label,
             created_at: now,
+            updated_at: now,
             expires_at_ledger,
             version: 1,
         };
@@ -215,7 +240,7 @@ impl DelegationRegistry {
             },
         );
 
-        id
+        Ok(id)
     }
 
     pub fn pause_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
@@ -233,6 +258,7 @@ impl DelegationRegistry {
 
         record.status = DelegationStatus::Paused;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -269,6 +295,7 @@ impl DelegationRegistry {
         if env.ledger().sequence() >= record.expires_at_ledger {
             record.status = DelegationStatus::Expired;
             record.version = Self::increment_version(&env, delegation_id);
+            record.updated_at = env.ledger().timestamp();
             env.storage()
                 .persistent()
                 .set(&DataKey::Delegation(delegation_id), &record);
@@ -289,6 +316,7 @@ impl DelegationRegistry {
 
         record.status = DelegationStatus::Active;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -309,6 +337,10 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    /// Revokes an active or paused delegation.
+    ///
+    /// Returns `Ok(true)` if the delegation transitioned to `Revoked`.
+    /// Returns `Ok(false)` if the delegation was already `Revoked` (idempotent no-op).
     pub fn revoke_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
         let mut record: DelegationRecord = env
             .storage()
@@ -319,11 +351,12 @@ impl DelegationRegistry {
         record.owner.require_auth();
 
         if record.status == DelegationStatus::Revoked {
-            return Ok(true);
+            return Ok(false);
         }
 
         record.status = DelegationStatus::Revoked;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -389,6 +422,7 @@ impl DelegationRegistry {
 
         record = snapshot.record;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -489,6 +523,7 @@ impl DelegationRegistry {
                     || record.status == DelegationStatus::Revoked;
                 if !already_terminal && current_ledger >= record.expires_at_ledger {
                     record.status = DelegationStatus::Expired;
+                    record.updated_at = env.ledger().timestamp();
                     env.storage().persistent().set(&key, &record);
 
                     env.events().publish(
@@ -578,3 +613,50 @@ impl DelegationRegistry {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod error_code_uniqueness_tests {
+    use super::DelegationError;
+
+    #[test]
+    fn delegation_error_codes_are_unique_and_allocated() {
+        let codes = [
+            (DelegationError::NotFound, 301u32),
+            (DelegationError::NotActive, 302u32),
+            (DelegationError::NotPaused, 303u32),
+            (DelegationError::Expired, 304u32),
+            (DelegationError::AlreadyInitialized, 305u32),
+            (DelegationError::InvalidVersion, 306u32),
+            (DelegationError::VersionNotLower, 307u32),
+            (DelegationError::SnapshotNotFound, 308u32),
+            (DelegationError::InvalidAgentId, 309u32),
+        ];
+
+        for (variant, expected) in codes {
+            assert_eq!(variant as u32, expected, "numeric code changed");
+        }
+
+        let mut seen = [
+            DelegationError::NotFound as u32,
+            DelegationError::NotActive as u32,
+            DelegationError::NotPaused as u32,
+            DelegationError::Expired as u32,
+            DelegationError::AlreadyInitialized as u32,
+            DelegationError::InvalidVersion as u32,
+            DelegationError::VersionNotLower as u32,
+            DelegationError::SnapshotNotFound as u32,
+            DelegationError::InvalidAgentId as u32,
+        ];
+        seen.sort_unstable();
+        for pair in seen.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate DelegationError code");
+        }
+        for code in seen {
+            assert!(
+                (301..=400).contains(&code),
+                "DelegationError code {} is outside the reserved range",
+                code
+            );
+        }
+    }
+}
