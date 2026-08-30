@@ -1469,6 +1469,7 @@ impl MarketplaceContract {
 
         Ok(String::from_bytes(env, &buf[start..end]))
     }
+
     /// Normalizes and bounds-checks every string field on `RegisterParams`,
     /// used by both `register_merchant` and, field-by-field, by
     /// `update_merchant_profile`. Whitespace is trimmed to a canonical form
