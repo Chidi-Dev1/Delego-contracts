@@ -2089,3 +2089,315 @@ fn deposit_escrow_with_id(t: &TestEnv, amount: i128, timeout_ledgers: u32, id_se
         &None,
     )
 }
+
+// --- Issue #136: extend_timeout mutual-auth, split_release over-allocation, withdraw_from_pool edge cases ---
+
+/// Setup without `mock_all_auths` so individual auth calls can be selectively mocked.
+fn setup_no_mock_auths() -> TestEnv {
+    let env = Env::default();
+
+    let admin = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    let seller = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_contract_id);
+    token_admin_client.mint(&buyer, &10000);
+
+    let escrow_contract_id = env.register(EscrowContract, ());
+    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+    let min_amount = 100i128;
+    let max_amount = 10000i128;
+    escrow_client.initialize(&admin, &0u32, &treasury, &min_amount, &max_amount);
+    escrow_client.add_token(&admin, &token_contract_id);
+
+    TestEnv {
+        env,
+        admin,
+        buyer,
+        seller,
+        agent,
+        treasury,
+        token_contract_id,
+        escrow_contract_id,
+    }
+}
+
+#[test]
+fn test_extend_timeout_buyer_only_auth_fails() {
+    let t = setup_no_mock_auths();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    // Deposit an escrow using buyer auth.
+    escrow_client
+        .mock_auths(&[MockAuth {
+            address: &t.buyer,
+            invoke: &MockAuthInvoke {
+                contract: &t.escrow_contract_id,
+                fn_name: "deposit",
+                args: (
+                    t.buyer.clone(),
+                    t.seller.clone(),
+                    t.token_contract_id.clone(),
+                    1000i128,
+                    order_id_n(&t.env, 1),
+                    100u32,
+                    Option::<BytesN<32>>::None,
+                    Option::<soroban_sdk::Symbol>::None,
+                )
+                    .into_val(&t.env),
+                sub_invokes: &[],
+            },
+        }])
+        .deposit(
+            &t.buyer,
+            &t.seller,
+            &t.token_contract_id,
+            &1000,
+            &order_id_n(&t.env, 1),
+            &100,
+            &None,
+            &None,
+        );
+
+    let escrow_id = 1u64;
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Funded);
+
+    // Buyer-only: mock auth for buyer only on extend_timeout.
+    // seller.require_auth() inside the contract is not satisfied.
+    let result = escrow_client
+        .mock_auths(&[MockAuth {
+            address: &t.buyer,
+            invoke: &MockAuthInvoke {
+                contract: &t.escrow_contract_id,
+                fn_name: "extend_timeout",
+                args: (escrow_id, t.buyer.clone(), 200u32).into_val(&t.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_extend_timeout(&escrow_id, &t.buyer, &200u32);
+    assert!(result.is_err());
+
+    // Timeout should remain unchanged.
+    let after = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(after.timeout_ledger, record.timeout_ledger);
+}
+
+#[test]
+fn test_extend_timeout_seller_only_auth_fails() {
+    let t = setup_no_mock_auths();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    // Deposit an escrow using buyer auth.
+    escrow_client
+        .mock_auths(&[MockAuth {
+            address: &t.buyer,
+            invoke: &MockAuthInvoke {
+                contract: &t.escrow_contract_id,
+                fn_name: "deposit",
+                args: (
+                    t.buyer.clone(),
+                    t.seller.clone(),
+                    t.token_contract_id.clone(),
+                    1000i128,
+                    order_id_n(&t.env, 2),
+                    100u32,
+                    Option::<BytesN<32>>::None,
+                    Option::<soroban_sdk::Symbol>::None,
+                )
+                    .into_val(&t.env),
+                sub_invokes: &[],
+            },
+        }])
+        .deposit(
+            &t.buyer,
+            &t.seller,
+            &t.token_contract_id,
+            &1000,
+            &order_id_n(&t.env, 2),
+            &100,
+            &None,
+            &None,
+        );
+
+    let escrow_id = 1u64;
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Funded);
+
+    // Seller-only: mock auth for seller only on extend_timeout.
+    // buyer.require_auth() inside the contract is not satisfied.
+    let result = escrow_client
+        .mock_auths(&[MockAuth {
+            address: &t.seller,
+            invoke: &MockAuthInvoke {
+                contract: &t.escrow_contract_id,
+                fn_name: "extend_timeout",
+                args: (escrow_id, t.seller.clone(), 200u32).into_val(&t.env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_extend_timeout(&escrow_id, &t.seller, &200u32);
+    assert!(result.is_err());
+
+    // Timeout should remain unchanged.
+    let after = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(after.timeout_ledger, record.timeout_ledger);
+}
+
+#[test]
+fn test_extend_timeout_both_parties_auth_succeeds() {
+    let t = setup_no_mock_auths();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    // Deposit an escrow using buyer auth.
+    escrow_client
+        .mock_auths(&[MockAuth {
+            address: &t.buyer,
+            invoke: &MockAuthInvoke {
+                contract: &t.escrow_contract_id,
+                fn_name: "deposit",
+                args: (
+                    t.buyer.clone(),
+                    t.seller.clone(),
+                    t.token_contract_id.clone(),
+                    1000i128,
+                    order_id_n(&t.env, 3),
+                    100u32,
+                    Option::<BytesN<32>>::None,
+                    Option::<soroban_sdk::Symbol>::None,
+                )
+                    .into_val(&t.env),
+                sub_invokes: &[],
+            },
+        }])
+        .deposit(
+            &t.buyer,
+            &t.seller,
+            &t.token_contract_id,
+            &1000,
+            &order_id_n(&t.env, 3),
+            &100,
+            &None,
+            &None,
+        );
+
+    let escrow_id = 1u64;
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Funded);
+    let original_timeout = record.timeout_ledger;
+
+    // Both buyer + seller authenticate the extend_timeout call.
+    let result = escrow_client
+        .mock_auths(&[
+            MockAuth {
+                address: &t.buyer,
+                invoke: &MockAuthInvoke {
+                    contract: &t.escrow_contract_id,
+                    fn_name: "extend_timeout",
+                    args: (escrow_id, t.buyer.clone(), 200u32).into_val(&t.env),
+                    sub_invokes: &[],
+                },
+            },
+            MockAuth {
+                address: &t.seller,
+                invoke: &MockAuthInvoke {
+                    contract: &t.escrow_contract_id,
+                    fn_name: "extend_timeout",
+                    args: (escrow_id, t.buyer.clone(), 200u32).into_val(&t.env),
+                    sub_invokes: &[],
+                },
+            },
+        ])
+        .try_extend_timeout(&escrow_id, &t.buyer, &200u32);
+    assert_eq!(result, Ok(Ok(true)));
+
+    // Timeout was extended.
+    let after = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(after.timeout_ledger, 200);
+    assert!(after.timeout_ledger > original_timeout);
+}
+
+#[test]
+fn test_split_release_shares_exceed_remaining_fails() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let recipient = Address::generate(&t.env);
+
+    // First, do a valid partial split: release 400.
+    let mut shares = Vec::new(&t.env);
+    shares.push_back((recipient.clone(), 400i128));
+    assert!(escrow_client.split_release(&escrow_id, &t.buyer, &shares));
+    let record_after_first = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record_after_first.released_amount, 400);
+    assert_eq!(record_after_first.status, EscrowStatus::Funded);
+
+    // Remaining = 1000 - 400 = 600.
+    // Now attempt a split where shares exceed remaining (601 > 600).
+    let mut excess_shares = Vec::new(&t.env);
+    excess_shares.push_back((recipient.clone(), 601i128));
+    assert_eq!(
+        escrow_client.try_split_release(&escrow_id, &t.buyer, &excess_shares),
+        Err(Ok(EscrowError::InsufficientEscrowBalance))
+    );
+
+    // State should be unchanged after the rejected operation.
+    let record_after_reject = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record_after_reject.released_amount, 400);
+    assert_eq!(record_after_reject.status, EscrowStatus::Funded);
+    assert_eq!(token_client.balance(&t.seller), 400);
+}
+
+#[test]
+fn test_withdraw_from_pool_exceeding_reserves_preserves_state() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let funder = Address::generate(&t.env);
+    let token_admin_client =
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token_contract_id);
+    token_admin_client.mint(&funder, &500);
+
+    // Fund pool with 500.
+    escrow_client.fund_pool(&funder, &t.token_contract_id, &500);
+    let pool_after_fund = escrow_client.get_liquidity_pool(&t.token_contract_id);
+    assert_eq!(pool_after_fund.balance, 500);
+
+    // Attempt to withdraw more than the pool holds (600 > 500).
+    assert_eq!(
+        escrow_client.try_withdraw_from_pool(&t.admin, &t.token_contract_id, &600),
+        Err(Ok(EscrowError::InsufficientPoolBalance))
+    );
+
+    // Pool balance and token balances are unchanged after the rejected withdrawal.
+    let pool_after_reject = escrow_client.get_liquidity_pool(&t.token_contract_id);
+    assert_eq!(pool_after_reject.balance, 500);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 500);
+    assert_eq!(token_client.balance(&t.admin), 0);
+
+    // A valid withdrawal within the reserve succeeds.
+    let new_balance = escrow_client.withdraw_from_pool(&t.admin, &t.token_contract_id, &300);
+    assert_eq!(new_balance, 200);
+    assert_eq!(token_client.balance(&t.admin), 300);
+
+    // After the valid withdrawal, an attempt for the full original 500 now fails.
+    assert_eq!(
+        escrow_client.try_withdraw_from_pool(&t.admin, &t.token_contract_id, &500),
+        Err(Ok(EscrowError::InsufficientPoolBalance))
+    );
+    assert_eq!(
+        escrow_client
+            .get_liquidity_pool(&t.token_contract_id)
+            .balance,
+        200
+    );
+}
