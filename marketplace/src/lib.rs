@@ -53,6 +53,15 @@ pub struct MerchantView {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
+pub struct MerchantStats {
+    pub total: u64,
+    pub active: u64,
+    pub suspended: u64,
+    pub closed: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 pub struct DiscoveryPage {
     pub items: Vec<MerchantView>,
     pub total: u32,
@@ -252,6 +261,7 @@ pub enum DataKey {
     Admin,
     PendingAdmin,
     NextMerchantId,
+    MerchantStats,
     Merchant(u64),
     MerchantName(String),
     FreedName(String),
@@ -311,6 +321,15 @@ impl MarketplaceContract {
         env.storage()
             .instance()
             .set(&DataKey::NextMerchantId, &1u64);
+        env.storage().instance().set(
+            &DataKey::MerchantStats,
+            &MerchantStats {
+                total: 0,
+                active: 0,
+                suspended: 0,
+                closed: 0,
+            },
+        );
         env.storage()
             .instance()
             .set(&DataKey::Verifiers, &Vec::<Verifier>::new(&env));
@@ -424,6 +443,11 @@ impl MarketplaceContract {
         env.storage()
             .persistent()
             .set(&DataKey::MerchantIds, &merchant_ids);
+
+        let mut stats = Self::get_merchant_stats(env.clone());
+        stats.total = stats.total.saturating_add(1);
+        stats.active = stats.active.saturating_add(1);
+        env.storage().instance().set(&DataKey::MerchantStats, &stats);
 
         // Append to category index
         let cat_key = DataKey::CategoryIndex(params.category.clone());
@@ -846,6 +870,18 @@ impl MarketplaceContract {
 
     // --- Discovery & Query ---
 
+    pub fn get_merchant_stats(env: Env) -> MerchantStats {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantStats)
+            .unwrap_or(MerchantStats {
+                total: 0,
+                active: 0,
+                suspended: 0,
+                closed: 0,
+            })
+    }
+
     pub fn get_merchant(env: Env, merchant_id: u64) -> Result<Merchant, MarketplaceError> {
         let merchant: Merchant = env
             .storage()
@@ -1127,6 +1163,14 @@ impl MarketplaceContract {
             return Err(MarketplaceError::MerchantClosed);
         }
 
+        let prev_status = merchant.status;
+        if prev_status != MerchantStatus::Suspended {
+            let mut stats = Self::get_merchant_stats(env.clone());
+            stats.active = stats.active.saturating_sub(1);
+            stats.suspended = stats.suspended.saturating_add(1);
+            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+        }
+
         merchant.status = MerchantStatus::Suspended;
         merchant.updated_at = env.ledger().timestamp();
 
@@ -1159,6 +1203,14 @@ impl MarketplaceContract {
         let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
         if matches!(merchant.status, MerchantStatus::Closed) {
             return Err(MarketplaceError::MerchantClosed);
+        }
+
+        let prev_status = merchant.status;
+        if prev_status == MerchantStatus::Suspended {
+            let mut stats = Self::get_merchant_stats(env.clone());
+            stats.suspended = stats.suspended.saturating_sub(1);
+            stats.active = stats.active.saturating_add(1);
+            env.storage().instance().set(&DataKey::MerchantStats, &stats);
         }
 
         merchant.status = if merchant.verified {
@@ -1196,6 +1248,22 @@ impl MarketplaceContract {
         }
 
         let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        let prev_status = merchant.status;
+        if prev_status != MerchantStatus::Closed {
+            let mut stats = Self::get_merchant_stats(env.clone());
+            match prev_status {
+                MerchantStatus::Suspended => {
+                    stats.suspended = stats.suspended.saturating_sub(1);
+                }
+                MerchantStatus::Registered | MerchantStatus::Verified => {
+                    stats.active = stats.active.saturating_sub(1);
+                }
+                MerchantStatus::Closed => {}
+            }
+            stats.closed = stats.closed.saturating_add(1);
+            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+        }
+
         merchant.status = MerchantStatus::Closed;
         merchant.updated_at = env.ledger().timestamp();
 
