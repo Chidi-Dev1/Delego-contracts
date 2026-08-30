@@ -196,6 +196,26 @@ fn test_cannot_rollback_to_current_or_future_version_typed_error() {
     assert_eq!(result, Err(Ok(DelegationError::VersionNotLower)));
 }
 
+#[test]
+fn test_rollback_rejects_stale_permissions_pointer() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Rotated_Pointer");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    let rotated_permissions = Address::generate(&env);
+    let mut record = client.get_delegation(&id);
+    record.permissions_contract = rotated_permissions.clone();
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(&DataKey::Delegation(id), &record);
+    });
+
+    let result = client.try_rollback_delegation(&id, &1u32);
+    assert_eq!(result, Err(Ok(DelegationError::InvalidVersion)));
+}
+
 // ── #322 Event-emission tests ───────────────────────────────────────────────
 
 #[test]
