@@ -1958,7 +1958,7 @@ impl EscrowContract {
         buyer_ids.push_back(last_id);
         env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
 
-        if let (Some(hash), Some(sch)) = (order_hash, schema) {
+        if let (Some(hash), Some(sch)) = (order_hash.clone(), schema.clone()) {
             let metadata = EscrowMetadata {
                 order_hash: hash.clone(),
                 schema: sch.clone(),
@@ -1974,7 +1974,7 @@ impl EscrowContract {
         }
 
         // The metadata event is only emitted once both halves are present.
-        if let (Some(hash), Some(sch)) = (order_hash, schema) {
+        if let (Some(hash), Some(sch)) = (order_hash.clone(), schema.clone()) {
             env.events().publish(
                 (symbol_short!("escrow"), symbol_short!("metadata")),
                 EscrowMetadataEvent {

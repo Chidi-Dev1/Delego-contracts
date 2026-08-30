@@ -1406,7 +1406,7 @@ impl PermissionsContract {
         // since the last recorded spend ledger for this (owner, delegate) pair.
         Self::check_velocity(&env, &owner, &delegate)?;
 
-        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
+        let _velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
 
         let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
@@ -1504,7 +1504,7 @@ impl PermissionsContract {
         owner: &Address,
         delegate: &Address,
     ) -> Result<(), PermissionError> {
-        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
+        let _velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
         if let Some(last_ledger) = env
             .storage()
             .persistent()
