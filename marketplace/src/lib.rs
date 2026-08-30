@@ -225,14 +225,14 @@ pub struct MerchantVerificationRevokedEvent {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminProposedEvent {
     pub current_admin: Address,
     pub new_admin: Address,
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminAcceptedEvent {
     pub new_admin: Address,
 }
@@ -1277,11 +1277,15 @@ impl MarketplaceContract {
         env: Env,
         current_admin: Address,
         new_admin: Address,
-    ) -> Result<(), MarketplaceError> {
+    ) -> Result<bool, MarketplaceError> {
         current_admin.require_auth();
         let admin = Self::get_admin(env.clone())?;
         if current_admin != admin {
             return Err(MarketplaceError::Unauthorized);
+        }
+
+        if new_admin == current_admin {
+            return Ok(false);
         }
 
         env.storage()
@@ -1296,7 +1300,7 @@ impl MarketplaceContract {
             },
         );
 
-        Ok(())
+        Ok(true)
     }
 
     pub fn accept_admin(env: Env, caller: Address) -> Result<(), MarketplaceError> {

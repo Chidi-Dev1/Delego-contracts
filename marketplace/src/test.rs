@@ -1,14 +1,14 @@
 use crate::{
-    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantRegisteredEvent,
-    MerchantStatus, RegisterParams, Verifier,
+    AdminProposedEvent, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
+    MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
 };
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger as _},
-    Address, Env, String,
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, Env, String, Symbol, TryIntoVal,
 };
 
 struct TestFixture<'a> {
@@ -1084,8 +1084,9 @@ fn test_two_step_admin_transfer() {
         MarketplaceError::NoPendingAdmin
     );
 
-    // Current admin proposes new admin
-    f.client.propose_admin(&f.admin, &new_admin);
+    // Current admin proposes new admin -> returns Ok(true)
+    let proposed = f.client.propose_admin(&f.admin, &new_admin);
+    assert!(proposed);
 
     // Stranger (wrong caller, proposal exists) -> Unauthorized
     let stranger_acc = f.client.try_accept_admin(&stranger);
@@ -1104,6 +1105,110 @@ fn test_two_step_admin_transfer() {
         cleared_acc.unwrap_err().unwrap(),
         MarketplaceError::NoPendingAdmin
     );
+}
+
+#[test]
+fn test_propose_admin_self_proposal_is_noop() {
+    let f = TestFixture::setup();
+
+    // Self-proposal where new_admin == current_admin should return Ok(false)
+    let res = f.client.propose_admin(&f.admin, &f.admin);
+    assert_eq!(res, false);
+
+    // Self-proposal must not store pending admin -> accepting still returns NoPendingAdmin
+    let acc_err = f.client.try_accept_admin(&f.admin);
+    assert_eq!(
+        acc_err.unwrap_err().unwrap(),
+        MarketplaceError::NoPendingAdmin
+    );
+
+    // Verify no AdminProposedEvent was published
+    let events = f.env.events().all();
+    let prop_events_count = events
+        .iter()
+        .filter(|(_, topics, _)| {
+            let t: soroban_sdk::Vec<soroban_sdk::Val> = topics.clone();
+            if t.len() < 2 {
+                return false;
+            }
+            let t0: Result<Symbol, _> = t.get(0).unwrap().try_into_val(&f.env);
+            let t1: Result<Symbol, _> = t.get(1).unwrap().try_into_val(&f.env);
+            t0 == Ok(symbol_short!("mkplc")) && t1 == Ok(symbol_short!("adm_prop"))
+        })
+        .count();
+    assert_eq!(
+        prop_events_count, 0,
+        "No adm_prop event should be emitted for self-proposal"
+    );
+}
+
+#[test]
+fn test_propose_admin_self_proposal_does_not_overwrite_pending() {
+    let f = TestFixture::setup();
+    let new_admin = Address::generate(&f.env);
+
+    // 1. Propose genuine new admin -> returns true
+    assert_eq!(f.client.propose_admin(&f.admin, &new_admin), true);
+
+    // Verify AdminProposedEvent was published for new_admin
+    let events_after_first = f.env.events().all();
+    let prop_event = events_after_first.iter().find(|(_, topics, _)| {
+        let t: soroban_sdk::Vec<soroban_sdk::Val> = topics.clone();
+        if t.len() < 2 {
+            return false;
+        }
+        let t0: Result<Symbol, _> = t.get(0).unwrap().try_into_val(&f.env);
+        let t1: Result<Symbol, _> = t.get(1).unwrap().try_into_val(&f.env);
+        t0 == Ok(symbol_short!("mkplc")) && t1 == Ok(symbol_short!("adm_prop"))
+    });
+    assert!(prop_event.is_some());
+    let (_, _, data) = prop_event.unwrap();
+    let parsed: AdminProposedEvent = data.try_into_val(&f.env).unwrap();
+    assert_eq!(
+        parsed,
+        AdminProposedEvent {
+            current_admin: f.admin.clone(),
+            new_admin: new_admin.clone(),
+        }
+    );
+
+    // 2. Attempt self-proposal -> returns false and does not overwrite existing pending proposal
+    assert_eq!(f.client.propose_admin(&f.admin, &f.admin), false);
+
+    // Current admin cannot accept (pending is new_admin, not f.admin) -> Unauthorized
+    let self_acc = f.client.try_accept_admin(&f.admin);
+    assert_eq!(
+        self_acc.unwrap_err().unwrap(),
+        MarketplaceError::Unauthorized
+    );
+
+    // Proposed new_admin can still accept the valid pending transfer
+    f.client.accept_admin(&new_admin);
+    assert_eq!(f.client.get_admin(), new_admin);
+}
+
+#[test]
+fn test_propose_admin_overwrite_pending_admin() {
+    let f = TestFixture::setup();
+    let new_admin_1 = Address::generate(&f.env);
+    let new_admin_2 = Address::generate(&f.env);
+
+    // 1. Propose first candidate -> returns true
+    assert_eq!(f.client.propose_admin(&f.admin, &new_admin_1), true);
+
+    // 2. Overwrite proposal with second candidate -> returns true
+    assert_eq!(f.client.propose_admin(&f.admin, &new_admin_2), true);
+
+    // First candidate can no longer accept -> Unauthorized
+    let acc_1 = f.client.try_accept_admin(&new_admin_1);
+    assert_eq!(
+        acc_1.unwrap_err().unwrap(),
+        MarketplaceError::Unauthorized
+    );
+
+    // Second candidate accepts successfully
+    f.client.accept_admin(&new_admin_2);
+    assert_eq!(f.client.get_admin(), new_admin_2);
 }
 
 #[test]
