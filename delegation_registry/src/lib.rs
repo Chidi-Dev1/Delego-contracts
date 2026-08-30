@@ -24,6 +24,7 @@ pub struct DelegationRecord {
     pub status: DelegationStatus,
     pub label: Symbol,
     pub created_at: u64,
+    pub updated_at: u64,
     pub expires_at_ledger: u32,
     pub version: u32,
 }
@@ -34,6 +35,14 @@ pub struct DelegationSnapshot {
     pub version: u32,
     pub snapshot_ledger: u32,
     pub record: DelegationRecord,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationPage {
+    pub items: Vec<DelegationRecord>,
+    pub total: u32,
+    pub next_offset: Option<u32>,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -112,6 +121,7 @@ pub enum DelegationError {
     InvalidVersion = 6,
     VersionNotLower = 7,
     SnapshotNotFound = 8,
+    InvalidAgentId = 9,
 }
 
 #[contract]
@@ -142,8 +152,15 @@ impl DelegationRegistry {
         permissions_contract: Address,
         label: Symbol,
         ttl_ledgers: u32,
-    ) -> u64 {
+    ) -> Result<u64, DelegationError> {
         owner.require_auth();
+
+        // Reject the all-zero sentinel agent id so authorization records
+        // can never be seeded with a dead id, keeping is_authorized
+        // failing closed.
+        if agent_id == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(DelegationError::InvalidAgentId);
+        }
 
         let id = env
             .storage()
@@ -163,6 +180,7 @@ impl DelegationRegistry {
             status: DelegationStatus::Active,
             label,
             created_at: now,
+            updated_at: now,
             expires_at_ledger,
             version: 1,
         };
@@ -215,7 +233,7 @@ impl DelegationRegistry {
             },
         );
 
-        id
+        Ok(id)
     }
 
     pub fn pause_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
@@ -233,6 +251,7 @@ impl DelegationRegistry {
 
         record.status = DelegationStatus::Paused;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -269,6 +288,7 @@ impl DelegationRegistry {
         if env.ledger().sequence() >= record.expires_at_ledger {
             record.status = DelegationStatus::Expired;
             record.version = Self::increment_version(&env, delegation_id);
+            record.updated_at = env.ledger().timestamp();
             env.storage()
                 .persistent()
                 .set(&DataKey::Delegation(delegation_id), &record);
@@ -289,6 +309,7 @@ impl DelegationRegistry {
 
         record.status = DelegationStatus::Active;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -309,6 +330,10 @@ impl DelegationRegistry {
         Ok(true)
     }
 
+    /// Revokes an active or paused delegation.
+    ///
+    /// Returns `Ok(true)` if the delegation transitioned to `Revoked`.
+    /// Returns `Ok(false)` if the delegation was already `Revoked` (idempotent no-op).
     pub fn revoke_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
         let mut record: DelegationRecord = env
             .storage()
@@ -319,11 +344,12 @@ impl DelegationRegistry {
         record.owner.require_auth();
 
         if record.status == DelegationStatus::Revoked {
-            return Ok(true);
+            return Ok(false);
         }
 
         record.status = DelegationStatus::Revoked;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -342,6 +368,128 @@ impl DelegationRegistry {
         );
 
         Ok(true)
+    }
+
+    const MAX_PAGE_LIMIT: u32 = 100;
+
+    pub fn get_delegations_by_owner_paginated(
+        env: Env,
+        owner: Address,
+        offset: u32,
+        limit: u32,
+    ) -> DelegationPage {
+        let user_dels: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserDelegations(owner))
+            .unwrap_or(Vec::new(&env));
+
+        let total = user_dels.len() as u32;
+        let limit = limit.min(Self::MAX_PAGE_LIMIT);
+        let offset = offset.min(total);
+
+        let mut items = Vec::new(&env);
+        let start = offset;
+        let end = offset.saturating_add(limit).min(total);
+        let mut i = start;
+        while i < end {
+            let id = user_dels.get(i).unwrap();
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
+            {
+                items.push_back(record);
+            }
+            i += 1;
+        }
+
+        let next_offset = if end < total { Some(end) } else { None };
+        DelegationPage {
+            items,
+            total,
+            next_offset,
+        }
+    }
+
+    pub fn get_delegation_history_paginated(
+        env: Env,
+        delegation_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> DelegationPage {
+        let history: Vec<DelegationSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationHistory(delegation_id))
+            .unwrap_or(Vec::new(&env));
+
+        let total = history.len() as u32;
+        let limit = limit.min(Self::MAX_PAGE_LIMIT);
+        let offset = offset.min(total);
+
+        let mut items = Vec::new(&env);
+        let start = offset;
+        let end = offset.saturating_add(limit).min(total);
+        let mut i = start;
+        while i < end {
+            let snapshot = history.get(i).unwrap();
+            items.push_back(snapshot.record);
+            i += 1;
+        }
+
+        let next_offset = if end < total { Some(end) } else { None };
+        DelegationPage {
+            items,
+            total,
+            next_offset,
+        }
+    }
+
+    pub fn get_expired_delegations_paginated(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> DelegationPage {
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+        let mut expired = Vec::new(&env);
+        let mut id = 1u64;
+        while id < next_id {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
+            {
+                if record.status == DelegationStatus::Expired {
+                    expired.push_back(record);
+                }
+            }
+            id += 1;
+        }
+
+        let total = expired.len() as u32;
+        let limit = limit.min(Self::MAX_PAGE_LIMIT);
+        let offset = offset.min(total);
+
+        let mut items = Vec::new(&env);
+        let start = offset;
+        let end = offset.saturating_add(limit).min(total);
+        let mut i = start;
+        while i < end {
+            items.push_back(expired.get(i).unwrap());
+            i += 1;
+        }
+
+        let next_offset = if end < total { Some(end) } else { None };
+        DelegationPage {
+            items,
+            total,
+            next_offset,
+        }
     }
 
     pub fn rollback_delegation(
@@ -389,6 +537,7 @@ impl DelegationRegistry {
 
         record = snapshot.record;
         record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
@@ -489,6 +638,7 @@ impl DelegationRegistry {
                     || record.status == DelegationStatus::Revoked;
                 if !already_terminal && current_ledger >= record.expires_at_ledger {
                     record.status = DelegationStatus::Expired;
+                    record.updated_at = env.ledger().timestamp();
                     env.storage().persistent().set(&key, &record);
 
                     env.events().publish(
