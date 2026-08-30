@@ -21,7 +21,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          toolchain-file: rust-toolchain.toml
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -36,7 +36,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          toolchain-file: rust-toolchain.toml
 
       - uses: actions/cache@v4
         with:
@@ -61,7 +61,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          toolchain-file: rust-toolchain.toml
 
       - uses: actions/cache@v4
         with:
@@ -87,7 +87,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          toolchain-file: rust-toolchain.toml
 
       - uses: actions/cache@v4
         with:
