@@ -370,6 +370,35 @@ fn test_record_transaction_extends_ttl_across_churn() {
     });
     assert!(initial_ttl > 17_280);
 
+    // The testing host grants freshly-written persistent entries only a
+    // small default TTL, and a newly-registered contract instance 4_095.
+    // Aging the *record* to the edge of its 17_280 bump threshold therefore
+    // requires jumping the ledger far past the point where the contract
+    // took care of the other entries it wrote in the first call
+    // (`Reputation`, `TransactionHistory`, `Transacted`, and the instance
+    // itself) — the test host would otherwise archive them mid-test. Keep
+    // those alive here so the jump exercises exactly the record-TTL bump
+    // this test is about.
+    env.as_contract(&client.address, || {
+        env.storage().instance().extend_ttl(10_000_000, 10_000_000);
+        let storage = env.storage().persistent();
+        storage.extend_ttl(
+            &crate::DataKey::Reputation(entity.clone()),
+            10_000_000,
+            10_000_000,
+        );
+        storage.extend_ttl(
+            &crate::DataKey::TransactionHistory(entity.clone()),
+            10_000_000,
+            10_000_000,
+        );
+        storage.extend_ttl(
+            &crate::DataKey::Transacted(entity.clone(), counterparty.clone()),
+            10_000_000,
+            10_000_000,
+        );
+    });
+
     env.ledger().set_sequence_number(initial_ttl - 17_280 + 1);
     client.record_transaction(
         &admin,
@@ -912,8 +941,9 @@ fn test_resolve_flag_missing() {
     let entity = Address::generate(&env);
     let reporter = Address::generate(&env);
 
+    // No flags at all on the entity => nothing active to resolve.
     let res = client.try_resolve_flag(&admin, &reporter, &entity);
-    assert_eq!(res, Err(Ok(ReputationError::EntityNotFound)));
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
 }
 
 #[test]
@@ -1139,4 +1169,218 @@ fn test_recency_weight_decay_curve() {
         );
         prev = curr;
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Issue #138: freeze-threshold, SCORE_WINDOW boundary, and duplicate-flag
+// resolution edge cases
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The auto-freeze must fire *exactly* at `freeze_threshold_flags` unresolved
+/// flags: one below it the entity stays operational, at the threshold it
+/// freezes, and further flags neither unfreeze nor re-freeze (one-way).
+/// Each reporter must first transact with `entity` to satisfy `flag_entity`'s
+/// counterparty gate.
+#[test]
+fn test_flag_entity_freezes_exactly_at_threshold() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    let reporter_a = Address::generate(&env);
+    let reporter_b = Address::generate(&env);
+    let reporter_c = Address::generate(&env);
+    let reporter_d = Address::generate(&env);
+    // All counterparty relationships are established up front: once the third
+    // flag freezes the entity, `record_transaction` would reject new escrows.
+    for (reporter, id) in [
+        (reporter_a.clone(), 1u64),
+        (reporter_b.clone(), 2u64),
+        (reporter_c.clone(), 3u64),
+        (reporter_d.clone(), 4u64),
+    ] {
+        make_transacting_counterparty(&client, &admin, &entity, &reporter, id);
+    }
+
+    // threshold - 1 unresolved flags: still below the boundary, not frozen.
+    client.flag_entity(&reporter_a, &entity, &symbol_short!("fraud"), &None);
+    client.flag_entity(&reporter_b, &entity, &symbol_short!("fraud"), &None);
+    assert!(!client.is_frozen(&entity));
+    assert_eq!(client.get_flags(&entity, &0u32, &10u32).len(), 2);
+
+    // Exactly at the threshold: auto-freeze fires.
+    client.flag_entity(&reporter_c, &entity, &symbol_short!("fraud"), &None);
+    assert!(client.is_frozen(&entity));
+    assert_eq!(client.get_flags(&entity, &0u32, &10u32).len(), 3);
+
+    // Freezing is one-way: an extra flag past the threshold leaves the entity
+    // frozen rather than re-toggling the flag.
+    client.flag_entity(&reporter_d, &entity, &symbol_short!("fraud"), &None);
+    assert!(client.is_frozen(&entity));
+    assert_eq!(client.get_flags(&entity, &0u32, &10u32).len(), 4);
+}
+
+/// Exact-capacity boundary: with `SCORE_WINDOW` lifetime records the recompute
+/// window starts at index 0 and must sample *every* record. One Disputed (0)
+/// mixed into `SCORE_WINDOW - 1` Released (10_000), all with identical
+/// `recorded_at`, produces an exact weighted average of 9_950 — proving the
+/// whole window participated (a window that silently dropped the oldest record
+/// or clamped the count would yield a different value).
+#[test]
+fn test_score_window_under_capacity_samples_all_records() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = 1;
+    cfg.dispute_penalty_bps = 0;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &0u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+    for i in 1..SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64);
+    // (199 * 10_000 + 1 * 0) / 200 = 9_950 (dispute penalty disabled).
+    assert_eq!(rep.score, 9_950);
+}
+
+/// The moment history exceeds `SCORE_WINDOW` records, the recompute window
+/// slides and the *oldest* record must exit the sample. A Disputed recorded
+/// first, followed by exactly `SCORE_WINDOW` Released records, gives a clean
+/// score of 10_000 — if the oldest Disputed were still sampled (no sliding),
+/// the average would be 9_950 instead. The lifetime dispute counter is
+/// unaffected by the window and stays exact.
+#[test]
+fn test_score_window_slide_excludes_oldest_record_across_boundary() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut cfg = default_config();
+    cfg.min_transactions_threshold = 1;
+    cfg.dispute_penalty_bps = 0;
+    let contract_id = env.register(ReputationContract, (admin.clone(), cfg));
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.record_transaction(
+        &admin,
+        &0u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+    for i in 1..=SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.total_transactions, SCORE_WINDOW as u64 + 1);
+    assert_eq!(rep.disputed_transactions, 1);
+    // Window slid to the newest SCORE_WINDOW records: all Released -> 10_000.
+    assert_eq!(rep.score, 10_000);
+}
+
+/// Resolving the same reporter/entity flag twice must not silently succeed:
+/// the second call finds no *unresolved* flag to match (the entity has no
+/// active flags left) and returns `NoActiveFlag`; the stored flag remains a
+/// single resolved entry.
+#[test]
+fn test_resolve_flag_duplicate_resolution_rejected() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
+
+    client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
+    client.resolve_flag(&admin, &reporter, &entity);
+
+    let res = client.try_resolve_flag(&admin, &reporter, &entity);
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
+
+    let flags = client.get_flags(&entity, &0u32, &10u32);
+    assert_eq!(flags.len(), 1);
+    assert!(flags.get(0).unwrap().resolved);
+}
+
+/// `resolve_flag` targets a single reporter's unresolved flag; resolving one
+/// of several must leave the others' resolved-status untouched, and a repeat
+/// resolve for the already-cleared reporter is rejected.
+#[test]
+fn test_resolve_flag_resolves_single_flag_among_many() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter_a = Address::generate(&env);
+    let reporter_b = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter_a, 1u64);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter_b, 2u64);
+
+    client.flag_entity(&reporter_a, &entity, &symbol_short!("fraud"), &None);
+    client.flag_entity(&reporter_b, &entity, &symbol_short!("spam"), &None);
+    client.resolve_flag(&admin, &reporter_a, &entity);
+
+    let flags = client.get_flags(&entity, &0u32, &10u32);
+    assert!(flags.get(0).unwrap().resolved);
+    assert!(!flags.get(1).unwrap().resolved);
+
+    // The already-resolved reporter's flag is gone from the active pool.
+    let res = client.try_resolve_flag(&admin, &reporter_a, &entity);
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
+}
+
+/// Resolving a flag must not retroactively lift an auto-freeze already
+/// reached at the threshold: unfreezing is an explicit admin action.
+#[test]
+fn test_resolve_flag_does_not_auto_unfreeze() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    let reporter_a = Address::generate(&env);
+    let reporter_b = Address::generate(&env);
+    let reporter_c = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter_a, 0u64);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter_b, 1u64);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter_c, 2u64);
+
+    client.flag_entity(&reporter_a, &entity, &symbol_short!("fraud"), &None);
+    client.flag_entity(&reporter_b, &entity, &symbol_short!("fraud"), &None);
+    client.flag_entity(&reporter_c, &entity, &symbol_short!("fraud"), &None);
+    assert!(client.is_frozen(&entity));
+
+    client.resolve_flag(&admin, &reporter_a, &entity);
+    assert!(client.is_frozen(&entity));
+
+    client.unfreeze_entity(&admin, &entity);
+    assert!(!client.is_frozen(&entity));
 }
