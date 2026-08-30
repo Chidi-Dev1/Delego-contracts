@@ -291,6 +291,24 @@ const MAX_PAGE_LIMIT: u32 = 50;
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
 
+// --- Merchant profile field bounds ---
+//
+// Caps on `RegisterParams` (and the corresponding `update_merchant_profile`)
+// string fields. Enforced *before* any bytes are copied off the host string,
+// so a caller cannot force unbounded storage growth or unbounded gas by
+// submitting an arbitrarily large `name`/`description`/`image_url`/`metadata`.
+pub const MAX_NAME_LEN: u32 = 64;
+pub const MAX_DESCRIPTION_LEN: u32 = 512;
+pub const MAX_IMAGE_URL_LEN: u32 = 256;
+pub const MAX_METADATA_LEN: u32 = 1024;
+
+// Largest of the caps above; used to size the stack buffer that string
+// normalization copies host bytes into. `#![no_std]` without the `alloc`
+// feature means we cannot heap-allocate a buffer sized to the actual string,
+// so we bound the buffer at the biggest field cap and always bounds-check
+// the raw string length against the field-specific cap before copying.
+const MAX_FIELD_BUF_LEN: usize = MAX_METADATA_LEN as usize;
+
 #[contract]
 pub struct MarketplaceContract;
 
@@ -338,9 +356,7 @@ impl MarketplaceContract {
     ) -> Result<u64, MarketplaceError> {
         merchant.require_auth();
 
-        if params.name.is_empty() {
-            return Err(MarketplaceError::InvalidParam);
-        }
+                let params = Self::validate_and_normalize(&env, &params)?;
 
         let name_key = DataKey::MerchantName(params.name.clone());
         if env.storage().persistent().has(&name_key) {
@@ -505,9 +521,12 @@ impl MarketplaceContract {
     ) -> Result<(), MarketplaceError> {
         caller.require_auth();
 
+        let name = Self::normalize_bounded_string(&env, &name, MAX_NAME_LEN)?;
         if name.is_empty() {
             return Err(MarketplaceError::InvalidParam);
         }
+        let description = Self::normalize_bounded_string(&env, &description, MAX_DESCRIPTION_LEN)?;
+        let image_url = Self::normalize_bounded_string(&env, &image_url, MAX_IMAGE_URL_LEN)?;
 
         let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
         Self::check_not_frozen_or_closed(&merchant)?;
@@ -1412,6 +1431,73 @@ impl MarketplaceContract {
             MerchantStatus::Closed => Err(MarketplaceError::MerchantClosed),
             _ => Ok(()),
         }
+    }
+
+    /// Trims leading/trailing ASCII whitespace from `s` and enforces that its
+    /// (pre-trim) byte length does not exceed `max_len`.
+    ///
+    /// The length check happens *before* any bytes are copied out of the
+    /// host string, so an oversized string is rejected in constant work
+    /// rather than first being paid for byte-by-byte.
+    ///
+    /// Trimming only ever strips single-byte ASCII whitespace characters
+    /// (space, tab, CR, LF, form feed, see `u8::is_ascii_whitespace`), which
+    /// can never appear as a continuation byte of a multi-byte UTF-8
+    /// sequence, so the remaining slice is always valid UTF-8.
+    fn normalize_bounded_string(
+        env: &Env,
+        s: &String,
+        max_len: u32,
+    ) -> Result<String, MarketplaceError> {
+        let raw_len = s.len();
+        if raw_len > max_len {
+            return Err(MarketplaceError::InvalidParam);
+        }
+
+        let mut buf = [0u8; MAX_FIELD_BUF_LEN];
+        let n = raw_len as usize;
+        s.copy_into_slice(&mut buf[..n]);
+
+        let mut start = 0usize;
+        let mut end = n;
+        while start < end && buf[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        while end > start && buf[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+
+        Ok(String::from_bytes(env, &buf[start..end]))
+    }
+    /// Normalizes and bounds-checks every string field on `RegisterParams`,
+    /// used by both `register_merchant` and, field-by-field, by
+    /// `update_merchant_profile`. Whitespace is trimmed to a canonical form
+    /// before persistence, and every field is rejected with
+    /// `MarketplaceError::InvalidParam` if it exceeds its configured cap.
+    /// `name` is additionally required to be non-empty after trimming.
+    fn validate_and_normalize(
+        env: &Env,
+        p: &RegisterParams,
+    ) -> Result<RegisterParams, MarketplaceError> {
+        let name = Self::normalize_bounded_string(env, &p.name, MAX_NAME_LEN)?;
+        if name.is_empty() {
+            return Err(MarketplaceError::InvalidParam);
+        }
+        let description = Self::normalize_bounded_string(env, &p.description, MAX_DESCRIPTION_LEN)?;
+        let image_url = Self::normalize_bounded_string(env, &p.image_url, MAX_IMAGE_URL_LEN)?;
+        let metadata = match &p.metadata {
+            Some(m) => Some(Self::normalize_bounded_string(env, m, MAX_METADATA_LEN)?),
+            None => None,
+        };
+
+        Ok(RegisterParams {
+            name,
+            description,
+            category: p.category.clone(),
+            image_url,
+            metadata,
+            required_verifications: p.required_verifications,
+        })
     }
 }
 

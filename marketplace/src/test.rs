@@ -1,6 +1,7 @@
 use crate::{
     MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantRegisteredEvent,
-    MerchantStatus, RegisterParams, Verifier,
+    MerchantStatus, RegisterParams, Verifier, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
+    MAX_METADATA_LEN, MAX_NAME_LEN,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -1256,4 +1257,212 @@ fn test_flight_merchant_lifecycle_and_discovery() {
     assert_eq!(item.commission_rate_bps, 350);
     assert!(item.verified);
     assert_eq!(item.status, MerchantStatus::Verified);
+}
+
+// --- RegisterParams normalization (#102) ---
+
+#[test]
+fn test_register_merchant_trims_whitespace_fields() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "  Padded Store  "),
+        description: String::from_str(&f.env, "\tPadded description\n"),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, "  https://cdn.example.com/logo.png  "),
+        metadata: Some(String::from_str(&f.env, "  ipfs://Qm123  ")),
+        required_verifications: 1,
+    };
+
+    let merchant_id = f.client.register_merchant(&merchant_addr, &params);
+    let merchant = f.client.get_merchant(&merchant_id);
+
+    assert_eq!(merchant.name, String::from_str(&f.env, "Padded Store"));
+    assert_eq!(
+        merchant.description,
+        String::from_str(&f.env, "Padded description")
+    );
+    assert_eq!(
+        merchant.image_url,
+        String::from_str(&f.env, "https://cdn.example.com/logo.png")
+    );
+    assert_eq!(
+        merchant.metadata,
+        Some(String::from_str(&f.env, "ipfs://Qm123"))
+    );
+
+    // The name index must be keyed by the canonical (trimmed) name, not the
+    // raw whitespace-padded input.
+    assert!(!f
+        .client
+        .is_name_available(&String::from_str(&f.env, "Padded Store")));
+}
+
+#[test]
+fn test_register_merchant_whitespace_only_name_rejected() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "    "),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, ""),
+        metadata: None,
+        required_verifications: 1,
+    };
+
+    let err = f.client.try_register_merchant(&merchant_addr, &params);
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
+}
+
+#[test]
+fn test_register_merchant_rejects_over_length_name() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let too_long_name = [b'a'; (MAX_NAME_LEN + 1) as usize];
+    let params = RegisterParams {
+        name: String::from_bytes(&f.env, &too_long_name),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, "https://example.com/x.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+
+    let err = f.client.try_register_merchant(&merchant_addr, &params);
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
+}
+
+#[test]
+fn test_register_merchant_rejects_over_length_description() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let too_long_description = [b'b'; (MAX_DESCRIPTION_LEN + 1) as usize];
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Valid Name"),
+        description: String::from_bytes(&f.env, &too_long_description),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, "https://example.com/x.png"),
+        metadata: None,
+        required_verifications: 1,
+    };
+
+    let err = f.client.try_register_merchant(&merchant_addr, &params);
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
+}
+
+#[test]
+fn test_register_merchant_rejects_over_length_image_url() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let too_long_image_url = [b'c'; (MAX_IMAGE_URL_LEN + 1) as usize];
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Valid Name"),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("retail"),
+        image_url: String::from_bytes(&f.env, &too_long_image_url),
+        metadata: None,
+        required_verifications: 1,
+    };
+
+    let err = f.client.try_register_merchant(&merchant_addr, &params);
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
+}
+
+#[test]
+fn test_register_merchant_rejects_over_length_metadata() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let too_long_metadata = [b'd'; (MAX_METADATA_LEN + 1) as usize];
+    let params = RegisterParams {
+        name: String::from_str(&f.env, "Valid Name"),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, "https://example.com/x.png"),
+        metadata: Some(String::from_bytes(&f.env, &too_long_metadata)),
+        required_verifications: 1,
+    };
+
+    let err = f.client.try_register_merchant(&merchant_addr, &params);
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
+}
+
+#[test]
+fn test_register_merchant_accepts_exact_cap_length() {
+    let f = TestFixture::setup();
+    let merchant_addr = Address::generate(&f.env);
+
+    let exact_name = [b'e'; MAX_NAME_LEN as usize];
+    let exact_description = [b'f'; MAX_DESCRIPTION_LEN as usize];
+    let exact_image_url = [b'g'; MAX_IMAGE_URL_LEN as usize];
+    let exact_metadata = [b'h'; MAX_METADATA_LEN as usize];
+
+    let params = RegisterParams {
+        name: String::from_bytes(&f.env, &exact_name),
+        description: String::from_bytes(&f.env, &exact_description),
+        category: symbol_short!("retail"),
+        image_url: String::from_bytes(&f.env, &exact_image_url),
+        metadata: Some(String::from_bytes(&f.env, &exact_metadata)),
+        required_verifications: 1,
+    };
+
+    let merchant_id = f.client.register_merchant(&merchant_addr, &params);
+    let merchant = f.client.get_merchant(&merchant_id);
+    assert_eq!(merchant.name.len(), MAX_NAME_LEN);
+    assert_eq!(merchant.description.len(), MAX_DESCRIPTION_LEN);
+    assert_eq!(merchant.image_url.len(), MAX_IMAGE_URL_LEN);
+    assert_eq!(merchant.metadata.map(|m| m.len()), Some(MAX_METADATA_LEN));
+}
+
+#[test]
+fn test_update_merchant_profile_trims_and_bounds() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Store A"),
+            description: String::from_str(&f.env, "Old Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "old.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+
+    // Whitespace on the update path is trimmed the same way as registration.
+    f.client.update_merchant_profile(
+        &id,
+        &owner,
+        &String::from_str(&f.env, "  Store A Updated  "),
+        &String::from_str(&f.env, "  New Desc  "),
+        &String::from_str(&f.env, "  new.png  "),
+    );
+
+    let updated = f.client.get_merchant(&id);
+    assert_eq!(updated.name, String::from_str(&f.env, "Store A Updated"));
+    assert_eq!(updated.description, String::from_str(&f.env, "New Desc"));
+    assert_eq!(updated.image_url, String::from_str(&f.env, "new.png"));
+
+    // An over-length name is rejected with a typed error and does not
+    // mutate stored state.
+    let too_long_name = [b'z'; (MAX_NAME_LEN + 1) as usize];
+    let err = f.client.try_update_merchant_profile(
+        &id,
+        &owner,
+        &String::from_bytes(&f.env, &too_long_name),
+        &String::from_str(&f.env, "New Desc"),
+        &String::from_str(&f.env, "new.png"),
+    );
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
+
+    let unchanged = f.client.get_merchant(&id);
+    assert_eq!(unchanged.name, String::from_str(&f.env, "Store A Updated"));
 }
