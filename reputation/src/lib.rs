@@ -4,10 +4,6 @@
 //! platform, driven by escrow transaction outcomes and counterparty ratings.
 
 #![no_std]
-// Several entry points mirror escrow/permissions call shapes and exceed
-// clippy's default 7-argument limit; restructuring them would break the
-// published ABI these contracts are reviewed against.
-#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
@@ -28,6 +24,16 @@ pub struct ReputationScore {
     /// 0-10000 basis points of a 5-star scale, time-decayed like `score`.
     pub avg_rating: u32,
     pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScoreDecomposition {
+    pub entity: Address,
+    pub base_score_bps: i128,
+    pub penalty_bps: i128,
+    pub total_transactions: u64,
+    pub final_score: u32,
 }
 
 #[contracttype]
@@ -68,9 +74,26 @@ pub struct Flag {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReputationConfig {
     pub decay_window_seconds: u64,
+    /// Minimum number of lifetime transactions (window-independent) an
+    /// entity must accumulate before [`ReputationContract::get_reputation`]
+    /// stops masking its `score`/`avg_rating` to `0`. The masking gate
+    /// compares against the exact lifetime `total_transactions` counter —
+    /// **not** the `SCORE_WINDOW` sample that feeds the score recompute — so
+    /// it is always satisfiable regardless of the window. A valid threshold
+    /// must not exceed `SCORE_WINDOW`, however: anything larger would describe
+    /// a gate that never unmasks within the scoring-relevant window the
+    /// contract's behavior is documented against, so `validate_config`
+    /// rejects it with [`ReputationError::InvalidParam`].
     pub min_transactions_threshold: u64,
     pub dispute_penalty_bps: u32,
     pub freeze_threshold_flags: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractVersion {
+    pub name: Symbol,
+    pub semver: Symbol,
 }
 
 #[contracterror]
@@ -161,9 +184,9 @@ pub enum DataKey {
     Flags(Address),
     FrozenStatus(Address),
     RatedEscrows(Address),
-    /// `true` once `.1` has appeared as a `counterparty` on one of `.0`'s
-    /// recorded transactions. Backs an O(1) [`ReputationContract::has_transacted_with`]
-    /// check instead of scanning `TransactionHistory`.
+    /// `true` once `.1` has appeared in a recorded transaction with `.0`.
+    /// Stored in both directions so the relationship reads symmetrically while
+    /// still supporting a directed lookup when needed.
     Transacted(Address, Address),
 }
 
@@ -171,16 +194,28 @@ pub enum DataKey {
 /// for the recency-weight scale in [`recency_weight_bps`].
 const BPS_SCALE: i128 = 10_000;
 
-/// Once this many half-lives have elapsed, the recency weight is close
-/// enough to zero (< 1 / 2^20 of full weight) to treat as zero outright and
-/// avoid needless iteration.
-const MAX_HALVINGS: u64 = 20;
+/// The maximum number of full half-lives after which the recency weight is
+/// treated as zero.  With `BPS_SCALE = 10_000`, the right-shift
+/// `BPS_SCALE >> full_halvings` yields 1 at `full_halvings = 13`
+/// (2^13 = 8 192 < 10 000) and 0 at `full_halvings = 14`
+/// (2^14 = 16 384 > 10 000).  Setting `MAX_HALVINGS = 13` therefore makes
+/// the early-exit guard reachable *and* precise: it fires exactly when the
+/// shift-based computation would produce a non-zero base for the last time.
+///
+/// Invariant (enforced by the `test_max_halvings_invariant` unit test):
+///   `BPS_SCALE >> MAX_HALVINGS != 0`
+const MAX_HALVINGS: u64 = 13;
 
 /// Caps how many of an entity's most recent transactions feed the
 /// time-decayed score/avg_rating computation in [`ReputationContract::recompute_score`],
 /// so `record_transaction` and `rate_entity` stay bounded-cost regardless of
 /// how large an entity's lifetime history grows.
 const SCORE_WINDOW: u32 = 200;
+
+/// Persistent entries are bumped when they approach expiry and kept alive
+/// for roughly 30 days, matching the repository's persistent-storage policy.
+const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
+const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
 
 /// Maps a transaction outcome to its contribution toward `score`, in basis
 /// points, per the reputation score formula.
@@ -250,7 +285,18 @@ impl ReputationContract {
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Config, &config);
+        // Keep the contract instance alive from deployment.
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         Ok(())
+    }
+
+    pub fn version(env: Env) -> ContractVersion {
+        ContractVersion {
+            name: symbol_short!("reput"),
+            semver: Symbol::new(&env, env!("CARGO_PKG_VERSION")),
+        }
     }
 
     // --- Core Recording ---
@@ -305,6 +351,15 @@ impl ReputationContract {
             recorded_at: env.ledger().timestamp(),
         };
         env.storage().persistent().set(&record_key, &record);
+        env.storage().persistent().extend_ttl(
+            &record_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        // The contract instance must stay alive alongside its records.
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         if existing.is_none() {
             let hist_key = DataKey::TransactionHistory(entity.clone());
@@ -315,9 +370,32 @@ impl ReputationContract {
                 .unwrap_or_else(|| Vec::new(&env));
             history.push_back(escrow_id);
             env.storage().persistent().set(&hist_key, &history);
+            env.storage().persistent().extend_ttl(
+                &hist_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            // Record the symmetric counterpart relationship in both directions so
+            // a transaction between A and B reads as transacted for both A->B and
+            // B->A when callers need a bidirectional relationship check.
             env.storage().persistent().set(
                 &DataKey::Transacted(entity.clone(), record.counterparty.clone()),
                 &true,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::Transacted(entity.clone(), record.counterparty.clone()),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            env.storage().persistent().set(
+                &DataKey::Transacted(record.counterparty.clone(), entity.clone()),
+                &true,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::Transacted(record.counterparty.clone(), entity.clone()),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
             );
             Self::apply_new_transaction_counts(&env, &entity, &outcome);
         } else if let Some(prior) = &existing {
@@ -420,6 +498,19 @@ impl ReputationContract {
         Ok(record)
     }
 
+    /// Returns the raw base/penalty breakdown behind `entity`'s current
+    /// score, including the clamped final score that `get_reputation`
+    /// reports.
+    pub fn get_score_decomposition(
+        env: Env,
+        entity: Address,
+    ) -> Result<ScoreDecomposition, ReputationError> {
+        let rep = Self::load_or_default_reputation(&env, &entity);
+        let (decomposition, _, _) =
+            Self::compute_score_components(&env, &entity, rep.total_transactions)?;
+        Ok(decomposition)
+    }
+
     pub fn get_reputation_breakdown(
         env: Env,
         entity: Address,
@@ -476,6 +567,28 @@ impl ReputationContract {
             .persistent()
             .get(&DataKey::FrozenStatus(entity))
             .unwrap_or(false)
+    }
+
+    /// Returns whether two entities have a transaction relationship.
+    ///
+    /// When `directed` is `false`, the check is symmetric: it returns true if
+    /// either direction has been recorded. When `directed` is `true`, it checks
+    /// only the exact `(entity_a, entity_b)` direction.
+    pub fn has_relation(env: Env, entity_a: Address, entity_b: Address, directed: bool) -> bool {
+        let forward = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Transacted(entity_a.clone(), entity_b.clone()))
+            .unwrap_or(false);
+        if directed {
+            return forward;
+        }
+        forward
+            || env
+                .storage()
+                .persistent()
+                .get(&DataKey::Transacted(entity_b, entity_a))
+                .unwrap_or(false)
     }
 
     pub fn get_config(env: Env) -> Result<ReputationConfig, ReputationError> {
@@ -713,6 +826,14 @@ impl ReputationContract {
         if config.freeze_threshold_flags == 0 {
             return Err(ReputationError::InvalidParam);
         }
+        // The masking gate compares lifetime `total_transactions` (see
+        // [`Self::get_reputation`]), so a threshold above `SCORE_WINDOW` can
+        // only ever unmask after the recompute window has already slid past
+        // the score-relevant records — the gate then silently samples a
+        // stale subset instead of unlocking as documented. Reject it.
+        if config.min_transactions_threshold > SCORE_WINDOW as u64 {
+            return Err(ReputationError::InvalidParam);
+        }
         Ok(())
     }
 
@@ -726,10 +847,7 @@ impl ReputationContract {
     /// the entity's lifetime transaction count (the same unbounded-growth
     /// problem `SCORE_WINDOW` guards against in `recompute_score`).
     fn has_transacted_with(env: &Env, entity: &Address, counterparty: &Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Transacted(entity.clone(), counterparty.clone()))
-            .unwrap_or(false)
+        Self::has_relation(env.clone(), entity.clone(), counterparty.clone(), false)
     }
 
     fn load_or_default_reputation(env: &Env, entity: &Address) -> ReputationScore {
@@ -770,6 +888,11 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Reputation(entity.clone()), &rep);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Reputation(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     /// Adjusts `entity`'s lifetime counters when an already-recorded escrow's
@@ -797,31 +920,23 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Reputation(entity.clone()), &rep);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Reputation(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
-    /// Recomputes and persists `entity`'s `score`/`avg_rating`/
-    /// `last_updated`, per the score formula:
-    ///
-    /// ```text
-    /// score = sum(recency_weight(r) * outcome_value(r)) / sum(recency_weight(r))
-    /// ```
-    ///
-    /// with an additional flat penalty of `dispute_penalty_bps` subtracted
-    /// per still-relevant (non-fully-decayed) `Disputed` record.
-    /// `avg_rating` is computed the same way over records carrying a rating.
-    ///
-    /// Only the most recent `SCORE_WINDOW` records feed this computation, so
-    /// `record_transaction` and `rate_entity` stay bounded-cost regardless of
-    /// how large an entity's lifetime history grows; records older than that
-    /// already carry a recency weight close to zero for any realistic
-    /// `decay_window_seconds`, so excluding them from the average has
-    /// negligible effect. `total_transactions` / `successful_transactions` /
-    /// `disputed_transactions` are exact lifetime counts maintained
-    /// separately and incrementally — see [`Self::apply_new_transaction_counts`]
-    /// and [`Self::apply_outcome_change_counts`] — so they are left as-is here.
-    fn recompute_score(env: &Env, entity: &Address) -> Result<ReputationScore, ReputationError> {
+    /// Computes the raw score decomposition and the time-decayed average
+    /// rating in a single pass over the recency window. Does not persist;
+    /// `recompute_score` uses the returned values to update and emit the
+    /// breakdown, while `get_score_decomposition` returns them directly.
+    fn compute_score_components(
+        env: &Env,
+        entity: &Address,
+        total_transactions: u64,
+    ) -> Result<(ScoreDecomposition, u32, u64), ReputationError> {
         let config = Self::get_config(env.clone())?;
-        let mut rep = Self::load_or_default_reputation(env, entity);
 
         let history: Vec<u64> = env
             .storage()
@@ -878,20 +993,98 @@ impl ReputationContract {
             0
         };
         let penalty = disputed_recent * (config.dispute_penalty_bps as i128);
-        rep.score = (base_score - penalty).clamp(0, BPS_SCALE) as u32;
-        rep.avg_rating = if rating_weight_sum > 0 {
+        let avg_rating = if rating_weight_sum > 0 {
             (rating_weighted_sum / rating_weight_sum).clamp(0, BPS_SCALE) as u32
         } else {
             0
         };
+
+        Ok((
+            ScoreDecomposition {
+                entity: entity.clone(),
+                base_score_bps: base_score,
+                penalty_bps: penalty,
+                total_transactions,
+                final_score: (base_score - penalty).clamp(0, BPS_SCALE) as u32,
+            },
+            avg_rating,
+            now,
+        ))
+    }
+
+    /// Recomputes and persists `entity`'s `score`/`avg_rating`/
+    /// `last_updated`, per the score formula:
+    ///
+    /// ```text
+    /// score = sum(recency_weight(r) * outcome_value(r)) / sum(recency_weight(r))
+    /// ```
+    ///
+    /// with an additional flat penalty of `dispute_penalty_bps` subtracted
+    /// per still-relevant (non-fully-decayed) `Disputed` record.
+    /// `avg_rating` is computed the same way over records carrying a rating.
+    ///
+    /// Only the most recent `SCORE_WINDOW` records feed this computation, so
+    /// `record_transaction` and `rate_entity` stay bounded-cost regardless of
+    /// how large an entity's lifetime history grows; records older than that
+    /// already carry a recency weight close to zero for any realistic
+    /// `decay_window_seconds`, so excluding them from the average has
+    /// negligible effect. `total_transactions` / `successful_transactions` /
+    /// `disputed_transactions` are exact lifetime counts maintained
+    /// separately and incrementally — see [`Self::apply_new_transaction_counts`]
+    /// and [`Self::apply_outcome_change_counts`] — so they are left as-is here.
+    fn recompute_score(env: &Env, entity: &Address) -> Result<ReputationScore, ReputationError> {
+        let mut rep = Self::load_or_default_reputation(env, entity);
+        let (decomposition, avg_rating, now) =
+            Self::compute_score_components(env, entity, rep.total_transactions)?;
+        rep.score = decomposition.final_score;
+        rep.avg_rating = avg_rating;
         rep.last_updated = now;
 
         env.storage()
             .persistent()
             .set(&DataKey::Reputation(entity.clone()), &rep);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Reputation(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("reput"), symbol_short!("score_dec")),
+            decomposition,
+        );
+
         Ok(rep)
     }
 }
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod config_parity_test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn get_config_matches_constructor_config() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let config = ReputationConfig {
+            decay_window_seconds: 86_400,
+            min_transactions_threshold: 5,
+            dispute_penalty_bps: 250,
+            freeze_threshold_flags: 3,
+        };
+
+        let contract_id = env.register(ReputationContract, (admin, config.clone()));
+
+        let stored: ReputationConfig = env.invoke_contract(
+            &contract_id,
+            &Symbol::new(&env, "get_config"),
+            soroban_sdk::vec![&env],
+        );
+
+        assert_eq!(stored, config);
+    }
+}
