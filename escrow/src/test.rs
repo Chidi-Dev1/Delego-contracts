@@ -78,7 +78,7 @@ mod test {
 
         // Call constructor
         let res = client.constructor(&config);
-        assert_eq!(res, Ok(()));
+        assert!(res);
 
         // Verify admin is set correctly
         let admin_view = client.get_admin();
@@ -113,7 +113,7 @@ mod test {
 
         // Initialize via constructor
         let res = client.constructor(&config);
-        assert_eq!(res, Ok(()));
+        assert!(res);
 
         // Attempt to call initialize after constructor should fail
         let res_try = client.try_initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
