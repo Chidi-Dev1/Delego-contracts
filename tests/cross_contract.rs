@@ -3,11 +3,38 @@
 use delego_escrow::{BatchDepositParams, EscrowContract, EscrowContractClient, EscrowStatus};
 use delego_permissions::{
     PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
+    RelayedSpendMessage,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
 };
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, BytesN, Env, Vec};
+use ed25519_dalek::{Signer, SigningKey};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Ledger as _, xdr::ToXdr, Address, BytesN, Env, Vec,
+};
+
+/// Deterministic test keypair plus its raw ed25519 public key bytes, mirroring
+/// `permissions::integration_tests::test_keypair`.
+fn test_keypair(env: &Env, seed: u8) -> (SigningKey, BytesN<32>) {
+    let signing_key = SigningKey::from_bytes(&[seed; 32]);
+    let public_key = BytesN::from_array(env, &signing_key.verifying_key().to_bytes());
+    (signing_key, public_key)
+}
+
+/// Sign a `RelayedSpendMessage` over its canonical XDR encoding — the exact
+/// bytes `execute_spend_via_relayer` re-derives and verifies.
+fn sign_relayed_spend(
+    env: &Env,
+    signing_key: &SigningKey,
+    message: RelayedSpendMessage,
+) -> BytesN<64> {
+    let message_bytes = message.to_xdr(env);
+    let len = message_bytes.len() as usize;
+    let mut buf = [0u8; 512];
+    message_bytes.copy_into_slice(&mut buf[..len]);
+    let signature = signing_key.sign(&buf[..len]);
+    BytesN::from_array(env, &signature.to_bytes())
+}
 
 struct TestEnv {
     env: Env,
@@ -581,4 +608,125 @@ fn test_permission_expiry_between_grant_and_spend() {
 
     let deposit_result = try_delegated_deposit(&t, 200, 3600);
     assert_eq!(deposit_result, Err(PermissionError::Expired));
+}
+
+// ------------------------------------------------------------------------
+// Security-control coverage: velocity, relayer replay, and multi-owner
+// quorum, wired into the same cross-contract suite as the escrow/permission
+// happy paths above. Whitelist gating end-to-end is already covered by
+// `test_merchant_restriction_enforcement`.
+// ------------------------------------------------------------------------
+
+#[test]
+fn test_second_velocity_spend_fails() {
+    let t = TestEnv::setup();
+    let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    let merchants = Vec::<Address>::new(&t.env);
+    perm_client.grant(&t.buyer, &t.agent, &1000, &500, &merchants, &36000u32);
+
+    perm_client.set_admin(&t._admin);
+    perm_client.set_velocity_limit(&t._admin, &50u32);
+
+    // First spend succeeds and records the current ledger for velocity tracking.
+    perm_client.execute_spend(&t.buyer, &t.agent, &100, &t.seller);
+
+    // A second spend before the configured interval has elapsed is rejected.
+    let second = perm_client.try_execute_spend(&t.buyer, &t.agent, &100, &t.seller);
+    assert_eq!(second, Err(Ok(PermissionError::VelocityLimitExceeded)));
+
+    // Advancing past the interval allows spending again.
+    let current_seq = t.env.ledger().sequence();
+    t.env.ledger().with_mut(|li| {
+        li.sequence_number = current_seq + 51;
+    });
+    perm_client.execute_spend(&t.buyer, &t.agent, &100, &t.seller);
+    assert_eq!(perm_client.get_permission(&t.buyer, &t.agent).spent, 200);
+}
+
+#[test]
+fn test_relayed_spend_replay_with_old_nonce_reverts() {
+    let t = TestEnv::setup();
+    let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let merchants = Vec::<Address>::new(&t.env);
+    perm_client.grant(&t.buyer, &t.agent, &1000, &500, &merchants, &36000u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 7);
+    perm_client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 1000;
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 100,
+        nonce: 0,
+        expiration_ledger,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+
+    perm_client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &100,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &signature,
+    );
+    assert_eq!(perm_client.get_relayer_nonce(&t.buyer, &t.agent), 1);
+
+    // Replaying the same signed message (nonce 0 again) is rejected — the
+    // delegate's expected nonce has already advanced to 1.
+    let replay = perm_client.try_execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &100,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &signature,
+    );
+    assert_eq!(replay, Err(Ok(PermissionError::InvalidNonce)));
+}
+
+#[test]
+fn test_multi_owner_spend_enforces_quorum() {
+    let t = TestEnv::setup();
+    let perm_client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let owner_b = Address::generate(&t.env);
+    let owner_c = Address::generate(&t.env);
+
+    let mut owners = Vec::<Address>::new(&t.env);
+    owners.push_back(t.buyer.clone());
+    owners.push_back(owner_b.clone());
+    owners.push_back(owner_c.clone());
+    let merchants = Vec::<Address>::new(&t.env);
+
+    perm_client.grant_multi_owner(
+        &t.buyer, &owners, &t.agent, &1000, &500, &merchants, &36000u32, &2u32,
+    );
+
+    // A single signer cannot satisfy a 2-of-3 threshold.
+    let mut one_signer = Vec::<Address>::new(&t.env);
+    one_signer.push_back(t.buyer.clone());
+    let under_quorum =
+        perm_client.try_execute_spend_multi(&t.buyer, &t.agent, &one_signer, &100, &t.seller);
+    assert_eq!(
+        under_quorum,
+        Err(Ok(PermissionError::InsufficientSignatures))
+    );
+
+    // Two of the three registered owners satisfies the threshold.
+    let mut two_signers = Vec::<Address>::new(&t.env);
+    two_signers.push_back(t.buyer.clone());
+    two_signers.push_back(owner_b.clone());
+    perm_client.execute_spend_multi(&t.buyer, &t.agent, &two_signers, &100, &t.seller);
+
+    let record = perm_client.get_multi_permission(&t.buyer, &t.agent);
+    assert_eq!(record.spent, 100);
 }
