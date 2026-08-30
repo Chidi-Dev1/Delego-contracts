@@ -26,12 +26,21 @@ pub struct ReputationScore {
     pub last_updated: u64,
 }
 
+/// A persisted record of a single escrow transaction.
+///
+/// The `amount` field is informational-only and does not affect reputation
+/// scoring. Scores are computed based solely on `outcome` and time decay,
+/// not on transaction value. This design choice ensures that dust transactions
+/// and high-value transactions are weighted equally in reputation calculations.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionRecord {
     pub escrow_id: u64,
     pub entity: Address,
     pub counterparty: Address,
+    /// Transaction amount in the smallest denomination of the token.
+    /// This field is persisted for historical record-keeping but does not
+    /// influence reputation scoring calculations.
     pub amount: i128,
     pub outcome: TransactionOutcome,
     /// 0-10000, set once by `rate_entity`.
@@ -107,6 +116,10 @@ pub enum ReputationError {
     /// Same reporter already flagged.
     AlreadyFlagged = 8,
     InvalidParam = 9,
+    /// No active (unresolved) flag from reporter.
+    NoActiveFlag = 10,
+    /// Reporter did not flag the entity.
+    NotFlagReporter = 11,
 }
 
 #[contracttype]
@@ -668,10 +681,21 @@ impl ReputationContract {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
 
+        // Check if entity has any flags at all
+        if flags.is_empty() {
+            return Err(ReputationError::EntityNotFound);
+        }
+
+        // Check if reporter has any flags (active or resolved) for this entity
+        let has_any_flag = flags.iter().any(|f| f.reporter == reporter);
+        if !has_any_flag {
+            return Err(ReputationError::NotFlagReporter);
+        }
+
         let idx = flags
             .iter()
             .position(|f| f.reporter == reporter && !f.resolved)
-            .ok_or(ReputationError::EntityNotFound)?;
+            .ok_or(ReputationError::NoActiveFlag)?;
         let mut flag = flags.get(idx as u32).unwrap();
         flag.resolved = true;
         flags.set(idx as u32, flag);
