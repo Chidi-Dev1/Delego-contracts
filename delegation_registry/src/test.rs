@@ -513,6 +513,15 @@ fn test_revoke_delegation_idempotency_distinguishes_first_and_subsequent_calls()
 }
 
 #[test]
+fn test_version_returns_contract_identity() {
+    let (_, client, _, _, _, _) = setup();
+
+    let v = client.version();
+    assert_eq!(v.name, symbol_short!("deleg_reg"));
+    assert_eq!(v.semver, symbol_short!("0_0_1"));
+}
+
+#[test]
 fn test_revoke_paused_delegation_returns_true() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();

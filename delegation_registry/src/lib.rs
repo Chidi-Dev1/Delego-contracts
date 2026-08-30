@@ -4,6 +4,14 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
+/// Contract version information for deployment scripts and runtime compatibility checks.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractVersion {
+    pub name: Symbol,
+    pub semver: Symbol,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DelegationStatus {
@@ -121,6 +129,15 @@ pub struct DelegationRegistry;
 
 #[contractimpl]
 impl DelegationRegistry {
+    /// Return the contract name and semantic version.
+    /// Callable without authentication — safe for off-chain tooling.
+    pub fn version(_env: Env) -> ContractVersion {
+        ContractVersion {
+            name: symbol_short!("deleg_reg"),
+            semver: symbol_short!("0_0_1"),
+        }
+    }
+
     pub fn initialize(env: Env, admin: Address) -> Result<bool, DelegationError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(DelegationError::AlreadyInitialized);
