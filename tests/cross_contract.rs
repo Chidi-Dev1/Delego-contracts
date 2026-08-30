@@ -1,12 +1,17 @@
 #![cfg(test)]
 
-use delego_escrow::{BatchDepositParams, EscrowContract, EscrowContractClient, EscrowStatus};
+use delego_delegation::DelegationError;
+use delego_escrow::{
+    BatchDepositParams, EscrowContract, EscrowContractClient, EscrowError, EscrowStatus,
+};
+use delego_marketplace::MarketplaceError;
 use delego_permissions::{
     PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
     RelayedSpendMessage,
 };
 use delego_reputation::{
-    ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
+    ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
+    TransactionOutcome,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
@@ -23,7 +28,11 @@ fn test_keypair(env: &Env, seed: u8) -> (SigningKey, BytesN<32>) {
 
 /// Sign a `RelayedSpendMessage` over its canonical XDR encoding — the exact
 /// bytes `execute_spend_via_relayer` re-derives and verifies.
-fn sign_relayed_spend(env: &Env, signing_key: &SigningKey, message: RelayedSpendMessage) -> BytesN<64> {
+fn sign_relayed_spend(
+    env: &Env,
+    signing_key: &SigningKey,
+    message: RelayedSpendMessage,
+) -> BytesN<64> {
     let message_bytes = message.to_xdr(env);
     let len = message_bytes.len() as usize;
     let mut buf = [0u8; 512];
@@ -710,14 +719,12 @@ fn test_multi_owner_spend_enforces_quorum() {
     // A single signer cannot satisfy a 2-of-3 threshold.
     let mut one_signer = Vec::<Address>::new(&t.env);
     one_signer.push_back(t.buyer.clone());
-    let under_quorum = perm_client.try_execute_spend_multi(
-        &t.buyer,
-        &t.agent,
-        &one_signer,
-        &100,
-        &t.seller,
+    let under_quorum =
+        perm_client.try_execute_spend_multi(&t.buyer, &t.agent, &one_signer, &100, &t.seller);
+    assert_eq!(
+        under_quorum,
+        Err(Ok(PermissionError::InsufficientSignatures))
     );
-    assert_eq!(under_quorum, Err(Ok(PermissionError::InsufficientSignatures)));
 
     // Two of the three registered owners satisfies the threshold.
     let mut two_signers = Vec::<Address>::new(&t.env);
@@ -727,4 +734,54 @@ fn test_multi_owner_spend_enforces_quorum() {
 
     let record = perm_client.get_multi_permission(&t.buyer, &t.agent);
     assert_eq!(record.spent, 100);
+}
+
+/// Cross-contract error-code allocation.
+///
+/// The bridge-facing error space is a single numeric `u32` code space. To make
+/// numeric codes unambiguous, every code belongs to at most one contract's
+/// error enum.
+///
+/// | Contract      | Error enum          |
+/// |---------------|---------------------|
+/// | Escrow        | `EscrowError`       |
+/// | Permissions   | `PermissionError`   |
+/// | Reputation    | `ReputationError`   |
+/// | Delegation    | `DelegationError`   |
+/// | Marketplace   | `MarketplaceError`  |
+///
+/// The test below verifies this uniqueness property for all codes accepted by
+/// each contract's `TryFrom<u32>` implementation.
+fn collect_error_codes<T>() -> Vec<u32>
+where
+    T: TryFrom<u32>,
+{
+    (0..=u16::MAX as u32)
+        .filter(|&code| T::try_from(code).is_ok())
+        .collect()
+}
+
+#[test]
+fn test_error_codes_are_unique_across_contracts() {
+    let error_codes = [
+        ("escrow", collect_error_codes::<EscrowError>()),
+        ("permissions", collect_error_codes::<PermissionError>()),
+        ("reputation", collect_error_codes::<ReputationError>()),
+        ("delegation", collect_error_codes::<DelegationError>()),
+        ("marketplace", collect_error_codes::<MarketplaceError>()),
+    ];
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (contract_name, codes) in error_codes {
+        assert!(
+            !codes.is_empty(),
+            "{contract_name} must expose at least one error code"
+        );
+        for code in codes {
+            assert!(
+                seen.insert(code),
+                "error code {code} is shared with another contract"
+            );
+        }
+    }
 }
