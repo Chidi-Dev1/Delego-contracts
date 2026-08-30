@@ -3909,12 +3909,20 @@ mod fee_distribution_tests {
     use soroban_sdk::testutils::Address as _;
 
     fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(env, &contract_id);
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
         env.mock_all_auths();
-        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
+        let contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 250u32,
+                treasury: treasury.clone(),
+                min_amount: 100i128,
+                max_amount: 1_000_000i128,
+            },),
+        );
+        let client = EscrowContractClient::new(env, &contract_id);
         (client, admin, contract_id)
     }
 
