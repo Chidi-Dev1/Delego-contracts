@@ -9,6 +9,7 @@ mod test {
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events, Ledger},
+        token::TokenClient,
         Address, BytesN, Env, IntoVal, TryIntoVal,
     };
 
@@ -420,6 +421,55 @@ mod test {
             &party, &party, &token, &1000i128, &order_id, &100u32, &None, &None,
         );
         assert_eq!(res, Err(Ok(EscrowError::InvalidEscrowParticipants)));
+    }
+
+    #[test]
+    fn test_get_escrow_metadata_absent_escrow_returns_not_found() {
+        let env = Env::default();
+        let (client, _admin, _contract_id) = setup_client(&env);
+
+        assert_eq!(
+            client.try_get_escrow_metadata(&999u64),
+            Err(Ok(EscrowError::NotFound))
+        );
+    }
+
+    #[test]
+    fn test_get_escrow_metadata_existing_escrow_without_metadata_returns_metadata_not_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_client = TokenClient::new(&env, &token);
+        token_client.mint(&buyer, &1000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[42u8; 32]);
+        let escrow_id = client.create(
+            &buyer,
+            &seller,
+            &token,
+            &1000i128,
+            &order_id,
+            &100u32,
+            &None,
+            &None,
+        );
+
+        // Simulate a legacy escrow by removing its metadata.
+        let metadata_key = DataKey::EscrowMetadata(escrow_id).into_val(&env);
+        env.as_contract(&contract_id, || {
+            env.storage().remove(&metadata_key);
+        });
+
+        assert_eq!(
+            client.try_get_escrow_metadata(&escrow_id),
+            Err(Ok(EscrowError::MetadataNotSet))
+        );
     }
 
     // ─── Issue #179: Storage Key Namespace Tests ───────────────────────────────

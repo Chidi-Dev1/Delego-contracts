@@ -662,7 +662,8 @@ pub enum DataKey {
 /// | 40 | AmountLimitsNotSet | ≤0.2.0 |
 /// | 41 | FeeConfigNotSet | ≤0.2.0 |
 /// | 201 | InvalidReleaseRecipient | ≤0.2.0 |
-/// | 400+ | Reserved for new variants | next major |
+/// | 400 | MetadataNotSet | next major |
+/// | 401+ | Reserved for new variants | next major |
 ///
 /// # Allocating new variants
 ///
@@ -758,6 +759,8 @@ pub enum EscrowError {
     FeeConfigNotSet = 41,
     /// Maximum treasuries exceeded
     MaxTreasuriesExceeded = 42,
+    /// Escrow exists but no metadata was stored at creation
+    MetadataNotSet = 400,
 }
 
 /// Compact receipt returned to buyers after escrow creation via `get_receipt`.
@@ -3464,9 +3467,10 @@ impl EscrowContract {
 
     /// Get the optional metadata for an escrow.
     ///
-    /// Returns the metadata if it was provided during escrow creation, otherwise
-    /// returns NotFound. The metadata contains the order hash and schema identifier
-    /// for off-chain order verification.
+    /// Returns the metadata if it was provided during escrow creation.
+    /// Returns [`EscrowError::NotFound`] when no escrow exists for
+    /// `escrow_id`, or [`EscrowError::MetadataNotSet`] when the escrow
+    /// exists but no metadata was stored.
     pub fn get_escrow_metadata(env: Env, escrow_id: u64) -> Result<EscrowMetadata, EscrowError> {
         let order_hash: BytesN<32> = env
             .storage()
@@ -3531,6 +3535,12 @@ impl EscrowContract {
             .persistent()
             .set(&DataKey::EscrowMetadataSchema(escrow_id), &schema);
         Ok(())
+        let escrow_key = DataKey::Escrow(escrow_id);
+        if !env.storage().persistent().has(&escrow_key) {
+            return Err(EscrowError::NotFound);
+        let key = DataKey::EscrowMetadata(escrow_id);
+            .get(&key)
+            .ok_or(EscrowError::MetadataNotSet)
     }
 
     /// Returns true if the address is the primary admin or a co-admin.
@@ -4224,6 +4234,45 @@ mod batch_flow_tests {
             client.try_batch_release(&caller, &releases),
             Err(Ok(EscrowError::NotFound))
         );
+mod metadata_tests {
+    fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
+        let client = EscrowContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let token = Address::generate(env);
+        client.add_token(&admin, &token);
+        (client, admin, token)
+    }
+    fn get_escrow_metadata_absent_escrow_returns_not_found() {
+        let (client, _admin, _token) = setup(&env);
+        let result = client.try_get_escrow_metadata(&999u64);
+        assert_eq!(result, Err(Ok(EscrowError::NotFound)));
+    fn get_escrow_metadata_existing_without_metadata_returns_metadata_not_set() {
+        let (client, _admin, token) = setup(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let order_id = BytesN::from_array(&env, &[0u8; 32]);
+        let no_hash: Option<BytesN<32>> = None;
+        let no_schema: Option<Symbol> = None;
+        let escrow_id = client.create(
+            &buyer,
+            &seller,
+            &token,
+            &100i128,
+            &order_id,
+            &1000u32,
+            &no_hash,
+            &no_schema,
+        let result = client.try_get_escrow_metadata(&escrow_id);
+        assert_eq!(result, Err(Ok(EscrowError::MetadataNotSet)));
+    fn get_escrow_metadata_existing_with_metadata_returns_metadata() {
+        let order_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let schema = Symbol::new(&env, "order_v1");
+            &Some(order_hash.clone()),
+            &Some(schema.clone()),
+        let metadata = client.get_escrow_metadata(&escrow_id);
+        assert_eq!(metadata.order_hash, order_hash);
+        assert_eq!(metadata.schema, schema);
     }
 }
 
