@@ -1339,6 +1339,7 @@ impl EscrowContract {
 
         record.updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
+        env.storage().persistent().remove(&votes_key);
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("resolved")),
@@ -4115,3 +4116,61 @@ mod fee_distribution_tests {
 mod integration_tests;
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod quorum_cleanup_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::Client as TokenClient;
+
+    #[test]
+    fn dispute_votes_removed_after_quorum_resolution() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let arbiter1 = Address::generate(&env);
+        let arbiter2 = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token = env.register_stellar_asset_contract(admin.clone());
+        let token_client = TokenClient::new(&env, &token);
+        token_client.mint(&admin, &buyer, &1000i128);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        client.initialize(&admin, &0u32, &treasury, &1i128, &1000i128).unwrap();
+        client.add_token(&admin, &token).unwrap();
+
+        let arbiters = soroban_sdk::vec![&env, arbiter1.clone(), arbiter2.clone()];
+        client.set_quorum_config(&admin, &arbiters, &2u32).unwrap();
+
+        let order_id = BytesN::from_array(&env, &[0u8; 32]);
+        let escrow_id = client
+            .deposit(
+                &buyer,
+                &seller,
+                &token,
+                &1000i128,
+                &order_id,
+                &1000u32,
+                &None::<BytesN<32>>,
+                &None::<Symbol>,
+            )
+            .unwrap();
+
+        client.dispute(&escrow_id, &buyer).unwrap();
+
+        client.vote_dispute(&escrow_id, &arbiter1, &true).unwrap();
+        client.vote_dispute(&escrow_id, &arbiter2, &true).unwrap();
+
+        let votes_key = DataKey::DisputeVotes(escrow_id);
+        assert!(env.storage().persistent().has(&votes_key));
+
+        client.resolve_dispute_quorum(&escrow_id, &arbiter1).unwrap();
+
+        assert!(!env.storage().persistent().has(&votes_key));
+    }
+}

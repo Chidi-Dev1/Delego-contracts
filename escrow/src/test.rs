@@ -495,6 +495,7 @@ mod test {
     // advances further and asserts the record is still live and readable.
     #[test]
     fn test_get_escrow_bumps_ttl_across_expiry_boundary() {
+    fn test_dispute_votes_removed_after_quorum_resolution() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, admin, _contract_id) = setup_client(&env);
@@ -532,6 +533,30 @@ mod test {
         let after = client.get_escrow(&escrow_id);
 
         assert_eq!(before, after);
+            &buyer,
+            &seller,
+            &token,
+            &1000i128,
+            &order_id,
+            &100u32,
+            &None,
+        client.deposit(&escrow_id, &1000i128);
+        let arbiter1 = Address::generate(&env);
+        let arbiter2 = Address::generate(&env);
+        client.set_quorum_config(
+            &admin,
+            &crate::QuorumConfig {
+                arbiters: soroban_sdk::vec![arbiter1.clone(), arbiter2.clone()],
+                threshold: 2,
+            },
+        client.dispute(&escrow_id);
+        client.vote(&escrow_id, &arbiter1, &true);
+        client.vote(&escrow_id, &arbiter2, &true);
+        client.resolve_dispute_quorum(&escrow_id);
+        assert!(
+            !env.storage()
+                .persistent()
+                .has(&DataKey::DisputeVotes(escrow_id))
     }
 
     // ─── Issue #172: Escrow Creation Metadata Hash Tests ─────────────────────
