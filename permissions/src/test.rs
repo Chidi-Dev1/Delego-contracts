@@ -158,6 +158,22 @@ mod test {
     }
 
     #[test]
+    fn test_get_permission_missing_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.try_get_permission(&owner, &delegate),
+            Err(Ok(PermissionError::PermissionNotFound))
+        );
+    }
+
+    #[test]
     fn test_get_remaining_allowance() {
         let env = Env::default();
         let owner = Address::generate(&env);
@@ -175,6 +191,22 @@ mod test {
 
         client.execute_spend(&owner, &delegate, &30, &merchant);
         assert_eq!(client.get_remaining_allowance(&owner, &delegate), 970);
+    }
+
+    #[test]
+    fn test_get_remaining_allowance_missing_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.try_get_remaining_allowance(&owner, &delegate),
+            Err(Ok(PermissionError::PermissionNotFound))
+        );
     }
 
     // --- Issue #98: get_allowance_detail tests ---
@@ -264,7 +296,6 @@ mod test {
         let contract_id = env.register(PermissionsContract, ());
         let client = PermissionsContractClient::new(&env, &contract_id);
 
-        // get_permission panics on missing (existing behavior), but get_allowance_detail returns typed error.
         let result = client.try_get_allowance_detail(&owner, &delegate);
         assert_eq!(result, Err(Ok(PermissionError::PermissionNotFound)));
     }
@@ -439,6 +470,22 @@ mod test {
         // PauseMetadata isn't there anymore, let's just assert it is paused
         let perm = client.get_permission(&owner, &delegate);
         assert_eq!(perm.status, crate::PermissionStatus::Paused);
+    }
+
+    #[test]
+    fn test_get_pause_metadata_missing_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.try_get_pause_metadata(&owner, &delegate),
+            Err(Ok(PermissionError::PermissionNotFound))
+        );
     }
 
     #[test]

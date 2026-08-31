@@ -774,6 +774,17 @@ impl PermissionsContract {
             env.storage().persistent().set(&user_perms_key, &delegates);
         }
 
+        let user_perms_key = DataKey::UserPermissions(owner.clone());
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&user_perms_key)
+            .unwrap_or(Vec::new(&env));
+        if !delegates.contains(&delegate) {
+            delegates.push_back(delegate.clone());
+            env.storage().persistent().set(&user_perms_key, &delegates);
+        }
+
         let record = PermissionRecord {
             owner: owner.clone(),
             delegate: delegate.clone(),
@@ -2031,10 +2042,15 @@ impl PermissionsContract {
         env.storage().persistent().get(&key).unwrap()
     }
 
-    pub fn get_remaining_allowance(env: Env, owner: Address, delegate: Address) -> i128 {
+    pub fn get_permission(env: Env, owner: Address, delegate: Address) -> PermissionRecord {
         let key = DataKey::Permission(owner, delegate);
-        let record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
-        record.limit_total - record.spent
+        env.storage().persistent().get(&key).ok_or(PermissionError::PermissionNotFound)
+    }
+
+    pub fn get_remaining_allowance(env: Env, owner: Address, delegate: Address) -> Result<i128, PermissionError> {
+        let key = DataKey::Permission(owner, delegate);
+        let record: PermissionRecord = env.storage().persistent().get(&key).ok_or(PermissionError::PermissionNotFound)?;
+        Ok(record.limit_total - record.spent)
     }
 
     /// Typed allowance getter: returns limit, spent, remaining (clamped ≥ 0),
@@ -2276,18 +2292,20 @@ impl PermissionsContract {
         Ok(())
     }
 
-    /// Returns the stored pause metadata for `(owner, delegate)`, or `Ok(None)`
-    /// when the permission is not currently paused (never panics on a missing
-    /// entry).
+    /// Returns the stored pause metadata for `(owner, delegate)`.
+    ///
+    /// # Errors
+    /// [`PermissionError::PermissionNotFound`] if no pause metadata is stored
+    /// for the pair.
     pub fn get_pause_metadata(
         env: Env,
         owner: Address,
         delegate: Address,
-    ) -> Result<Option<PauseMetadata>, PermissionError> {
-        Ok(env
-            .storage()
+    ) -> Result<PauseMetadata, PermissionError> {
+        env.storage()
             .persistent()
-            .get(&DataKey::PauseMetadata(owner, delegate)))
+            .get(&DataKey::PauseMetadata(owner, delegate))
+            .ok_or(PermissionError::PermissionNotFound)
     }
 
     pub fn set_admin(env: Env, admin: Address) {
@@ -3113,3 +3131,43 @@ impl PermissionsContract {
 mod integration_tests;
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod absent_key_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn absent_pair() -> (Env, Address, Address) {
+        let env = Env::default();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        (env, owner, delegate)
+    }
+
+    #[test]
+    fn get_permission_absent_returns_not_found() {
+        let (env, owner, delegate) = absent_pair();
+        assert_eq!(
+            PermissionsContract::get_permission(env, owner, delegate),
+            Err(PermissionError::PermissionNotFound)
+        );
+    }
+
+    #[test]
+    fn get_remaining_allowance_absent_returns_not_found() {
+        let (env, owner, delegate) = absent_pair();
+        assert_eq!(
+            PermissionsContract::get_remaining_allowance(env, owner, delegate),
+            Err(PermissionError::PermissionNotFound)
+        );
+    }
+
+    #[test]
+    fn get_pause_metadata_absent_returns_not_found() {
+        let (env, owner, delegate) = absent_pair();
+        assert_eq!(
+            PermissionsContract::get_pause_metadata(env, owner, delegate),
+            Err(PermissionError::PermissionNotFound)
+        );
+    }
+}
