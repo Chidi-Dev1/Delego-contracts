@@ -1,3 +1,6 @@
+#![cfg(test)]
+#![allow(clippy::too_many_lines)]
+
 use super::*;
 use soroban_sdk::{
     symbol_short,
