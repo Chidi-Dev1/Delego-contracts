@@ -441,6 +441,15 @@ impl DelegationRegistry {
         }
 
         record = snapshot.record;
+
+        // Re-validate snapshot liveness on rollback: if the restored
+        // snapshot's expiry has already passed, mark it Expired instead of
+        // reviving a dead delegation across its original expiry.
+        let expired_on_restore = env.ledger().sequence() >= record.expires_at_ledger;
+        if expired_on_restore {
+            record.status = DelegationStatus::Expired;
+        }
+
         record.version = Self::increment_version(&env, delegation_id);
         record.updated_at = env.ledger().timestamp();
 
@@ -449,6 +458,18 @@ impl DelegationRegistry {
             .set(&DataKey::Delegation(delegation_id), &record);
 
         Self::store_snapshot(&env, delegation_id, &record);
+
+        if expired_on_restore {
+            env.events().publish(
+                (symbol_short!("deleg"), symbol_short!("expired")),
+                DelegationExpiredEvent {
+                    delegation_id,
+                    owner: record.owner.clone(),
+                    agent: record.agent_id.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+        }
 
         Ok(true)
     }

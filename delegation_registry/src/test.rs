@@ -730,4 +730,15 @@ fn test_create_delegation_returns_id_exhausted_at_boundary() {
     let result =
         client.try_create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
     assert_eq!(result, Err(Ok(DelegationError::IdExhausted)));
+fn test_rollback_cannot_revive_past_expiry_snapshot() {
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Past_Expiry");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    // Create a second version so there is a v1 snapshot to roll back to.
+    // Advance the ledger past the original expiry (created at 100, ttl 100 => expires at 200).
+    env.ledger().set_sequence_number(300);
+    // Rolling back to the Active v1 snapshot must NOT revive a delegation
+    // that has already expired; it should be marked Expired instead.
+    client.rollback_delegation(&id, &1u32);
+    assert_eq!(record.status, DelegationStatus::Expired);
 }
