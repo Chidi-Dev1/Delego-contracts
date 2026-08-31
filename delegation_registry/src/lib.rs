@@ -68,6 +68,14 @@ pub struct DelegationSnapshot {
     pub record: DelegationRecord,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationPage {
+    pub items: Vec<DelegationRecord>,
+    pub total: u32,
+    pub next_offset: Option<u32>,
+}
+
 // ── Events ────────────────────────────────────────────────────────────────────
 
 /// Emitted when a new delegation is created.
@@ -459,6 +467,64 @@ impl DelegationRegistry {
     }
 
     /// Rolls a delegation back to a previous version.
+    const MAX_PAGE_LIMIT: u32 = 100;
+
+    pub fn get_delegations_by_owner_paginated(
+        env: Env,
+        owner: Address,
+        offset: u32,
+        limit: u32,
+    ) -> DelegationPage {
+        let user_dels: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserDelegations(owner))
+            .unwrap_or(Vec::new(&env));
+        let total = user_dels.len() as u32;
+        let limit = limit.min(Self::MAX_PAGE_LIMIT);
+        let offset = offset.min(total);
+        let mut items = Vec::new(&env);
+        let start = offset;
+        let end = offset.saturating_add(limit).min(total);
+        let mut i = start;
+        while i < end {
+            let id = user_dels.get(i).unwrap();
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
+            {
+                items.push_back(record);
+            }
+            i += 1;
+        }
+        let next_offset = if end < total { Some(end) } else { None };
+        DelegationPage {
+            items,
+            total,
+            next_offset,
+    }
+    pub fn get_delegation_history_paginated(
+        delegation_id: u64,
+        let history: Vec<DelegationSnapshot> = env
+            .get(&DataKey::DelegationHistory(delegation_id))
+        let total = history.len() as u32;
+            let snapshot = history.get(i).unwrap();
+            items.push_back(snapshot.record);
+    pub fn get_expired_delegations_paginated(
+        let next_id: u64 = env
+            .instance()
+            .get(&DataKey::NextId)
+            .unwrap_or(1);
+        let mut expired = Vec::new(&env);
+        let mut id = 1u64;
+        while id < next_id {
+                if record.status == DelegationStatus::Expired {
+                    expired.push_back(record);
+                }
+            id += 1;
+        let total = expired.len() as u32;
+            items.push_back(expired.get(i).unwrap());
     pub fn rollback_delegation(
         env: Env,
         delegation_id: u64,

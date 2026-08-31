@@ -827,4 +827,35 @@ fn test_cross_owner_delegation_id_monotonicity() {
     assert_eq!(client.get_delegation(&id_a).owner, owner_a);
     assert_eq!(client.get_delegation(&id_b).owner, owner_b);
     assert_eq!(client.get_delegation(&id_c).owner, owner_c);
+fn test_get_delegations_by_owner_paged_paginates() {
+    for _ in 0..=MAX_PAGE_LIMIT {
+        let label = Symbol::new(&env, "Owner_Page");
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    }
+    let page = client.get_delegations_by_owner_paged(&owner, &0u32, &(MAX_PAGE_LIMIT + 1));
+    assert_eq!(page.total, MAX_PAGE_LIMIT + 1);
+    assert_eq!(page.items.len(), MAX_PAGE_LIMIT);
+    assert_eq!(page.next_offset, Some(MAX_PAGE_LIMIT));
+    let next = client.get_delegations_by_owner_paged(&owner, &MAX_PAGE_LIMIT, &MAX_PAGE_LIMIT);
+    assert_eq!(next.items.len(), 1);
+    assert_eq!(next.total, MAX_PAGE_LIMIT + 1);
+    assert_eq!(next.next_offset, None);
+fn test_get_delegation_history_paged_paginates() {
+    let label = Symbol::new(&env, "History_Page");
+    for _ in 0..MAX_PAGE_LIMIT {
+        client.pause_delegation(&id);
+        client.resume_delegation(&id);
+    let page = client.get_delegation_history_paged(&id, &0u32, &(MAX_PAGE_LIMIT + 1));
+    assert_eq!(page.total, 1 + (2 * MAX_PAGE_LIMIT));
+    let next = client.get_delegation_history_paged(&id, &MAX_PAGE_LIMIT, &MAX_PAGE_LIMIT);
+    assert_eq!(next.items.len(), MAX_PAGE_LIMIT);
+    assert_eq!(next.next_offset, Some(2 * MAX_PAGE_LIMIT));
+    let last = client.get_delegation_history_paged(&id, &(2 * MAX_PAGE_LIMIT), &MAX_PAGE_LIMIT);
+    assert_eq!(last.items.len(), 1);
+    assert_eq!(last.next_offset, None);
+fn test_get_expired_delegations_paged_paginates() {
+        let label = Symbol::new(&env, "Expired_Page");
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    let page = client.get_expired_delegations_paged(&owner, &0u32, &(MAX_PAGE_LIMIT + 1));
+    let next = client.get_expired_delegations_paged(&owner, &MAX_PAGE_LIMIT, &MAX_PAGE_LIMIT);
 }
