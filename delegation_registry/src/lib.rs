@@ -123,6 +123,7 @@ pub enum DelegationError {
     VersionNotLower = 7,
     SnapshotNotFound = 8,
     InvalidAgentId = 9,
+    IdExhausted = 9,
 }
 
 #[contract]
@@ -168,7 +169,8 @@ impl DelegationRegistry {
             .instance()
             .get(&DataKey::NextId)
             .unwrap_or(1u64);
-        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        let next_id = id.checked_add(1).ok_or(DelegationError::IdExhausted)?;
+        env.storage().instance().set(&DataKey::NextId, &next_id);
 
         let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
         let now = env.ledger().timestamp();

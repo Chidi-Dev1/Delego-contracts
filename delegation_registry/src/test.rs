@@ -721,4 +721,13 @@ fn test_active_authorization_survives_ttl_boundary() {
     assert!(client.is_authorized(&id, &agent_id));
     let record = client.get_delegation(&id);
     assert_eq!(record.status, DelegationStatus::Active);
+// ── #90 checked_add boundary test ───────────────────────────────────────────
+fn test_create_delegation_returns_id_exhausted_at_boundary() {
+    // Directly set NextId to u64::MAX so the next increment overflows
+    env.storage()
+        .instance()
+        .set(&DataKey::NextId, &u64::MAX);
+    let result =
+        client.try_create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    assert_eq!(result, Err(Ok(DelegationError::IdExhausted)));
 }
