@@ -1,14 +1,14 @@
 use crate::{
-    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantRegisteredEvent,
-    MerchantStatus, RegisterParams, Verifier,
+    AdminAcceptedEvent, AdminProposedEvent, MarketplaceContract, MarketplaceContractClient,
+    MarketplaceError, MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
 };
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger as _},
-    Address, Env, String,
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, Env, IntoVal, String, Symbol, TryFromVal, Val,
 };
 
 struct TestFixture<'a> {
@@ -1087,6 +1087,11 @@ fn test_two_step_admin_transfer() {
     // Current admin proposes new admin
     f.client.propose_admin(&f.admin, &new_admin);
 
+    // Proposal publishes AdminProposedEvent with current + new admin
+    let proposed = find_event::<AdminProposedEvent>(&f, &symbol_short!("adm_prop")).unwrap();
+    assert_eq!(proposed.current_admin, f.admin);
+    assert_eq!(proposed.new_admin, new_admin);
+
     // Stranger (wrong caller, proposal exists) -> Unauthorized
     let stranger_acc = f.client.try_accept_admin(&stranger);
     assert_eq!(
@@ -1094,8 +1099,17 @@ fn test_two_step_admin_transfer() {
         MarketplaceError::Unauthorized
     );
 
+    // Unauthorized acceptance must not emit AdminAcceptedEvent
+    assert!(find_event::<AdminAcceptedEvent>(&f, &symbol_short!("adm_acc")).is_none());
+
     // New admin accepts
     f.client.accept_admin(&new_admin);
+
+    // Acceptance publishes AdminAcceptedEvent with previous + new admin
+    let accepted = find_event::<AdminAcceptedEvent>(&f, &symbol_short!("adm_acc")).unwrap();
+    assert_eq!(accepted.previous_admin, f.admin);
+    assert_eq!(accepted.new_admin, new_admin);
+
     assert_eq!(f.client.get_admin(), new_admin);
 
     // After acceptance the pending admin is cleared -> NoPendingAdmin again
@@ -1104,6 +1118,29 @@ fn test_two_step_admin_transfer() {
         cleared_acc.unwrap_err().unwrap(),
         MarketplaceError::NoPendingAdmin
     );
+}
+
+/// Find the most recently published contract event whose event-name topic
+/// (the second topic, e.g. "adm_acc") matches `name`, and deserialize its
+/// payload as `T`.
+fn find_event<T>(f: &TestFixture<'_>, name: &Symbol) -> Option<T>
+where
+    T: TryFromVal<Env, Val>,
+{
+    f.env
+        .events()
+        .all()
+        .iter()
+        .rev()
+        .find_map(|(_id, topics, data)| {
+            let topic_val: Val = topics.get(1).unwrap_or_else(|| ().into_val(&f.env));
+            let topic = Symbol::try_from_val(&f.env, &topic_val).ok()?;
+            if &topic == name {
+                T::try_from_val(&f.env, &data).ok()
+            } else {
+                None
+            }
+        })
 }
 
 #[test]
