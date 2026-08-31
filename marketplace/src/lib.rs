@@ -211,6 +211,13 @@ pub enum MarketplaceError {
 }
 
 // --- Events ---
+//
+// Merchant-scoped events are published as `(mkplc, <action>, merchant_id)` so
+// off-chain indexers and Soroban RPC subscriptions can filter by merchant from
+// the topics alone, without deserializing the event body (issue #142). The
+// `merchant_id` is also retained in the event data. Events that are not scoped
+// to a single merchant — verifier add/remove and admin transfer — keep the
+// two-topic `(mkplc, <action>)` form.
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -669,7 +676,7 @@ impl MarketplaceContract {
             .set(&DataKey::NextMerchantId, &incremented);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("reg")),
+            (symbol_short!("mkplc"), symbol_short!("reg"), next_id),
             MerchantRegisteredEvent {
                 merchant_id: next_id,
                 owner: merchant,
@@ -794,7 +801,11 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("profile")),
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("profile"),
+                merchant_id,
+            ),
             MerchantProfileUpdatedEvent {
                 merchant_id,
                 updated_fields: symbol_short!("profile"),
@@ -854,7 +865,7 @@ impl MarketplaceContract {
             .set(&DataKey::LastMetadataUpdate(merchant_id), &now);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("meta")),
+            (symbol_short!("mkplc"), symbol_short!("meta"), merchant_id),
             MerchantMetadataUpdatedEvent {
                 merchant_id,
                 new_metadata,
@@ -1138,7 +1149,7 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("verif")),
+            (symbol_short!("mkplc"), symbol_short!("verif"), merchant_id),
             MerchantVerifiedEvent {
                 merchant_id,
                 verifier,
@@ -1194,7 +1205,7 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("v_rev")),
+            (symbol_short!("mkplc"), symbol_short!("v_rev"), merchant_id),
             MerchantVerificationRevokedEvent {
                 merchant_id,
                 revoked_by: admin,
@@ -1673,7 +1684,7 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("comm")),
+            (symbol_short!("mkplc"), symbol_short!("comm"), merchant_id),
             MerchantCommissionSetEvent {
                 merchant_id,
                 commission_bps,
@@ -1715,7 +1726,11 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("suspend")),
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("suspend"),
+                merchant_id,
+            ),
             MerchantSuspendedEvent {
                 merchant_id,
                 suspended_by: admin,
@@ -1753,7 +1768,7 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("unsusp")),
+            (symbol_short!("mkplc"), symbol_short!("unsusp"), merchant_id),
             MerchantUnsuspendedEvent {
                 merchant_id,
                 unsuspended_by: admin,
@@ -1833,7 +1848,7 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("closed")),
+            (symbol_short!("mkplc"), symbol_short!("closed"), merchant_id),
             MerchantClosedEvent {
                 merchant_id,
                 closed_by: admin,
@@ -1936,7 +1951,11 @@ impl MarketplaceContract {
             .set(&DataKey::Merchant(merchant_id), &merchant);
 
         env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("rep_set")),
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("rep_set"),
+                merchant_id,
+            ),
             MerchantReputationSetEvent {
                 merchant_id,
                 reputation,

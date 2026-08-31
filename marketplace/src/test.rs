@@ -2662,3 +2662,23 @@ fn test_merchant_category_changed_event_struct_fields() {
     assert_eq!(event.merchant_id, 7);
     assert_eq!(event.from, symbol_short!("retail"));
     assert_eq!(event.to, symbol_short!("food"));
+// Issue #142: merchant-scoped events carry the merchant id as their third
+// topic so indexers can route by merchant without deserializing the body.
+fn test_register_merchant_event_carries_merchant_id_topic() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{Symbol, TryIntoVal};
+        name: String::from_str(&f.env, "Topic Store"),
+        description: String::from_str(&f.env, "Tests topic routing"),
+        image_url: String::from_str(&f.env, "https://example.com/topic.png"),
+    let mut found = false;
+    for event in f.env.events().all().iter() {
+        let (_c_id, topics, _value) = event;
+        if topics.len() != 3 {
+            continue;
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+        let t1: Symbol = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+        if t0 == symbol_short!("mkplc") && t1 == symbol_short!("reg") {
+            let t2: u64 = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+            assert_eq!(t2, merchant_id, "reg topic must carry the merchant id");
+            found = true;
+    assert!(found, "reg event with merchant_id topic not found");

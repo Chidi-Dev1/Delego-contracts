@@ -328,15 +328,33 @@ Smart Contracts
 
 ### Event Emission
 
-Contracts emit events for off-chain services:
+Contracts emit events for off-chain services.
+
+**Topic schema.** Entity-scoped lifecycle events carry the entity id as a third
+topic — `(contract, action, entity_id)` — so indexers and Soroban RPC
+subscriptions can filter by entity without deserializing every event body
+(issue #142). The id is also kept in the event data for convenience.
 
 ```rust
-// Emit event when funds are locked
-events::publish(
-    &e,
-    (Symbol::new(&e, Symbol::short("locked")), order_id, amount)
+// escrow lifecycle: (escrow, <action>, escrow_id)
+env.events().publish(
+    (symbol_short!("escrow"), symbol_short!("released"), escrow_id),
+    EscrowReleasedEvent { escrow_id, seller, amount, released_by },
+);
+
+// marketplace lifecycle: (mkplc, <action>, merchant_id)
+env.events().publish(
+    (symbol_short!("mkplc"), symbol_short!("reg"), merchant_id),
+    MerchantRegisteredEvent { merchant_id, owner, name },
 );
 ```
+
+The id topic's type matches the event's own id field: escrow events use the
+`u64` `escrow_id`, except `metadata` and `cancelled` which route by the
+`BytesN<32>` order id (their `escrow_id` field is the order id); marketplace
+merchant events use the `u64` `merchant_id`. Contract-wide events with no single
+entity to route by — admin transfer, pause, fee distribution, liquidity-pool
+funding/withdrawal — keep the two-topic `(contract, action)` form.
 
 ## State Management
 

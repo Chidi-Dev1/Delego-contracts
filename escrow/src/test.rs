@@ -1108,7 +1108,7 @@ mod test {
         let mut found = false;
         for event in events.iter() {
             let (contract, topics, value) = event;
-            if contract != contract_id || topics.len() != 2 {
+            if contract != contract_id || topics.len() != 3 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -1148,7 +1148,7 @@ mod test {
 
         for event in env.events().all().iter() {
             let (contract, topics, _value) = event;
-            if contract != contract_id || topics.len() != 2 {
+            if contract != contract_id || topics.len() != 3 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -1192,7 +1192,7 @@ mod test {
 
         for event in env.events().all().iter() {
             let (contract, topics, _value) = event;
-            if contract != contract_id || topics.len() != 2 {
+            if contract != contract_id || topics.len() != 3 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -1242,7 +1242,7 @@ mod test {
         let mut found = false;
         for event in events.iter() {
             let (c_id, topics, value) = event;
-            if c_id != contract_id || topics.len() != 2 {
+            if c_id != contract_id || topics.len() != 3 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -2025,7 +2025,7 @@ mod test {
         let mut found = false;
         for event in events.iter() {
             let (c_id, topics, value) = event;
-            if c_id != contract_id || topics.len() != 2 {
+            if c_id != contract_id || topics.len() != 3 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -2056,7 +2056,7 @@ mod test {
         let mut found = false;
         for event in events.iter() {
             let (c_id, topics, value) = event;
-            if c_id != contract_id || topics.len() != 2 {
+            if c_id != contract_id || topics.len() != 3 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -2091,7 +2091,7 @@ mod test {
         let mut last_evt: Option<crate::DisputeVotedEvent> = None;
         for event in events.iter() {
             let (c_id, topics, value) = event;
-            if c_id != contract_id || topics.len() != 2 {
+            if c_id != contract_id || topics.len() != 3 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -2119,7 +2119,7 @@ mod test {
         let mut count = 0u32;
         for event in env.events().all().iter() {
             let (c_id, topics, _value) = event;
-            if c_id != contract_id || topics.len() != 2 {
+            if c_id != contract_id || topics.len() != 3 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -2138,7 +2138,7 @@ mod test {
         count = 0;
         for event in env.events().all().iter() {
             let (c_id, topics, _value) = event;
-            if c_id != contract_id || topics.len() != 2 {
+            if c_id != contract_id || topics.len() != 3 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -2157,7 +2157,7 @@ mod test {
         count = 0;
         for event in env.events().all().iter() {
             let (c_id, topics, _value) = event;
-            if c_id != contract_id || topics.len() != 2 {
+            if c_id != contract_id || topics.len() != 3 {
                 continue;
             }
             let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -2876,4 +2876,42 @@ mod test {
          let valid_record = client.get_escrow(&valid_escrow_id);
          assert_eq!(valid_record.status, crate::EscrowStatus::Created);
      }
+    // ─── Issue #142: entity id carried in event topics ───────────────────────
+    /// The `released` event carries the escrow id as its third topic so
+    /// indexers can subscribe by escrow without deserializing the event body.
+    fn test_released_event_carries_escrow_id_topic() {
+        let (client, admin, contract_id) = setup_client(&env);
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10_000i128);
+        client.add_token(&admin, &token);
+        let order_id = BytesN::from_array(&env, &[142u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
+        );
+        client.release(&escrow_id, &buyer, &seller);
+        let mut found = false;
+        for event in env.events().all().iter() {
+            let (c_id, topics, _value) = event;
+            if c_id != contract_id || topics.len() != 3 {
+                continue;
+            }
+            let t0: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let t1: soroban_sdk::Symbol = topics.get(1).unwrap().try_into_val(&env).unwrap();
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("released") {
+                let t2: u64 = topics.get(2).unwrap().try_into_val(&env).unwrap();
+                assert_eq!(t2, escrow_id, "released topic must carry the escrow id");
+                found = true;
+        assert!(found, "released event with escrow_id topic not found");
+    /// The `created` event (emitted by `deposit`) carries the escrow id topic.
+    fn test_created_event_carries_escrow_id_topic() {
+        let order_id = BytesN::from_array(&env, &[7u8; 32]);
+            if t0 == symbol_short!("escrow") && t1 == symbol_short!("created") {
+                assert_eq!(t2, escrow_id, "created topic must carry the escrow id");
+        assert!(found, "created event with escrow_id topic not found");
 }
