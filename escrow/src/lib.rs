@@ -1233,7 +1233,7 @@ impl EscrowContract {
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
             let payout = Self::compute_payout(&env, record.amount)?;
-            Self::distribute_fee(&env, &token_client, record.amount)?;
+            Self::distribute_fee(&env, &token_client, payout.fee)?;
             token_client.transfer(
                 &env.current_contract_address(),
                 &record.seller,
@@ -1459,18 +1459,17 @@ impl EscrowContract {
     fn distribute_fee(
         env: &Env,
         token_client: &soroban_sdk::token::Client,
-        amount: i128,
-    ) -> Result<i128, EscrowError> {
+        total_fee: i128,
+    ) -> Result<(), EscrowError> {
+        if total_fee == 0 {
+            return Ok(());
+        }
+
         let shares: soroban_sdk::Vec<TreasuryShare> = env
             .storage()
             .instance()
             .get(&DataKey::FeeDistribution)
             .unwrap_or_else(|| soroban_sdk::Vec::new(env));
-
-        let total_fee = Self::compute_fee_amount(env, amount)?;
-        if total_fee == 0 {
-            return Ok(0);
-        }
 
         if shares.is_empty() {
             let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
@@ -1480,15 +1479,39 @@ impl EscrowContract {
                 &total_fee,
             );
         } else {
+            let mut total_bps: i128 = 0;
             for share in shares.iter() {
-                let bps = share.bps as i128;
-                let fee = (amount / 10_000i128) * bps + ((amount % 10_000i128) * bps) / 10_000i128;
-                if fee > 0 {
-                    token_client.transfer(&env.current_contract_address(), &share.treasury, &fee);
+                total_bps += share.bps as i128;
+            }
+
+            let mut distributed: i128 = 0;
+            let last_idx = shares.len() - 1;
+
+            for (i, share) in shares.iter().enumerate() {
+                if i as u32 == last_idx {
+                    let remaining = total_fee - distributed;
+                    if remaining > 0 {
+                        token_client.transfer(
+                            &env.current_contract_address(),
+                            &share.treasury,
+                            &remaining,
+                        );
+                    }
+                } else {
+                    let bps = share.bps as i128;
+                    let fee = (total_fee * bps) / total_bps;
+                    if fee > 0 {
+                        token_client.transfer(
+                            &env.current_contract_address(),
+                            &share.treasury,
+                            &fee,
+                        );
+                        distributed += fee;
+                    }
                 }
             }
         }
-        Ok(total_fee)
+        Ok(())
     }
 
     /// Computes the total release fee (in tokens) for `amount`, splitting it
@@ -2388,7 +2411,7 @@ impl EscrowContract {
         let token_client = soroban_sdk::token::Client::new(env, &record.token);
 
         let payout = Self::compute_payout(env, release_amount)?;
-        Self::distribute_fee(env, &token_client, release_amount)?;
+        Self::distribute_fee(env, &token_client, payout.fee)?;
         token_client.transfer(
             &env.current_contract_address(),
             &record.seller,
@@ -2746,7 +2769,7 @@ impl EscrowContract {
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
             let payout = Self::compute_payout(&env, record.amount)?;
-            Self::distribute_fee(&env, &token_client, record.amount)?;
+            Self::distribute_fee(&env, &token_client, payout.fee)?;
             token_client.transfer(
                 &env.current_contract_address(),
                 &record.seller,
@@ -3575,26 +3598,22 @@ impl EscrowContract {
             return Err(EscrowError::InsufficientEscrowBalance);
         }
 
-        let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
-        let fee_bps = fee_config.fee_bps as i128;
 
         let mut total_fee: i128 = 0;
         let mut total_released: i128 = 0;
 
         for (recipient, amount) in shares.iter() {
-            let fee =
-                (amount / 10_000i128) * fee_bps + ((amount % 10_000i128) * fee_bps) / 10_000i128;
+            let fee = Self::compute_fee_amount(&env, amount)?;
             let net = amount - fee;
 
-            if fee > 0 {
-                token_client.transfer(&env.current_contract_address(), &fee_config.treasury, &fee);
-            }
             token_client.transfer(&env.current_contract_address(), &recipient, &net);
 
             total_fee += fee;
             total_released += amount;
         }
+
+        Self::distribute_fee(&env, &token_client, total_fee)?;
 
         record.released_amount += total_released;
         let new_remaining = record.amount - record.released_amount;

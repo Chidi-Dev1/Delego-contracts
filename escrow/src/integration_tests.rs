@@ -2376,4 +2376,34 @@ fn test_upgrade_with_admin_handover_preserves_state_and_emits_event() {
         record_before, record_after,
         "escrow record must survive the upgrade"
     );
+fn test_split_release_multi_treasury() {
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    // Setup multi-treasury
+    let treasury1 = Address::generate(&t.env);
+    let treasury2 = Address::generate(&t.env);
+    let mut shares = soroban_sdk::Vec::new(&t.env);
+    shares.push_back(crate::TreasuryShare { treasury: treasury1.clone(), bps: 200 }); // 2%
+    shares.push_back(crate::TreasuryShare { treasury: treasury2.clone(), bps: 300 }); // 3%
+    assert!(escrow_client.set_fee_distribution(&t.admin, &shares));
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+    let recipient1 = Address::generate(&t.env);
+    let recipient2 = Address::generate(&t.env);
+    let mut release_shares = soroban_sdk::Vec::new(&t.env);
+    release_shares.push_back((recipient1.clone(), 4000));
+    release_shares.push_back((recipient2.clone(), 6000));
+    // Release shares
+    assert!(escrow_client.split_release(&escrow_id, &t.buyer, &release_shares));
+    // Fees: 
+    // total base amount = 10000
+    // share1 amount = 4000
+    // fee1 = 4000 * 500 / 10000 = 200. Net = 3800.
+    // share2 amount = 6000
+    // fee2 = 6000 * 500 / 10000 = 300. Net = 5700.
+    // Total fee = 500.
+    // treasury1 = 500 * 200 / 500 = 200
+    // treasury2 = 500 * 300 / 500 = 300
+    assert_eq!(token_client.balance(&recipient1), 3800);
+    assert_eq!(token_client.balance(&recipient2), 5700);
+    assert_eq!(token_client.balance(&treasury1), 200);
+    assert_eq!(token_client.balance(&treasury2), 300);
 }
