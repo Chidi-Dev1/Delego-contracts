@@ -3,6 +3,8 @@ use crate::{
     MarketplaceError, MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
     DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantStatus,
     RegisterParams, Verifier,
+    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantCursor,
+    MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -36,6 +38,20 @@ impl<'a> TestFixture<'a> {
             _contract_id: contract_id,
         }
     }
+}
+
+fn store_name(env: &Env, i: u32) -> String {
+    let mut buf = [0u8; 9];
+    buf[0] = b'S';
+    buf[1] = b't';
+    buf[2] = b'o';
+    buf[3] = b'r';
+    buf[4] = b'e';
+    buf[5] = b'0' + ((i / 1000) % 10) as u8;
+    buf[6] = b'0' + ((i / 100) % 10) as u8;
+    buf[7] = b'0' + ((i / 10) % 10) as u8;
+    buf[8] = b'0' + (i % 10) as u8;
+    String::from_str(env, core::str::from_utf8(&buf).unwrap())
 }
 
 #[test]
@@ -1424,4 +1440,167 @@ fn test_version_matches_cargo_toml() {
     let v = client.version();
     let expected = env!("CARGO_PKG_VERSION").replace('.', "_");
     assert_eq!(v.semver, soroban_sdk::Symbol::new(&env, &expected));
+fn test_cursor_discovery_pagination() {
+    let f = TestFixture::setup();
+
+    for i in 1..=7 {
+        let owner = Address::generate(&f.env);
+        f.client.register_merchant(
+            &owner,
+            &RegisterParams {
+                name: store_name(&f.env, i),
+                description: String::from_str(&f.env, "Desc"),
+                category: symbol_short!("tech"),
+                image_url: String::from_str(&f.env, "url"),
+                metadata: None,
+                required_verifications: 1,
+            },
+        );
+    }
+    // Page 1: starts at the beginning (after_id = 0)
+    let page1 = f.client.get_merchants_cursor(&MerchantCursor {
+        after_id: 0,
+        status: MerchantStatus::All,
+        limit: 3,
+    });
+    assert_eq!(page1.items.len(), 3);
+    assert_eq!(page1.next_cursor, Some(3));
+    assert_eq!(page1.items.get(0).unwrap().id, 1);
+    assert_eq!(page1.items.get(1).unwrap().id, 2);
+    assert_eq!(page1.items.get(2).unwrap().id, 3);
+    // Page 2: resumes after id 3
+    let page2 = f.client.get_merchants_cursor(&MerchantCursor {
+        after_id: page1.next_cursor.unwrap(),
+    assert_eq!(page2.items.len(), 3);
+    assert_eq!(page2.next_cursor, Some(6));
+    assert_eq!(page2.items.get(0).unwrap().id, 4);
+    assert_eq!(page2.items.get(2).unwrap().id, 6);
+    // Page 3: last item, no further cursor
+    let page3 = f.client.get_merchants_cursor(&MerchantCursor {
+        after_id: page2.next_cursor.unwrap(),
+    assert_eq!(page3.items.len(), 1);
+    assert_eq!(page3.next_cursor, None);
+    assert_eq!(page3.items.get(0).unwrap().id, 7);
+    // Offset entry point exposes the same pivot for callers migrating over.
+    let offset_page = f.client.get_merchants(&0, &2);
+    assert_eq!(offset_page.next_cursor, Some(2));
+}
+#[test]
+fn test_cursor_discovery_by_status() {
+    let owner1 = Address::generate(&f.env);
+    let owner2 = Address::generate(&f.env);
+    let owner3 = Address::generate(&f.env);
+    let owner4 = Address::generate(&f.env);
+    let id1 = f.client.register_merchant(
+        &owner1,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Cursor Store 1"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+    let id2 = f.client.register_merchant(
+        &owner2,
+            name: String::from_str(&f.env, "Cursor Store 2"),
+    let id3 = f.client.register_merchant(
+        &owner3,
+            name: String::from_str(&f.env, "Cursor Store 3"),
+    let id4 = f.client.register_merchant(
+        &owner4,
+            name: String::from_str(&f.env, "Cursor Store 4"),
+    f.client.suspend_merchant(&f.admin, &id2);
+    f.client
+        .close_merchant(&f.admin, &id3, &symbol_short!("test"));
+    // Registered -> id1, id4
+    let registered = f.client.get_merchants_cursor(&MerchantCursor {
+        status: MerchantStatus::Registered,
+        limit: 10,
+    assert_eq!(registered.items.len(), 2);
+    assert_eq!(registered.items.get(0).unwrap().id, id1);
+    assert_eq!(registered.items.get(1).unwrap().id, id4);
+    assert_eq!(registered.next_cursor, None);
+    // Suspended -> id2
+    let suspended = f.client.get_merchants_cursor(&MerchantCursor {
+        status: MerchantStatus::Suspended,
+    assert_eq!(suspended.items.len(), 1);
+    assert_eq!(suspended.items.get(0).unwrap().id, id2);
+    assert_eq!(
+        suspended.items.get(0).unwrap().status,
+        MerchantStatus::Suspended
+    // Closed -> id3
+    let closed = f.client.get_merchants_cursor(&MerchantCursor {
+        status: MerchantStatus::Closed,
+    assert_eq!(closed.items.len(), 1);
+    assert_eq!(closed.items.get(0).unwrap().id, id3);
+    assert_eq!(closed.items.get(0).unwrap().status, MerchantStatus::Closed);
+    // All -> every merchant
+    let all = f.client.get_merchants_cursor(&MerchantCursor {
+    assert_eq!(all.items.len(), 4);
+fn test_cursor_discovery_by_category() {
+    for i in 1..=5 {
+        let category = if i <= 3 {
+            symbol_short!("tech")
+        } else {
+            symbol_short!("books")
+        };
+                category,
+    // tech category -> ids 1,2,3
+    let page1 = f
+        .client
+        .get_merchants_by_category_cursor(&symbol_short!("tech"), &0, &2);
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.next_cursor, Some(2));
+    let page2 = f.client.get_merchants_by_category_cursor(
+        &symbol_short!("tech"),
+        &page1.next_cursor.unwrap(),
+        &2,
+    assert_eq!(page2.items.len(), 1);
+    assert_eq!(page2.items.get(0).unwrap().id, 3);
+    assert_eq!(page2.next_cursor, None);
+    // books category -> ids 4,5
+    let books = f
+        .get_merchants_by_category_cursor(&symbol_short!("books"), &0, &10);
+    assert_eq!(books.items.len(), 2);
+    assert_eq!(books.items.get(0).unwrap().id, 4);
+    assert_eq!(books.items.get(1).unwrap().id, 5);
+    assert_eq!(books.next_cursor, None);
+    // Unknown category -> empty page
+    let unknown = f
+        .get_merchants_by_category_cursor(&symbol_short!("nope"), &0, &10);
+    assert_eq!(unknown.items.len(), 0);
+    assert_eq!(unknown.next_cursor, None);
+fn test_cursor_deep_pagination() {
+    // 100 merchants so deep pages are well past the start of the registry.
+    for i in 1..=100 {
+    // A deep page (after_id = 50) must return exactly the next `limit` records.
+    let deep = f.client.get_merchants_cursor(&MerchantCursor {
+        after_id: 50,
+    assert_eq!(deep.items.len(), 10);
+    assert_eq!(deep.items.get(0).unwrap().id, 51);
+    assert_eq!(deep.items.get(9).unwrap().id, 60);
+    assert_eq!(deep.next_cursor, Some(60));
+    // Walk the entire registry page by page and verify contiguous, gap-free,
+    // duplicate-free coverage of all ids — i.e. deep pagination stays correct.
+    let mut after_id = 0u64;
+    let mut expected_id = 1u64;
+    let mut total = 0u32;
+    loop {
+        let page = f.client.get_merchants_cursor(&MerchantCursor {
+            after_id,
+            status: MerchantStatus::All,
+            limit: 10,
+        });
+        assert!(page.items.len() <= 10);
+        for item in page.items.iter() {
+            assert_eq!(item.id, expected_id);
+            expected_id += 1;
+            total += 1;
+        }
+        match page.next_cursor {
+            Some(c) => after_id = c,
+            None => break,
+    assert_eq!(total, 100);
 }

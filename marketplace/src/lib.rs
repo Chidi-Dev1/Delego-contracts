@@ -24,6 +24,7 @@ pub enum MerchantStatus {
     Verified = 1,   // Passed verification
     Suspended = 2,  // Temporarily disabled (admin action / review)
     Closed = 3,     // Permanently removed
+    All = 4,        // Filter sentinel for cursor discovery (matches every status)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +63,19 @@ pub enum ReputationResolution {
     NotConfigured,
     Available(u32, u64),
     CallFailed,
+pub struct DiscoveryPage {
+    pub items: Vec<MerchantView>,
+    pub total: u32,
+    pub next_offset: Option<u32>,
+    pub next_cursor: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct MerchantCursor {
+    pub after_id: u64,
+    pub status: MerchantStatus,
+    pub limit: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -960,15 +974,21 @@ impl MarketplaceContract {
         status_filter: Option<MerchantStatus>,
     ) -> Result<DiscoveryPage, MarketplaceError> {
         let limit = limit.min(MAX_PAGE_LIMIT);
-        let merchant_ids: Vec<u64> = env
+
+        // Probe id-scoped `DataKey::Merchant(u64)` entries directly instead of
+        // deserializing the whole `MerchantIds` index (issue #120). Merchant ids
+        // are assigned monotonically from `NextMerchantId`, so the id space is
+        // contiguous and each id in `1..NextMerchantId` maps to a record.
+        let next_merchant_id: u64 = env
             .storage()
-            .persistent()
-            .get(&DataKey::MerchantIds)
-            .unwrap_or_else(|| Vec::new(&env));
+            .instance()
+            .get(&DataKey::NextMerchantId)
+            .unwrap_or(1);
 
         // Filter merchants by status if provided
         let mut filtered_ids = Vec::new(&env);
-        for id in merchant_ids.iter() {
+        let mut id = 1u64;
+        while id < next_merchant_id {
             if let Ok(merchant) = Self::get_merchant(env.clone(), id) {
                 if let Some(status) = status_filter {
                     if merchant.status == status {
@@ -979,6 +999,7 @@ impl MarketplaceContract {
                     filtered_ids.push_back(id);
                 }
             }
+            id += 1;
         }
 
         let total = filtered_ids.len();
@@ -987,6 +1008,7 @@ impl MarketplaceContract {
                 items: Vec::new(&env),
                 total,
                 next_offset: None,
+                next_cursor: None,
             });
         }
 
@@ -1001,11 +1023,18 @@ impl MarketplaceContract {
         }
 
         let next_offset = if end < total { Some(end) } else { None };
+        // Expose the last returned id so callers can pivot to cursor pagination.
+        let next_cursor = if end < total {
+            Some(filtered_ids.get(end.saturating_sub(1)).unwrap())
+        } else {
+            None
+        };
 
         Ok(DiscoveryPage {
             items,
             total,
             next_offset,
+            next_cursor,
         })
     }
 
@@ -1065,6 +1094,7 @@ impl MarketplaceContract {
                 items: Vec::new(&env),
                 total,
                 next_offset: None,
+                next_cursor: None,
             });
         }
 
@@ -1079,11 +1109,112 @@ impl MarketplaceContract {
         }
 
         let next_offset = if end < total { Some(end) } else { None };
+        // Expose the last returned id so callers can pivot to cursor pagination.
+        let next_cursor = if end < total {
+            Some(filtered_ids.get(end.saturating_sub(1)).unwrap())
+        } else {
+            None
+        };
 
         Ok(DiscoveryPage {
             items,
             total,
             next_offset,
+            next_cursor,
+        })
+    }
+
+    pub fn get_merchants_cursor(
+        env: Env,
+        cursor: MerchantCursor,
+    ) -> Result<DiscoveryPage, MarketplaceError> {
+        let limit = cursor.limit.min(MAX_PAGE_LIMIT);
+        let status_filter = cursor.status;
+
+        // Iterate id-scoped `DataKey::Merchant(u64)` entries from `after_id`
+        // without deserializing the whole `MerchantIds` index (issue #120). The
+        // loop reads at most `limit` merchant views, so cost is bounded by the
+        // page size (plus cheap key probes for skipped ids), not by the registry
+        // size, and deep pages never pay for the full index.
+        let next_merchant_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextMerchantId)
+            .unwrap_or(1);
+
+        let mut items = Vec::new(&env);
+        let mut last_id = cursor.after_id;
+        let mut id = cursor.after_id.saturating_add(1);
+
+        while items.len() < limit && id < next_merchant_id {
+            if env.storage().persistent().has(&DataKey::Merchant(id)) {
+                let merchant = Self::get_merchant(env.clone(), id)?;
+                let matches =
+                    status_filter == MerchantStatus::All || merchant.status == status_filter;
+                if matches {
+                    let view = Self::get_merchant_view(env.clone(), id)?;
+                    items.push_back(view);
+                    last_id = id;
+                }
+            }
+            id += 1;
+        }
+
+        let next_cursor = if !items.is_empty() && id < next_merchant_id {
+            Some(last_id)
+        } else {
+            None
+        };
+
+        Ok(DiscoveryPage {
+            items,
+            total: 0,
+            next_offset: None,
+            next_cursor,
+        })
+    }
+
+    pub fn get_merchants_by_category_cursor(
+        env: Env,
+        category: Symbol,
+        after_id: u64,
+        limit: u32,
+    ) -> Result<DiscoveryPage, MarketplaceError> {
+        let limit = limit.min(MAX_PAGE_LIMIT);
+
+        // Category membership is already scoped by `CategoryIndex(category)`, so
+        // page that id list from `after_id` without scanning the global registry.
+        let cat_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CategoryIndex(category))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut items = Vec::new(&env);
+        let mut last_id = after_id;
+        let n = cat_ids.len();
+
+        // Skip ids already seen by the caller (after_id is exclusive).
+        let mut i = 0u32;
+        while i < n && cat_ids.get(i).unwrap() <= after_id {
+            i += 1;
+        }
+
+        while i < n && items.len() < limit {
+            let id = cat_ids.get(i).unwrap();
+            let view = Self::get_merchant_view(env.clone(), id)?;
+            items.push_back(view);
+            last_id = id;
+            i += 1;
+        }
+
+        let next_cursor = if i < n { Some(last_id) } else { None };
+
+        Ok(DiscoveryPage {
+            items,
+            total: 0,
+            next_offset: None,
+            next_cursor,
         })
     }
 
