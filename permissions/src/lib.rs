@@ -91,6 +91,11 @@ pub enum PermissionError {
     /// A multi-owner spend accumulation would overflow or exceed the
     /// permission's total allowance
     ExceedsAllowance = 411,
+    ExceedsAllowance = 410,
+    /// A grant's `expires_at_ledger = ledger_sequence + ttl_ledgers`
+    /// computation would overflow `u32`, so no valid expiry ledger can be
+    /// represented. Returned instead of an arithmetic overflow panic.
+    InvalidExpiry = 411,
     /// Admin-gated call made before `set_admin` has ever been called
     NotInitialized = 500,
 }
@@ -725,6 +730,7 @@ impl PermissionsContract {
         }
 
         let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
+        let expires_at_ledger = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
 
         let user_perms_key = DataKey::UserPermissions(owner.clone());
         let mut delegates: Vec<Address> = env
@@ -867,7 +873,7 @@ impl PermissionsContract {
             return Err(PermissionError::ExceedsParentLimit);
         }
 
-        let requested_expiry = env.ledger().sequence() + ttl_ledgers;
+        let requested_expiry = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
         let expires_at_ledger = requested_expiry.min(parent_record.expires_at_ledger);
 
         let record = PermissionRecord {
@@ -1234,6 +1240,15 @@ impl PermissionsContract {
             return Err(PermissionError::Unauthorized);
         }
         Ok(stored_admin)
+    }
+
+    /// Computes an absolute expiry ledger as `current_sequence + ttl_ledgers`,
+    /// returning [`PermissionError::InvalidExpiry`] instead of overflow-panicking
+    /// when `ttl_ledgers` is large enough to push the sum past `u32::MAX`.
+    fn grant_expiry_ledger(env: &Env, ttl_ledgers: u32) -> Result<u32, PermissionError> {
+        ttl_ledgers
+            .checked_add(env.ledger().sequence())
+            .ok_or(PermissionError::InvalidExpiry)
     }
 
     /// Validates the merchant whitelist:
@@ -1727,7 +1742,7 @@ impl PermissionsContract {
         }
 
         let primary_owner = unique_owners.get(0).unwrap();
-        let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
+        let expires_at_ledger = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
 
         let record = MultiOwnerPermission {
             owners: unique_owners.clone(),

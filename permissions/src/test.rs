@@ -2742,5 +2742,32 @@ mod test {
         }
         assert!(found_new);
         assert!(!found_old);
+    // --- grant expiry overflow (issue #52) -------------------------------------
+    fn test_grant_expiry_at_u32_max_boundary_succeeds() {
+        let delegate = Address::generate(&env);
+        let merchants = Vec::<Address>::new(&env);
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1_000;
+        });
+        // ttl_ledgers that lands the expiry exactly on u32::MAX must still succeed.
+        let ttl = u32::MAX - 1_000;
+        assert_eq!(
+            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &ttl),
+            Ok(Ok(()))
+        );
+            client.get_permission(&owner, &delegate).expires_at_ledger,
+            u32::MAX
+    }
+    fn test_grant_expiry_overflow_returns_typed_error() {
+        // Just past the boundary: sequence + ttl == u32::MAX + 1.
+        // Must return a typed error instead of overflow-panicking.
+        let ttl = u32::MAX - 999;
+            Err(Ok(PermissionError::InvalidExpiry))
+        // Extreme ttl is handled the same way.
+            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &u32::MAX),
+        // A subsequent in-range grant for the same pair still succeeds,
+        // confirming the rejected calls left no half-written state.
+            client.try_grant(&owner, &delegate, &1000, &100, &merchants, &10_000),
+            11_000
     }
 }
