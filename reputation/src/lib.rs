@@ -210,6 +210,12 @@ mod error_code_allocation {
     /// the generic entity-not-found case.
     /// resolve_flag called with a reporter that has no flag on this entity
     /// (someone else's flag cannot be resolved through this reporter).
+    /// `resolve_flag` was asked to clear a flag for an entity that has no
+    /// active (unresolved) flags at all — the reporter may never have
+    /// flagged, or all of its flags were already resolved.
+    /// `resolve_flag` was asked to clear a flag for a reporter that is not
+    /// the source of the entity's (still active) flag — there is an active
+    /// flag, but it belongs to a different reporter.
 }
 
 #[contracttype]
@@ -859,6 +865,18 @@ impl ReputationContract {
         };
             .position(|f| f.reporter == reporter)
             .ok_or(ReputationError::NotFlagReporter)?;
+            .position(|f| f.reporter == reporter && !f.resolved);
+        let Some(idx) = idx else {
+            // Distinguish why there is no active flag to clear for `reporter`
+            // so off-chain tooling can react appropriately.
+            if !flags.iter().any(|f| !f.resolved) || flags.iter().any(|f| f.reporter == reporter) {
+                // Nothing active on the entity at all, or `reporter`'s own
+                // flags are all already resolved.
+                return Err(ReputationError::NoActiveFlag);
+            }
+            // Some other reporter's flag is active; `reporter` has never
+            // flagged this entity.
+            return Err(ReputationError::NotFlagReporter);
         let mut flag = flags.get(idx as u32).unwrap();
         if flag.resolved {
             return Err(ReputationError::NoActiveFlag);
