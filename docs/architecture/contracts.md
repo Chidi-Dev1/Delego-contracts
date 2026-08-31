@@ -449,6 +449,20 @@ struct ContractInfo {
 
 ## Security Considerations
 
+### Error Code Allocation
+
+Cross-contract bridges surface numeric `u32` error codes from different contracts. To keep unified error mapping unambiguous, each contract's error enum owns a disjoint numeric range. The allocation table below is normative and is enforced by a repo-level unit test.
+
+| Contract | Error enum | Allocated numeric range |
+|----------|------------|-------------------------|
+| Escrow | `EscrowError` | `1000..=1999` |
+| Permissions | `PermissionError` | `2000..=2999` |
+| Delegation Registry | `DelegationError` | `3000..=3999` |
+| Reputation | `ReputationError` | `4000..=4999` |
+| Marketplace | `MarketplaceError` | `5000..=5999` |
+
+Within a contract, error discriminants must stay inside the allocated range. New error codes require updating the contract enum; if a range is exhausted, extend the allocation table before adding another range.
+
 ### Access Control
 
 Contracts implement strict access control:

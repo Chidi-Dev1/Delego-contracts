@@ -160,6 +160,17 @@ impl From<MerchantValidationError> for MarketplaceError {
     }
 }
 
+/// Cross-contract error code allocation.
+///
+/// To keep bridge error mapping unambiguous, each contract owns a disjoint
+/// numeric range. The Marketplace contract must stay within its range:
+/// | Contract            | Error code range |
+/// |---------------------|------------------|
+/// | `PermissionError`   | 1..=999          |
+/// | `EscrowError`       | 1000..=1999      |
+/// | `ReputationError`   | 2000..=2999      |
+/// | `DelegationError`   | 3000..=3999      |
+/// | `MarketplaceError`  | 4000..=4999      |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -181,6 +192,22 @@ pub enum MarketplaceError {
     InvalidParam = 15,
     NoPendingAdmin = 16,
     VerificationCountOverflow = 16,
+    AlreadyInitialized = 4001,
+    NotInitialized = 4002,
+    Unauthorized = 4003,
+    MerchantNotFound = 4004,
+    AlreadyVerified = 4005,
+    InvalidCommissionBps = 4006,
+    DuplicateMerchantName = 4007,
+    MerchantFrozen = 4008,
+    MerchantClosed = 4009,
+    VerifierAlreadyExists = 4010,
+    VerifierNotFound = 4011,
+    InsufficientVerifications = 4012,
+    MetadataLockActive = 4013,
+    InvalidCategory = 4014,
+    InvalidParam = 4015,
+    NoPendingAdmin = 4016,
 }
 
 // --- Events ---
@@ -2143,6 +2170,62 @@ mod overflow_tests {
     #[test]
     fn verification_count_overflow_error_payload() {
         assert_eq!(MarketplaceError::VerificationCountOverflow as u32, 16);
+mod error_code_uniqueness_tests {
+    const PERMISSION_ERROR_RANGE: (u32, u32) = (1, 999);
+    const ESCROW_ERROR_RANGE: (u32, u32) = (1000, 1999);
+    const REPUTATION_ERROR_RANGE: (u32, u32) = (2000, 2999);
+    const DELEGATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
+    const MARKETPLACE_ERROR_RANGE: (u32, u32) = (4000, 4999);
+    fn marketplace_error_codes() -> [u32; 16] {
+        [
+            MarketplaceError::AlreadyInitialized as u32,
+            MarketplaceError::NotInitialized as u32,
+            MarketplaceError::Unauthorized as u32,
+            MarketplaceError::MerchantNotFound as u32,
+            MarketplaceError::AlreadyVerified as u32,
+            MarketplaceError::InvalidCommissionBps as u32,
+            MarketplaceError::DuplicateMerchantName as u32,
+            MarketplaceError::MerchantFrozen as u32,
+            MarketplaceError::MerchantClosed as u32,
+            MarketplaceError::VerifierAlreadyExists as u32,
+            MarketplaceError::VerifierNotFound as u32,
+            MarketplaceError::InsufficientVerifications as u32,
+            MarketplaceError::MetadataLockActive as u32,
+            MarketplaceError::InvalidCategory as u32,
+            MarketplaceError::InvalidParam as u32,
+            MarketplaceError::NoPendingAdmin as u32,
+        ]
+    fn marketplace_error_codes_are_unique() {
+        let codes = marketplace_error_codes();
+        for (i, code) in codes.iter().enumerate() {
+            for other in codes.iter().skip(i + 1) {
+                assert!(
+                    code != other,
+                    "duplicate error code {} in MarketplaceError",
+                    code
+                );
+            }
+        }
+    fn marketplace_error_codes_are_in_allocated_range() {
+        for code in marketplace_error_codes() {
+            assert!(
+                (MARKETPLACE_ERROR_RANGE.0..=MARKETPLACE_ERROR_RANGE.1).contains(&code),
+                "MarketplaceError code {} outside allocated range",
+                code
+            );
+    fn marketplace_error_codes_do_not_collide_with_other_contracts() {
+        let other_ranges = [
+            PERMISSION_ERROR_RANGE,
+            ESCROW_ERROR_RANGE,
+            REPUTATION_ERROR_RANGE,
+            DELEGATION_ERROR_RANGE,
+        ];
+            for &(start, end) in &other_ranges {
+                    !(start..=end).contains(&code),
+                    "MarketplaceError code {} collides with reserved range {}-{}",
+                    code,
+                    start,
+                    end
     }
 }
 

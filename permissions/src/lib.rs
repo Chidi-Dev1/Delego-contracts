@@ -1,5 +1,24 @@
 //! Delego Permissions Contract
 //! Spending limits, delegated authority, and time-locked allowance decrements
+//!
+//! # Error code allocation
+//!
+//! Numeric error codes are `u32` values surfaced over the bridge, so every
+//! contract must own a disjoint numeric block. The current allocation is:
+//!
+//! | Contract          | Range      |
+//! |-------------------|------------|
+//! | `EscrowError`     | 1000-1999  |
+//! | `PermissionError` | 2000-2999  |
+//! | `ReputationError` | 3000-3999  |
+//! | `DelegationError` | 4000-4999  |
+//! | `MarketplaceError` | 5000-5999 |
+//!
+//! `PermissionError` keeps its historical status-code style by adding the
+//! allocation base (`2000`) to each legacy value (e.g. `ParentNotFound`
+//! moves from `404` to `2404`). The unit tests below enforce that every
+//! `PermissionError` discriminant is inside the contract's range and that
+//! the documented ranges are pairwise disjoint.
 
 // Contract crates compile as no_std for release and wasm builds, but keep std
 // enabled during testing so dev-dependencies and test assertions operate normally.
@@ -47,52 +66,54 @@ pub const MAX_SWEEP_BATCH: u32 = 50;
 #[allow(missing_docs)]
 pub enum PermissionError {
     /// No permission record found for this owner/delegate pair
-    PermissionNotFound = 302,
-    NotFound = 1,
+    PermissionNotFound = 2302,
+    NotFound = 2001,
     /// Permission has expired
-    Expired = 2,
+    Expired = 2002,
     /// Amount exceeds per-transaction limit
-    ExceedsPerTxLimit = 3,
+    ExceedsPerTxLimit = 2003,
     /// Amount exceeds remaining total allowance
-    ExceedsTotalLimit = 4,
+    ExceedsTotalLimit = 2004,
     /// Merchant is not in the allowed merchants list
-    MerchantNotAllowed = 5,
+    MerchantNotAllowed = 2005,
     /// Caller is not authorized (not the owner)
-    Unauthorized = 6,
+    Unauthorized = 2006,
     /// Invalid parameter (zero limit, etc.)
-    InvalidParam = 7,
+    InvalidParam = 2007,
     /// Permission is currently paused
-    PermissionPaused = 8,
+    PermissionPaused = 2008,
     /// Permission is already paused
-    AlreadyPaused = 9,
+    AlreadyPaused = 2009,
     /// Permission is already active
-    AlreadyActive = 10,
+    AlreadyActive = 2010,
     /// New grants are globally paused by admin
-    GrantsPaused = 11,
+    GrantsPaused = 2011,
     /// No relayer signing key registered for this delegate
-    RelayerKeyNotSet = 12,
+    RelayerKeyNotSet = 2012,
     /// Relayer-submitted nonce does not match the delegate's expected next nonce
-    InvalidNonce = 13,
+    InvalidNonce = 2013,
     /// Relayer-submitted signature has expired
     SignatureExpired = 14,
     /// A live permission already exists; use `re_grant` to replace it explicitly (issue #51)
     AlreadyGranted = 15,
+    SignatureExpired = 2014,
+    AlreadyGranted = 2015,
     /// Owner and delegate cannot be the same address
-    SelfDelegationNotAllowed = 401,
+    SelfDelegationNotAllowed = 2401,
     /// Fewer valid owner signatures were provided than the configured threshold
-    InsufficientSignatures = 402,
+    InsufficientSignatures = 2402,
     /// Metadata schema is not in the approved schema registry
-    UnknownSchema = 403,
+    UnknownSchema = 2403,
     /// Referenced parent permission was not found
-    ParentNotFound = 404,
+    ParentNotFound = 2404,
     /// Child limits exceed what the parent permission can back
-    ExceedsParentLimit = 405,
+    ExceedsParentLimit = 2405,
     /// Spend rejected because the velocity (min interval) limit has not elapsed
-    VelocityLimitExceeded = 406,
+    VelocityLimitExceeded = 2406,
     /// sweep_inactive called before admin has configured an inactivity threshold
-    InactivityThresholdNotSet = 407,
+    InactivityThresholdNotSet = 2407,
     /// A pending allowance decrease already exists for this delegation
-    PendingDecreaseExists = 408,
+    PendingDecreaseExists = 2408,
     /// Time-lock on pending allowance decrease has not elapsed yet
     TimeLockActive = 409,
     /// Decrease would drop the allowance limit below what has already been spent
@@ -105,8 +126,97 @@ pub enum PermissionError {
     /// computation would overflow `u32`, so no valid expiry ledger can be
     /// represented. Returned instead of an arithmetic overflow panic.
     InvalidExpiry = 411,
+    TimeLockActive = 2409,
+    LimitBelowSpent = 2410,
+    ExceedsAllowance = 2411,
     /// Admin-gated call made before `set_admin` has ever been called
-    NotInitialized = 500,
+    NotInitialized = 2500,
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::PermissionError;
+
+    const ERROR_CODE_RANGES: &[(&str, u32, u32)] = &[
+        ("EscrowError", 1000, 1999),
+        ("PermissionError", 2000, 2999),
+        ("ReputationError", 3000, 3999),
+        ("DelegationError", 4000, 4999),
+        ("MarketplaceError", 5000, 5999),
+    ];
+
+    const PERMISSION_ERROR_CODES: &[u32] = &[
+        PermissionError::PermissionNotFound as u32,
+        PermissionError::NotFound as u32,
+        PermissionError::Expired as u32,
+        PermissionError::ExceedsPerTxLimit as u32,
+        PermissionError::ExceedsTotalLimit as u32,
+        PermissionError::MerchantNotAllowed as u32,
+        PermissionError::Unauthorized as u32,
+        PermissionError::InvalidParam as u32,
+        PermissionError::PermissionPaused as u32,
+        PermissionError::AlreadyPaused as u32,
+        PermissionError::AlreadyActive as u32,
+        PermissionError::GrantsPaused as u32,
+        PermissionError::RelayerKeyNotSet as u32,
+        PermissionError::InvalidNonce as u32,
+        PermissionError::SignatureExpired as u32,
+        PermissionError::AlreadyGranted as u32,
+        PermissionError::SelfDelegationNotAllowed as u32,
+        PermissionError::InsufficientSignatures as u32,
+        PermissionError::UnknownSchema as u32,
+        PermissionError::ParentNotFound as u32,
+        PermissionError::ExceedsParentLimit as u32,
+        PermissionError::VelocityLimitExceeded as u32,
+        PermissionError::InactivityThresholdNotSet as u32,
+        PermissionError::PendingDecreaseExists as u32,
+        PermissionError::TimeLockActive as u32,
+        PermissionError::LimitBelowSpent as u32,
+        PermissionError::ExceedsAllowance as u32,
+        PermissionError::NotInitialized as u32,
+    ];
+
+    #[test]
+    fn permission_error_codes_are_unique_and_in_reserved_range() {
+        let permission_range = ERROR_CODE_RANGES
+            .iter()
+            .find(|entry| entry.0 == "PermissionError")
+            .expect("PermissionError range must be declared");
+        let (start, end) = (permission_range.1, permission_range.2);
+
+        for (i, code) in PERMISSION_ERROR_CODES.iter().enumerate() {
+            assert!(
+                (start..=end).contains(code),
+                "PermissionError code {} is outside the allocated range {}-{}",
+                code,
+                start,
+                end
+            );
+            assert!(
+                !PERMISSION_ERROR_CODES[..i].contains(code),
+                "duplicate PermissionError code {}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn error_code_ranges_are_disjoint() {
+        for (i, &(name_i, start_i, end_i)) in ERROR_CODE_RANGES.iter().enumerate() {
+            for &(name_j, start_j, end_j) in ERROR_CODE_RANGES.iter().skip(i + 1) {
+                assert!(
+                    end_i < start_j || end_j < start_i,
+                    "error code ranges overlap: {} ({}-{}) and {} ({}-{})",
+                    name_i,
+                    start_i,
+                    end_i,
+                    name_j,
+                    start_j,
+                    end_j
+                );
+            }
+        }
+    }
 }
 
 #[contracttype]
@@ -410,6 +520,7 @@ pub struct RelayerKeyChangedEvent {
     pub old_key: Option<BytesN<32>>,
     pub new_key: BytesN<32>,
 }
+
 /// Emitted by `renew_permission` when a renewal's requested extension would
 /// overflow `u32` and is instead capped at `u32::MAX`, so callers get an
 /// explicit signal rather than a silently saturated expiry.
@@ -420,6 +531,7 @@ pub struct PermissionExpiryCappedEvent {
     pub delegate: Address,
     pub capped_at: u32,
 }
+
 /// Emitted by `propose_admin` when the current admin proposes a successor
 /// as part of the two-step admin transfer.
 #[contracttype]
@@ -767,6 +879,17 @@ impl PermissionsContract {
 
         let expires_at_ledger = env.ledger().sequence() + ttl_ledgers;
         let expires_at_ledger = Self::grant_expiry_ledger(&env, ttl_ledgers)?;
+
+        let user_perms_key = DataKey::UserPermissions(owner.clone());
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&user_perms_key)
+            .unwrap_or(Vec::new(&env));
+        if !delegates.contains(&delegate) {
+            delegates.push_back(delegate.clone());
+            env.storage().persistent().set(&user_perms_key, &delegates);
+        }
 
         let user_perms_key = DataKey::UserPermissions(owner.clone());
         let mut delegates: Vec<Address> = env
@@ -1473,6 +1596,7 @@ impl PermissionsContract {
 
         let _velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
 
+        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
         let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
         // Emit after successful spend only (issue #99).

@@ -114,6 +114,24 @@ pub struct ContractVersion {
     pub semver: Symbol,
 }
 
+/// # Cross-contract error-code allocation
+///
+/// Soroban error codes surface as raw `u32` values over a bridge, so each
+/// contract must keep its numeric error space disjoint. Every contract error
+/// enum uses a 16-bit contract prefix plus a contract-local code:
+///
+/// | Contract | Error enum | Base |
+/// |----------|------------|------------|
+/// | escrow | `EscrowError` | `0x0001_0000` |
+/// | permissions | `PermissionError` | `0x0002_0000` |
+/// | reputation | `ReputationError` | `0x0003_0000` |
+/// | delegation_registry | `DelegationError` | `0x0004_0000` |
+/// | marketplace | `MarketplaceError` | `0x0005_0000` |
+///
+/// A numeric code is `base + local_code`; the high 16 bits identify the
+/// originating contract and the low 16 bits identify the variant inside that
+/// contract. Keep this table in sync with the contract sources and keep the
+/// allocation tests green.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -123,15 +141,15 @@ pub enum ReputationError {
     /// `__constructor` (see [`ReputationContract::__constructor`]), which
     /// the host guarantees can run at most once, atomically with
     /// deployment — there is no second call for this to guard against.
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    Unauthorized = 3,
-    EntityNotFound = 4,
+    AlreadyInitialized = 0x0003_0001,
+    NotInitialized = 0x0003_0002,
+    Unauthorized = 0x0003_0003,
+    EntityNotFound = 0x0003_0004,
     /// Same escrow_id already rated.
-    DuplicateRating = 5,
+    DuplicateRating = 0x0003_0005,
     /// Rating out of range.
-    InvalidRating = 6,
-    EntityFrozen = 7,
+    InvalidRating = 0x0003_0006,
+    EntityFrozen = 0x0003_0007,
     /// Same reporter already flagged.
     AlreadyFlagged = 8,
     NoActiveFlag = 10,
@@ -145,6 +163,48 @@ pub enum ReputationError {
     /// Entity has no flags on file.
     /// Reporter is not the creator of an active flag.
     NotFlagReporter = 11,
+    AlreadyFlagged = 0x0003_0008,
+    InvalidParam = 0x0003_0009,
+}
+
+#[cfg(test)]
+mod error_code_allocation {
+    use super::*;
+    const CONTRACT_SPACES: &[(&str, u32)] = &[
+        ("EscrowError", 0x0001_0000),
+        ("PermissionError", 0x0002_0000),
+        ("ReputationError", 0x0003_0000),
+        ("DelegationError", 0x0004_0000),
+        ("MarketplaceError", 0x0005_0000),
+    ];
+    #[test]
+    fn contract_spaces_are_disjoint() {
+        for (i, &(_, base_a)) in CONTRACT_SPACES.iter().enumerate() {
+            for &(_, base_b) in CONTRACT_SPACES.iter().skip(i + 1) {
+                assert_ne!(base_a, base_b, "contract error-code spaces must be disjoint");
+            }
+        }
+    }
+    fn reputation_error_codes_are_unique_and_in_allocated_space() {
+        let mut codes = [
+            ReputationError::AlreadyInitialized as u32,
+            ReputationError::NotInitialized as u32,
+            ReputationError::Unauthorized as u32,
+            ReputationError::EntityNotFound as u32,
+            ReputationError::DuplicateRating as u32,
+            ReputationError::InvalidRating as u32,
+            ReputationError::EntityFrozen as u32,
+            ReputationError::AlreadyFlagged as u32,
+            ReputationError::InvalidParam as u32,
+        ];
+        for code in codes {
+            assert!(
+                (0x0003_0001..=0x0003_ffff).contains(&code),
+                "ReputationError code {code:#x} escaped its allocated contract space"
+            );
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), 9, "ReputationError codes must be unique");
 }
 
 #[contracttype]

@@ -7,12 +7,16 @@ use delego_marketplace::{
 use delego_escrow::{
     BatchDepositParams, EscrowConfig, EscrowContract, EscrowContractClient, EscrowStatus,
 };
+use delego_delegation::DelegationError;
+    BatchDepositParams, EscrowContract, EscrowContractClient, EscrowError, EscrowStatus,
+use delego_marketplace::MarketplaceError;
 use delego_permissions::{
     PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
     RelayedSpendMessage,
 };
 use delego_reputation::{
-    ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
+    ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
+    TransactionOutcome,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
@@ -847,4 +851,54 @@ fn test_multi_owner_spend_enforces_quorum() {
 
     let record = perm_client.get_multi_permission(&t.buyer, &t.agent);
     assert_eq!(record.spent, 100);
+}
+
+/// Cross-contract error-code allocation.
+///
+/// The bridge-facing error space is a single numeric `u32` code space. To make
+/// numeric codes unambiguous, every code belongs to at most one contract's
+/// error enum.
+///
+/// | Contract      | Error enum          |
+/// |---------------|---------------------|
+/// | Escrow        | `EscrowError`       |
+/// | Permissions   | `PermissionError`   |
+/// | Reputation    | `ReputationError`   |
+/// | Delegation    | `DelegationError`   |
+/// | Marketplace   | `MarketplaceError`  |
+///
+/// The test below verifies this uniqueness property for all codes accepted by
+/// each contract's `TryFrom<u32>` implementation.
+fn collect_error_codes<T>() -> Vec<u32>
+where
+    T: TryFrom<u32>,
+{
+    (0..=u16::MAX as u32)
+        .filter(|&code| T::try_from(code).is_ok())
+        .collect()
+}
+
+#[test]
+fn test_error_codes_are_unique_across_contracts() {
+    let error_codes = [
+        ("escrow", collect_error_codes::<EscrowError>()),
+        ("permissions", collect_error_codes::<PermissionError>()),
+        ("reputation", collect_error_codes::<ReputationError>()),
+        ("delegation", collect_error_codes::<DelegationError>()),
+        ("marketplace", collect_error_codes::<MarketplaceError>()),
+    ];
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (contract_name, codes) in error_codes {
+        assert!(
+            !codes.is_empty(),
+            "{contract_name} must expose at least one error code"
+        );
+        for code in codes {
+            assert!(
+                seen.insert(code),
+                "error code {code} is shared with another contract"
+            );
+        }
+    }
 }

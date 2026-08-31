@@ -168,6 +168,19 @@ pub enum DataKey {
 }
 
 /// Errors for delegation registry operations.
+/// # Error code allocation
+///
+/// Error codes are surfaced over bridges and must be unique across contracts.
+/// The following ranges are allocated protocol-wide and must not overlap:
+/// | Contract | Reserved codes |
+/// | --- | --- |
+/// | `EscrowError` | 1..=100 |
+/// | `PermissionError` | 101..=200 |
+/// | `ReputationError` | 201..=300 |
+/// | `DelegationError` | 301..=400 |
+/// | `MarketplaceError` | 401..=500 |
+/// `DelegationError` currently occupies the first nine codes in its range.
+/// New variants must use the next unused code within 301..=400.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -190,6 +203,15 @@ pub enum DelegationError {
     SnapshotNotFound = 8,
     InvalidAgentId = 9,
     IdExhausted = 9,
+    NotFound = 301,
+    NotActive = 302,
+    NotPaused = 303,
+    Expired = 304,
+    AlreadyInitialized = 305,
+    InvalidVersion = 306,
+    VersionNotLower = 307,
+    SnapshotNotFound = 308,
+    InvalidAgentId = 309,
 }
 
 /// The delegation registry contract.
@@ -838,3 +860,50 @@ impl DelegationRegistry {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod error_code_uniqueness_tests {
+    use super::DelegationError;
+
+    #[test]
+    fn delegation_error_codes_are_unique_and_allocated() {
+        let codes = [
+            (DelegationError::NotFound, 301u32),
+            (DelegationError::NotActive, 302u32),
+            (DelegationError::NotPaused, 303u32),
+            (DelegationError::Expired, 304u32),
+            (DelegationError::AlreadyInitialized, 305u32),
+            (DelegationError::InvalidVersion, 306u32),
+            (DelegationError::VersionNotLower, 307u32),
+            (DelegationError::SnapshotNotFound, 308u32),
+            (DelegationError::InvalidAgentId, 309u32),
+        ];
+
+        for (variant, expected) in codes {
+            assert_eq!(variant as u32, expected, "numeric code changed");
+        }
+
+        let mut seen = [
+            DelegationError::NotFound as u32,
+            DelegationError::NotActive as u32,
+            DelegationError::NotPaused as u32,
+            DelegationError::Expired as u32,
+            DelegationError::AlreadyInitialized as u32,
+            DelegationError::InvalidVersion as u32,
+            DelegationError::VersionNotLower as u32,
+            DelegationError::SnapshotNotFound as u32,
+            DelegationError::InvalidAgentId as u32,
+        ];
+        seen.sort_unstable();
+        for pair in seen.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate DelegationError code");
+        }
+        for code in seen {
+            assert!(
+                (301..=400).contains(&code),
+                "DelegationError code {} is outside the reserved range",
+                code
+            );
+        }
+    }
+}

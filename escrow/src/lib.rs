@@ -669,6 +669,26 @@ pub enum DataKey {
 ///
 /// New variants MUST use codes in the reserved contiguous range starting at
 /// 400. Do not fill historical gaps or reuse codes from the registry above.
+/// | 400+ | Reserved for new variants | next major |
+/// # Cross-contract allocation
+/// The contract error enums (`EscrowError`, `PermissionError`,
+/// `ReputationError`, `DelegationError`, `MarketplaceError`) share a single
+/// numeric ABI space when errors surface over a bridge.  Each contract owns
+/// a disjoint range; the table below is the canonical allocation and is
+/// checked by `error_code_allocation_tests`.
+/// | Contract | Error enum | Allocated range |
+/// |----------|------------|-----------------|
+/// | escrow | `EscrowError` | 400..=999 |
+/// | permission | `PermissionError` | 1_000..=1_999 |
+/// | reputation | `ReputationError` | 2_000..=2_999 |
+/// | delegation | `DelegationError` | 3_000..=3_999 |
+/// | marketplace | `MarketplaceError` | 4_000..=4_999 |
+/// The 0.x codes in the registry above are frozen legacy codes; they predate
+/// this table. New `EscrowError` variants MUST use `400..=999` (or the 1.0
+/// renumbered range) and MUST NOT use another contract's range.
+/// New variants MUST use codes in the escrow allocation (`400..=999`) and
+/// MUST NOT use another contract's range. Do not fill historical gaps or
+/// reuse codes from the registry above.
 ///
 /// # Renumber plan
 ///
@@ -676,6 +696,10 @@ pub enum DataKey {
 /// release for renumbering `EscrowError` contiguously from 1 to N, removing
 /// gaps and sorting declaration order by code. Until that release, the codes
 /// in the registry above are stable.
+/// release for renumbering `EscrowError` contiguously inside the escrow
+/// allocation range (`400..=999`), removing gaps and sorting declaration
+/// order by code. Until that release, the codes in the registry above are
+/// stable.
 pub enum EscrowError {
     /// Contract already initialized
     AlreadyInitialized = 1,
@@ -2096,6 +2120,8 @@ impl EscrowContract {
 
         if let (Some(hash), Some(sch)) = (order_hash.clone(), schema.clone()) {
             let _metadata = EscrowMetadata {
+        if let (Some(hash), Some(sch)) = (order_hash, schema) {
+            let metadata = EscrowMetadata {
                 order_hash: hash.clone(),
                 schema: sch.clone(),
             };
@@ -2111,6 +2137,7 @@ impl EscrowContract {
 
         // The metadata event is only emitted once both halves are present.
         if let (Some(hash), Some(sch)) = (order_hash.clone(), schema.clone()) {
+        if let (Some(hash), Some(sch)) = (order_hash, schema) {
             env.events().publish(
                 (symbol_short!("escrow"), symbol_short!("metadata")),
                 EscrowMetadataEvent {
@@ -4336,5 +4363,88 @@ mod quorum_cleanup_tests {
         client.resolve_dispute_quorum(&escrow_id, &arbiter1).unwrap();
 
         assert!(!env.storage().persistent().has(&votes_key));
+mod error_code_allocation_tests {
+    const ALLOCATED_RANGES: [(u32, u32); 5] = [
+        (400, 999),
+        (1_000, 1_999),
+        (2_000, 2_999),
+        (3_000, 3_999),
+        (4_000, 4_999),
+    ];
+    fn escrow_error_codes() -> [u32; 40] {
+        [
+            EscrowError::AlreadyInitialized as u32,
+            EscrowError::NotFound as u32,
+            EscrowError::Unauthorized as u32,
+            EscrowError::AlreadyReleased as u32,
+            EscrowError::AlreadyRefunded as u32,
+            EscrowError::InvalidStatus as u32,
+            EscrowError::TimeoutNotReached as u32,
+            EscrowError::NotDisputed as u32,
+            EscrowError::InvalidAmount as u32,
+            EscrowError::TokenNotWhitelisted as u32,
+            EscrowError::InsufficientEscrowBalance as u32,
+            EscrowError::ZeroAmount as u32,
+            EscrowError::NoPendingTransfer as u32,
+            EscrowError::InvalidPendingAdmin as u32,
+            EscrowError::AdminAlreadyExists as u32,
+            EscrowError::InvalidFeeBps as u32,
+            EscrowError::AmountBelowMin as u32,
+            EscrowError::AmountAboveMax as u32,
+            EscrowError::InvalidLimits as u32,
+            EscrowError::NotAnArbiter as u32,
+            EscrowError::AlreadyVoted as u32,
+            EscrowError::InvalidQuorum as u32,
+            EscrowError::QuorumNotReached as u32,
+            EscrowError::QuorumConfigNotSet as u32,
+            EscrowError::ConflictingQuorum as u32,
+            EscrowError::CreationPaused as u32,
+            EscrowError::AlreadyCancelled as u32,
+            EscrowError::AlreadyFunded as u32,
+            EscrowError::InvalidExtension as u32,
+            EscrowError::PoolNotFound as u32,
+            EscrowError::InsufficientPoolBalance as u32,
+            EscrowError::InvalidAddress as u32,
+            EscrowError::InvalidEscrowParticipants as u32,
+            EscrowError::ReleaseConditionNotSet as u32,
+            EscrowError::OracleCallFailed as u32,
+            EscrowError::ConditionNotMet as u32,
+            EscrowError::InvalidYieldConfig as u32,
+            EscrowError::AmountLimitsNotSet as u32,
+            EscrowError::FeeConfigNotSet as u32,
+            EscrowError::InvalidReleaseRecipient as u32,
+        ]
+    fn escrow_error_codes_are_unique() {
+        let mut codes = escrow_error_codes();
+        codes.sort_unstable();
+        for pair in codes.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate EscrowError code: {}", pair[0]);
+        }
+    fn cross_contract_ranges_are_disjoint() {
+        let mut ranges = ALLOCATED_RANGES;
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "overlapping error-code ranges: {}..={} and {}..={}",
+                pair[0].0,
+                pair[0].1,
+                pair[1].0,
+                pair[1].1
+            );
+    fn escrow_error_codes_avoid_other_contract_ranges() {
+        for &code in &escrow_error_codes() {
+            if code >= 400 {
+                assert!(
+                    code <= ALLOCATED_RANGES[0].1,
+                    "EscrowError code {} is outside the escrow allocation",
+                    code
+                );
+            for &(lo, hi) in &ALLOCATED_RANGES[1..] {
+                    !(lo..=hi).contains(&code),
+                    "EscrowError code {} collides with another contract's range {}..={}",
+                    code,
+                    lo,
+                    hi
     }
 }
