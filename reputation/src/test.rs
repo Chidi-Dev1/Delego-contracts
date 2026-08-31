@@ -8,6 +8,7 @@ use crate::{
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger, storage::Persistent},
+    testutils::{storage::Persistent, Address as _, Ledger},
     Address, Env, String,
 };
 
@@ -348,6 +349,48 @@ fn test_record_transaction_allows_lifecycle_update_while_frozen() {
     );
     assert_eq!(res, Err(Ok(ReputationError::EntityFrozen)));
 }
+
+#[test]
+fn test_record_transaction_incremental_recompute_cost() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    // Fill the replay window.
+    for i in 0..SCORE_WINDOW as u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    // A steady-state record should update incrementally and not rescan the
+    // full window. If the old full recompute ran here, the instruction count
+    // would scale linearly with SCORE_WINDOW.
+    let budget = env.budget();
+    budget.reset();
+    let start = budget.get_wasm_instructions();
+    client.record_transaction(
+        &admin,
+        &(SCORE_WINDOW as u64),
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    );
+    let delta = budget.get_wasm_instructions() - start;
+    assert!(
+        delta < 50_000,
+        "record_transaction consumed {} instructions; expected incremental cost below full-window recompute",
+        delta
+    );
+}
+
 
 #[test]
 fn test_record_transaction_extends_ttl_across_churn() {
@@ -999,6 +1042,34 @@ fn test_resolve_flag_no_active_flag() {
     client.resolve_flag(&admin, &reporter, &entity);
 
     // Now try to resolve again - should return NoActiveFlag since the flag is already resolved
+    let res = client.try_resolve_flag(&admin, &reporter, &entity);
+    assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
+}
+
+#[test]
+fn test_resolve_flag_not_flag_reporter() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let other_reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
+    make_transacting_counterparty(&client, &admin, &entity, &other_reporter, 2u64);
+
+    client.flag_entity(&reporter, &entity, &symbol_short!("fraud"), &None);
+
+    let res = client.try_resolve_flag(&admin, &other_reporter, &entity);
+    assert_eq!(res, Err(Ok(ReputationError::NotFlagReporter)));
+}
+
+#[test]
+fn test_resolve_flag_no_active_flag() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    make_transacting_counterparty(&client, &admin, &entity, &reporter, 1u64);
+
     let res = client.try_resolve_flag(&admin, &reporter, &entity);
     assert_eq!(res, Err(Ok(ReputationError::NoActiveFlag)));
 }

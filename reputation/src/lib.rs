@@ -197,6 +197,13 @@ pub struct EntityHistoryPrunedEvent {
     pub entity: Address,
     pub pruned_count: u32,
     pub pruned_by: Address,
+pub struct ScoreAccumulator {
+    pub decay_window_seconds: u64,
+    pub weighted_value_sum: i128,
+    pub weight_sum: i128,
+    pub rating_weighted_sum: i128,
+    pub rating_weight_sum: i128,
+    pub disputed_recent: i128,
 }
 
 #[contracttype]
@@ -214,6 +221,8 @@ pub enum DataKey {
     /// Stored in both directions so the relationship reads symmetrically while
     /// still supporting a directed lookup when needed.
     Transacted(Address, Address),
+    /// Incremental weighted sums used by `record_transaction`'s hot path.
+    ScoreAccumulator(Address),
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -387,13 +396,17 @@ impl ReputationContract {
             .instance()
             .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
-        if existing.is_none() {
+        let history_len_before = if let Some(prior) = &existing {
+            Self::apply_outcome_change_counts(&env, &entity, &prior.outcome, &outcome);
+            None
+        } else {
             let hist_key = DataKey::TransactionHistory(entity.clone());
             let mut history: Vec<u64> = env
                 .storage()
                 .persistent()
                 .get(&hist_key)
                 .unwrap_or_else(|| Vec::new(&env));
+            let len_before = history.len();
             history.push_back(escrow_id);
             env.storage().persistent().set(&hist_key, &history);
             env.storage().persistent().extend_ttl(
@@ -424,11 +437,15 @@ impl ReputationContract {
                 PERSISTENT_BUMP_AMOUNT,
             );
             Self::apply_new_transaction_counts(&env, &entity, &outcome);
-        } else if let Some(prior) = &existing {
-            Self::apply_outcome_change_counts(&env, &entity, &prior.outcome, &outcome);
-        }
+            Some(len_before)
+        };
 
-        let score = Self::recompute_score(&env, &entity)?;
+        // New escrow records slide the window incrementally; in-place
+        // lifecycle updates fall back to the full recompute path.
+        let score = match history_len_before {
+            Some(len_before) => Self::apply_incremental_score_update(&env, &entity, len_before)?,
+            None => Self::recompute_score(&env, &entity)?,
+        };
 
         env.events().publish(
             (symbol_short!("reput"), symbol_short!("tx_rec")),
@@ -1022,6 +1039,157 @@ impl ReputationContract {
         );
     }
 
+    /// Applies the newest record's contribution to the incremental accumulator.
+    fn add_record_contribution(
+        accumulator: &mut ScoreAccumulator,
+        config: &ReputationConfig,
+        record: &TransactionRecord,
+        now: u64,
+    ) {
+        let elapsed = now.saturating_sub(record.recorded_at);
+        let weight = recency_weight_bps(elapsed, config.decay_window_seconds);
+        let value = outcome_value_bps(&record.outcome);
+        accumulator.weighted_value_sum += weight * value;
+        accumulator.weight_sum += weight;
+        if matches!(record.outcome, TransactionOutcome::Disputed) && weight > 0 {
+            accumulator.disputed_recent += 1;
+        }
+        if let Some(rating) = record.rating {
+            accumulator.rating_weighted_sum += weight * (rating as i128);
+            accumulator.rating_weight_sum += weight;
+        }
+    }
+
+    /// Removes an evicted record's contribution from the incremental accumulator.
+    fn remove_record_contribution(
+        accumulator: &mut ScoreAccumulator,
+        config: &ReputationConfig,
+        record: &TransactionRecord,
+        now: u64,
+    ) {
+        let elapsed = now.saturating_sub(record.recorded_at);
+        let weight = recency_weight_bps(elapsed, config.decay_window_seconds);
+        let value = outcome_value_bps(&record.outcome);
+        accumulator.weighted_value_sum -= weight * value;
+        accumulator.weight_sum -= weight;
+        if matches!(record.outcome, TransactionOutcome::Disputed) && weight > 0 {
+            accumulator.disputed_recent -= 1;
+        }
+        if let Some(rating) = record.rating {
+            accumulator.rating_weighted_sum -= weight * (rating as i128);
+            accumulator.rating_weight_sum -= weight;
+        }
+    }
+
+    /// Incrementally updates `score`/`avg_rating` after a new transaction has
+    /// been appended to `TransactionHistory`. Falls back to a full
+    /// recomputation whenever the accumulator is unavailable or stale, a
+    /// record is missing, or the history was not appended as expected.
+    fn apply_incremental_score_update(
+        env: &Env,
+        entity: &Address,
+        history_len_before: u32,
+    ) -> Result<ReputationScore, ReputationError> {
+        let config = Self::get_config(env.clone())?;
+        let now = env.ledger().timestamp();
+
+        let history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TransactionHistory(entity.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+        let len_after = history.len();
+        if len_after != history_len_before.saturating_add(1) {
+            return Self::recompute_score(env, entity);
+        }
+
+        let mut accumulator: ScoreAccumulator = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::ScoreAccumulator(entity.clone()))
+        {
+            Some(acc) if acc.decay_window_seconds == config.decay_window_seconds => acc,
+            None if history_len_before == 0 => ScoreAccumulator {
+                decay_window_seconds: config.decay_window_seconds,
+                weighted_value_sum: 0,
+                weight_sum: 0,
+                rating_weighted_sum: 0,
+                rating_weight_sum: 0,
+                disputed_recent: 0,
+            },
+            _ => return Self::recompute_score(env, entity),
+        };
+
+        let newest_idx = len_after.saturating_sub(1);
+        let newest_id = match history.get(newest_idx) {
+            Some(id) => id,
+            None => return Self::recompute_score(env, entity),
+        };
+        let newest_record: Option<TransactionRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TransactionRecord(newest_id));
+        match newest_record {
+            Some(record) => {
+                Self::add_record_contribution(&mut accumulator, &config, &record, now);
+            }
+            None => return Self::recompute_score(env, entity),
+        };
+
+        if len_after > SCORE_WINDOW {
+            let evicted_idx = len_after.saturating_sub(SCORE_WINDOW).saturating_sub(1);
+            let evicted_id = match history.get(evicted_idx) {
+                Some(id) => id,
+                None => return Self::recompute_score(env, entity),
+            };
+            let evicted_record: Option<TransactionRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TransactionRecord(evicted_id));
+            match evicted_record {
+                Some(record) => {
+                    Self::remove_record_contribution(&mut accumulator, &config, &record, now);
+                }
+                None => return Self::recompute_score(env, entity),
+            };
+        }
+
+        let mut rep = Self::load_or_default_reputation(env, entity);
+        let base_score = if accumulator.weight_sum > 0 {
+            accumulator.weighted_value_sum / accumulator.weight_sum
+        } else {
+            0
+        };
+        let penalty = accumulator.disputed_recent * (config.dispute_penalty_bps as i128);
+        rep.score = (base_score - penalty).clamp(0, BPS_SCALE) as u32;
+        rep.avg_rating = if accumulator.rating_weight_sum > 0 {
+            (accumulator.rating_weighted_sum / accumulator.rating_weight_sum).clamp(0, BPS_SCALE)
+                as u32
+        } else {
+            0
+        };
+        rep.last_updated = now;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reputation(entity.clone()), &rep);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Reputation(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::ScoreAccumulator(entity.clone()), &accumulator);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ScoreAccumulator(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(rep)
+    }
+
     /// Recomputes and persists `entity`'s `score`/`avg_rating`/
     /// `last_updated`, per the score formula:
     ///
@@ -1095,6 +1263,15 @@ impl ReputationContract {
             }
         }
 
+        let accumulator = ScoreAccumulator {
+            decay_window_seconds: config.decay_window_seconds,
+            weighted_value_sum,
+            weight_sum,
+            rating_weighted_sum,
+            rating_weight_sum,
+            disputed_recent,
+        };
+
         let base_score = if weight_sum > 0 {
             weighted_value_sum / weight_sum
         } else {
@@ -1114,6 +1291,14 @@ impl ReputationContract {
             .set(&DataKey::Reputation(entity.clone()), &rep);
         env.storage().persistent().extend_ttl(
             &DataKey::Reputation(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::ScoreAccumulator(entity.clone()), &accumulator);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ScoreAccumulator(entity.clone()),
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
