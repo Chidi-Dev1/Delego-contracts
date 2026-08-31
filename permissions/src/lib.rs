@@ -5,6 +5,8 @@
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
+#![allow(clippy::too_many_arguments)]
+#![warn(missing_docs)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, BytesN,
     Env, Symbol, Vec,
@@ -36,6 +38,8 @@ pub const MAX_VELOCITY_INTERVAL: u32 = 6_307_200;
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
+/// Errors returned by permission operations.
+#[allow(missing_docs)]
 pub enum PermissionError {
     /// No permission record found for this owner/delegate pair
     PermissionNotFound = 302,
@@ -102,6 +106,8 @@ pub enum PermissionError {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// The current state of a permission.
+#[allow(missing_docs)]
 pub enum PermissionStatus {
     Active,
     Paused,
@@ -111,6 +117,8 @@ pub enum PermissionStatus {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// A record describing a delegated permission from an owner to a delegate.
+#[allow(missing_docs)]
 pub struct PermissionRecord {
     pub owner: Address,
     pub delegate: Address,
@@ -137,6 +145,7 @@ pub struct PermissionRecord {
 /// storage by `(owners[0], delegate)` — see `DataKey::MultiPermission`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub struct MultiOwnerPermission {
     pub owners: Vec<Address>,
     pub threshold: u32,
@@ -152,6 +161,8 @@ pub struct MultiOwnerPermission {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a multi-owner permission is granted.
+#[allow(missing_docs)]
 pub struct MultiOwnerGrantedEvent {
     pub primary_owner: Address,
     pub delegate: Address,
@@ -163,6 +174,7 @@ pub struct MultiOwnerGrantedEvent {
 /// Emitted after a multi-owner delegated spend is successfully recorded (issue #326).
 #[contracttype]
 #[derive(Clone, Debug)]
+#[allow(missing_docs)]
 pub struct MultiOwnerSpendEvent {
     pub primary_owner: Address,
     pub delegate: Address,
@@ -175,6 +187,7 @@ pub struct MultiOwnerSpendEvent {
 /// Emitted when an admin registers a new approved metadata schema (issue #328).
 #[contracttype]
 #[derive(Clone, Debug)]
+#[allow(missing_docs)]
 pub struct SchemaRegisteredEvent {
     pub admin: Address,
     pub schema: Symbol,
@@ -183,6 +196,7 @@ pub struct SchemaRegisteredEvent {
 /// Lightweight config for multi-merchant whitelisting and allowance tracking.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub struct PermissionConfig {
     pub merchants: Vec<Address>,
     pub allowance: i128,
@@ -190,6 +204,8 @@ pub struct PermissionConfig {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a permission is granted.
+#[allow(missing_docs)]
 pub struct PermissionGrantedEvent {
     pub owner: Address,
     pub delegate: Address,
@@ -209,6 +225,8 @@ pub struct PermissionGrantedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a permission is revoked.
+#[allow(missing_docs)]
 pub struct PermissionRevokedEvent {
     pub owner: Address,
     pub delegate: Address,
@@ -216,6 +234,8 @@ pub struct PermissionRevokedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a permission is transferred to a new delegate.
+#[allow(missing_docs)]
 pub struct PermissionTransferredEvent {
     pub owner: Address,
     pub old_delegate: Address,
@@ -226,6 +246,7 @@ pub struct PermissionTransferredEvent {
 /// Emitted after a delegated spend is successfully recorded (issue #99).
 #[contracttype]
 #[derive(Clone, Debug)]
+#[allow(missing_docs)]
 pub struct PermissionSpendEvent {
     pub owner: Address,
     pub delegate: Address,
@@ -240,6 +261,7 @@ pub struct PermissionSpendEvent {
 /// and later re-derived and verified inside `execute_spend_via_relayer`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub struct RelayedSpendMessage {
     pub owner: Address,
     pub delegate: Address,
@@ -251,6 +273,8 @@ pub struct RelayedSpendMessage {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a permission's merchant whitelist changes.
+#[allow(missing_docs)]
 pub struct MerchantWhitelistChangedEvent {
     pub owner: Address,
     pub delegate: Address,
@@ -259,6 +283,8 @@ pub struct MerchantWhitelistChangedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// A pending allowance decrease waiting for its time-lock to expire.
+#[allow(missing_docs)]
 pub struct PendingAllowanceDecrement {
     pub amount: i128,
     pub execution_time: u64,
@@ -267,6 +293,7 @@ pub struct PendingAllowanceDecrement {
 /// Typed allowance breakdown returned by `get_allowance_detail` (issue #98).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub struct RemainingAllowance {
     pub limit: i128,
     pub spent: i128,
@@ -277,6 +304,7 @@ pub struct RemainingAllowance {
 /// Contract identity returned by `version` (issue #103).
 #[contracttype]
 #[derive(Clone, Debug)]
+#[allow(missing_docs)]
 pub struct ContractVersion {
     pub name: Symbol,
     pub semver: Symbol,
@@ -285,6 +313,7 @@ pub struct ContractVersion {
 /// Stored when a permission is paused; cleared on resume (issue #105).
 #[contracttype]
 #[derive(Clone, Debug)]
+#[allow(missing_docs)]
 pub struct PauseMetadata {
     pub paused_by: Address,
     pub reason_code: Symbol,
@@ -293,6 +322,8 @@ pub struct PauseMetadata {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+/// Emitted when a permission is paused.
+#[allow(missing_docs)]
 pub struct PermissionPausedEvent {
     pub owner: Address,
     pub delegate: Address,

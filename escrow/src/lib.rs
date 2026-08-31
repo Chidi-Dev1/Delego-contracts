@@ -6,6 +6,8 @@
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
+#![warn(missing_docs)]
+#![no_std]
 // `create` and `deposit` have 9 parameters — more than clippy's default limit of 7.
 // These are Soroban contract entry points whose signatures are part of the
 // published on-chain ABI; restructuring them would be a breaking change.
@@ -17,26 +19,38 @@ use soroban_sdk::{
     InvokeError, Symbol, Vec,
 };
 
+/// Lifecycle state of an escrow.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowStatus {
+    /// Escrow has been created but not yet funded.
     Created,
+    /// Escrow has been funded by the buyer.
     Funded,
+    /// Funds have been released to the seller.
     Released,
+    /// Funds have been refunded to the buyer.
     Refunded,
+    /// Escrow is disputed and awaiting resolution.
     Disputed,
+    /// Escrow has been cancelled by an authorized party.
     Cancelled,
 }
 
+/// Terminal states an escrow can reach after it is no longer active.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowTerminalState {
+    /// Funds were released to the seller.
     Released,
+    /// Funds were refunded to the buyer.
     Refunded,
+    /// Escrow was cancelled.
     Cancelled,
 }
 
 impl EscrowTerminalState {
+    /// Returns the terminal state corresponding to the given status, if the status is terminal.
     pub fn from_status(status: &EscrowStatus) -> Option<Self> {
         match status {
             EscrowStatus::Released => Some(EscrowTerminalState::Released),
@@ -61,36 +75,57 @@ pub struct YieldConfig {
     pub apr_bps: u32,
 }
 
+/// Full on-chain record for a single escrow.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowRecord {
+    /// Unique identifier for the escrow.
     pub escrow_id: u64,
+    /// Buyer's address.
     pub buyer: Address,
+    /// Seller's address.
     pub seller: Address,
+    /// Token contract address for the escrowed asset.
     pub token: Address,
+    /// Total amount of tokens escrowed.
     pub amount: i128,
+    /// Amount released to seller so far.
     pub released_amount: i128,
+    /// Amount refunded to buyer so far.
     pub refunded_amount: i128,
+    /// Current lifecycle state of the escrow.
     pub status: EscrowStatus,
+    /// Off-chain order ID this escrow is associated with.
     pub order_id: BytesN<32>,
+    /// Ledger timestamp when the escrow was created.
     pub created_at: u64,
+    /// Ledger timestamp when the escrow was last updated.
     pub updated_at: u64,
+    /// Ledger sequence at which the escrow can be refunded or disputed.
     pub timeout_ledger: u32,
 }
 
+/// Outcome of a partial release.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartialReleaseResult {
+    /// Amount released to the seller.
     pub released: i128,
+    /// Amount still held in escrow.
     pub remaining: i128,
+    /// Whether the escrow was fully released by this operation.
     pub fully_released: bool,
 }
 
+/// Outcome of a partial refund.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartialRefundResult {
+    /// Amount refunded to the buyer.
     pub refunded: i128,
+    /// Amount still held in escrow.
     pub remaining: i128,
+    /// Whether the escrow was fully refunded by this operation.
     pub fully_refunded: bool,
 }
 
@@ -107,15 +142,23 @@ pub struct ReleaseCondition {
     pub oracle_contract: Address,
 }
 
+/// Emitted when a new escrow is created.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowCreatedEvent {
+    /// Unique identifier for the escrow.
     pub escrow_id: u64,
+    /// Buyer's address.
     pub buyer: Address,
+    /// Seller's address.
     pub seller: Address,
+    /// Token contract address for the escrowed asset.
     pub token: Address,
+    /// Total amount of tokens escrowed.
     pub amount: i128,
+    /// Off-chain order ID.
     pub order_id: BytesN<32>,
+    /// Ledger sequence at which the escrow can be refunded or disputed.
     pub timeout_ledger: u32,
 }
 
@@ -131,20 +174,29 @@ pub struct EscrowMetadataEvent {
     pub schema: Symbol,
 }
 
+/// Emitted when an escrow is cancelled.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowCancelledEvent {
+    /// The escrow ID (32-byte order ID).
     pub escrow_id: BytesN<32>,
+    /// Address that cancelled the escrow.
     pub cancelled_by: Address,
+    /// Symbolic reason for cancellation.
     pub reason: Symbol,
 }
 
+/// Emitted when funds are released to the seller.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowReleasedEvent {
+    /// Unique identifier for the escrow.
     pub escrow_id: u64,
+    /// Seller's address.
     pub seller: Address,
+    /// Amount released to the seller.
     pub amount: i128,
+    /// Address that triggered the release.
     pub released_by: Address,
 }
 
@@ -160,36 +212,53 @@ pub struct EscrowYieldAccruedEvent {
     pub held_seconds: u64,
 }
 
+/// Emitted when funds are refunded to the buyer.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowRefundedEvent {
+    /// Unique identifier for the escrow.
     pub escrow_id: u64,
+    /// Buyer's address.
     pub buyer: Address,
+    /// Amount refunded to the buyer.
     pub amount: i128,
+    /// Amount remaining in escrow after this refund.
     pub remaining: i128,
+    /// Address that triggered the refund.
     pub refunded_by: Address,
 }
 
+/// Emitted when a release condition is attached to an escrow.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ReleaseConditionSetEvent {
+    /// Unique identifier for the escrow.
     pub escrow_id: u64,
+    /// Symbolic condition type forwarded to the oracle.
     pub condition_type: Symbol,
+    /// Oracle contract that evaluates the condition.
     pub oracle_contract: Address,
 }
 
+/// Emitted when an escrow is disputed.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowDisputedEvent {
+    /// Unique identifier for the escrow.
     pub escrow_id: u64,
+    /// Address that initiated the dispute.
     pub disputed_by: Address,
 }
 
+/// Emitted when a dispute is resolved.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowResolvedEvent {
+    /// Unique identifier for the escrow.
     pub escrow_id: u64,
+    /// Whether the resolution releases funds to the seller.
     pub release_to_seller: bool,
+    /// Address that resolved the dispute.
     pub resolved_by: Address,
 }
 
@@ -228,39 +297,55 @@ pub struct EscrowTimeoutExtendedEvent {
     pub extended_by: Address,
 }
 
+/// Emitted when an admin transfer is proposed.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct AdminProposedEvent {
+    /// Current admin address.
     pub current_admin: Address,
+    /// Proposed new admin address.
     pub new_admin: Address,
 }
 
+/// Emitted when a proposed admin accepts the transfer.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct AdminAcceptedEvent {
+    /// New admin address that accepted.
     pub new_admin: Address,
 }
 
+/// Emitted when a proposed admin transfer is cancelled.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct AdminTransferCancelledEvent {
+    /// Current admin address who cancelled the transfer.
     pub current_admin: Address,
 }
 
+/// Emitted when the contract's pause state changes.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowPauseChangedEvent {
+    /// Whether the contract is now paused.
     pub paused: bool,
+    /// Admin address that triggered the change.
     pub admin: Address,
+    /// Ledger sequence number of the change.
     pub ledger: u32,
 }
 
+/// Pause state for the contract's create and deposit operations.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowPauseState {
+    /// Whether new escrow creation is paused.
     pub create_paused: bool,
+    /// Address that last updated the pause state.
     pub updated_by: Address,
+    /// Ledger sequence of the last update.
     pub updated_at_ledger: u32,
+    /// Ledger sequence at which the pause expires, if any.
     pub expires_at_ledger: Option<u32>,
 }
 
@@ -292,10 +377,13 @@ pub struct EscrowMetadata {
     pub schema: Symbol,
 }
 
+/// Maps an escrow to its held token.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowTokenView {
+    /// Unique identifier for the escrow.
     pub escrow_id: u64,
+    /// Token contract address.
     pub token: Address,
 }
 
