@@ -130,6 +130,8 @@ pub enum ReputationError {
     /// No active (unresolved) flag from reporter.
     NoActiveFlag = 10,
     /// Reporter did not flag the entity.
+    /// No flags exist for this entity.
+    /// The caller is not the reporter who flagged this entity.
     NotFlagReporter = 11,
 }
 
@@ -707,6 +709,16 @@ impl ReputationContract {
             .iter()
             .position(|f| f.reporter == reporter && !f.resolved)
             .ok_or(ReputationError::NoActiveFlag)?;
+        // Distinguish between "no flags exist at all" and "flags exist but
+        // none are from this reporter" so callers get a precise error.
+        let idx = if flags.is_empty() {
+            return Err(ReputationError::NoActiveFlag);
+        } else {
+            flags
+                .iter()
+                .position(|f| f.reporter == reporter && !f.resolved)
+                .ok_or(ReputationError::NotFlagReporter)?
+        };
         let mut flag = flags.get(idx as u32).unwrap();
         flag.resolved = true;
         flags.set(idx as u32, flag);

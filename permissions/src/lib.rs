@@ -1710,6 +1710,12 @@ impl PermissionsContract {
             merchant.clone(),
         )?;
 
+        // #54: Velocity check — reject if min_spend_interval has not yet elapsed
+        // since the last recorded spend ledger for this (owner, delegate) pair.
+        // Shared with execute_spend so direct and relayed spends share the
+        // same throttle (issue #179).
+        Self::check_velocity(&env, &owner, &delegate)?;
+
         // Advance the nonce before mutating spend state so a replay attempt
         // within the same ledger is rejected even if apply_spend panics.
         env.storage().persistent().set(&nonce_key, &(nonce + 1));
