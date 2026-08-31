@@ -16,6 +16,7 @@ use crate::{
     CategoryChange, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
     MerchantCategoryChangedEvent, MerchantRegisteredEvent, MerchantStatus, RegisterParams,
     Verifier,
+    MerchantStats, MerchantStatus, RegisterParams, Verifier,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -919,6 +920,79 @@ fn test_commission_rate_configuration() {
     // Admin sets commission
     f.client.set_merchant_commission(&id, &f.admin, &250); // 2.50%
     assert_eq!(f.client.get_commission(&id), 250);
+}
+
+#[test]
+fn test_merchant_stats_lifecycle() {
+    let f = TestFixture::setup();
+    let owner1 = Address::generate(&f.env);
+    let owner2 = Address::generate(&f.env);
+
+    let id1 = f.client.register_merchant(
+        &owner1,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Alpha Store"),
+            description: String::from_str(&f.env, "Desc 1"),
+            category: symbol_short!("food"),
+            image_url: String::from_str(&f.env, "alpha.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+    let id2 = f.client.register_merchant(
+        &owner2,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Beta Store"),
+            description: String::from_str(&f.env, "Desc 2"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "beta.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+
+    assert_eq!(
+        f.client.get_merchant_stats(),
+        MerchantStats {
+            total: 2,
+            active: 2,
+            suspended: 0,
+            closed: 0,
+        }
+    );
+
+    f.client.suspend_merchant(&f.admin, &id1);
+    assert_eq!(
+        f.client.get_merchant_stats(),
+        MerchantStats {
+            total: 2,
+            active: 1,
+            suspended: 1,
+            closed: 0,
+        }
+    );
+
+    f.client.unsuspend_merchant(&f.admin, &id1);
+    assert_eq!(
+        f.client.get_merchant_stats(),
+        MerchantStats {
+            total: 2,
+            active: 2,
+            suspended: 0,
+            closed: 0,
+        }
+    );
+
+    f.client.close_merchant(&f.admin, &id2, &symbol_short!("miscond"));
+    assert_eq!(
+        f.client.get_merchant_stats(),
+        MerchantStats {
+            total: 2,
+            active: 1,
+            suspended: 0,
+            closed: 1,
+        }
+    );
 }
 
 #[test]
