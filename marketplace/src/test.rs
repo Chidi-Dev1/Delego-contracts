@@ -13,6 +13,9 @@ use crate::{
     MerchantStatus, RegisterParams, Verifier,
     MerchantStatus, MerchantValidationError, RegisterParams, Verifier,
     MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantOperationalView,
+    CategoryChange, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
+    MerchantCategoryChangedEvent, MerchantRegisteredEvent, MerchantStatus, RegisterParams,
+    Verifier,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -386,6 +389,7 @@ fn test_update_merchant_profile() {
         &String::from_str(&f.env, "New Name"),
         &String::from_str(&f.env, "New Desc"),
         &String::from_str(&f.env, "new.png"),
+        &None,
     );
     assert_eq!(
         unauth_err.unwrap_err().unwrap(),
@@ -451,6 +455,7 @@ fn test_update_merchant_profile() {
         &String::from_str(&f.env, "  Store A Updated  "),
         &String::from_str(&f.env, "  New Desc  "),
         &String::from_str(&f.env, "new.png"),
+        &None,
     );
 
     let updated = f.client.get_merchant(&id);
@@ -955,6 +960,7 @@ fn test_suspension_closing_and_mutation_locking() {
         &String::from_str(&f.env, "New"),
         &String::from_str(&f.env, "Desc"),
         &String::from_str(&f.env, "url"),
+        &None,
     );
     assert_eq!(
         prof_err.unwrap_err().unwrap(),
@@ -1958,6 +1964,90 @@ fn test_prune_closed_merchants_removes_from_indices() {
 fn test_close_merchant_prunes_indexes_and_archives() {
     f.env.ledger().set_timestamp(5_000);
             name: String::from_str(&f.env, "Pruned Store"),
+// ---------------------------------------------------------------------------
+// Category re-index tests
+/// A category change moves the merchant from the old CategoryIndex Vec to the
+/// new one, and the old Vec shrinks (filter-rebuild removes the entry).
+fn test_update_merchant_profile_category_reindex() {
+    let owner = Address::generate(&f.env);
+    // Register merchant in "tech"
+    let id = f.client.register_merchant(
+        &owner,
+            name: String::from_str(&f.env, "Tech Shop"),
+            description: String::from_str(&f.env, "Sells gadgets"),
+            image_url: String::from_str(&f.env, "tech.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+    // Confirm initial category index
+    let tech_before = f
+        .client
+        .get_merchants_by_category(&symbol_short!("tech"), &0, &10);
+    assert_eq!(tech_before.total, 1);
+    assert_eq!(tech_before.items.get(0).unwrap().id, id);
+    let books_before = f
+        .get_merchants_by_category(&symbol_short!("books"), &0, &10);
+    assert_eq!(books_before.total, 0);
+    // Owner re-categorises from "tech" to "books"
+    f.client.update_merchant_profile(
+        &id,
+        &String::from_str(&f.env, "Tech Shop"),
+        &String::from_str(&f.env, "Sells gadgets"),
+        &String::from_str(&f.env, "tech.png"),
+        &Some(symbol_short!("books")),
+    // Merchant record must reflect new category
+    let merchant = f.client.get_merchant(&id);
+    assert_eq!(merchant.category, symbol_short!("books"));
+    // Old index must no longer contain the merchant
+    let tech_after = f
+    assert_eq!(tech_after.total, 0, "tech index must be empty after move");
+    // New index must now contain the merchant
+    let books_after = f
+    assert_eq!(books_after.total, 1);
+    assert_eq!(books_after.items.get(0).unwrap().id, id);
+/// Passing None for new_category must leave the category and both indexes
+/// completely unchanged.
+fn test_update_merchant_profile_no_category_change_when_none() {
+            name: String::from_str(&f.env, "Stable Shop"),
+            category: symbol_short!("food"),
+            image_url: String::from_str(&f.env, "food.png"),
+        &String::from_str(&f.env, "Stable Shop"),
+        &String::from_str(&f.env, "Updated Desc"),
+        &String::from_str(&f.env, "food.png"),
+        &None,
+    assert_eq!(merchant.category, symbol_short!("food"));
+    assert_eq!(
+        merchant.description,
+        String::from_str(&f.env, "Updated Desc")
+    let food = f
+        .get_merchants_by_category(&symbol_short!("food"), &0, &10);
+    assert_eq!(food.total, 1);
+    assert_eq!(food.items.get(0).unwrap().id, id);
+/// Passing the same category the merchant already has must be a no-op: no
+/// event emitted and the CategoryIndex is untouched.
+fn test_update_merchant_profile_same_category_is_noop() {
+            name: String::from_str(&f.env, "Noop Shop"),
+            category: symbol_short!("retail"),
+            image_url: String::from_str(&f.env, "url.png"),
+    // Pass the same category explicitly — must not duplicate the entry.
+        &String::from_str(&f.env, "Noop Shop"),
+        &String::from_str(&f.env, "Desc"),
+        &String::from_str(&f.env, "url.png"),
+        &Some(symbol_short!("retail")),
+    let retail = f
+        .get_merchants_by_category(&symbol_short!("retail"), &0, &10);
+        retail.total, 1,
+        "retail index must still have exactly one entry"
+    assert_eq!(retail.items.get(0).unwrap().id, id);
+    // Category must be unchanged on the merchant record
+    assert_eq!(merchant.category, symbol_short!("retail"));
+/// Vec shrink: registers 3 merchants in "tech", moves the middle one out.
+/// The remaining tech index must contain exactly the two outer merchants in
+/// their original relative order.
+fn test_category_reindex_shrinks_old_vec_correctly() {
+            name: String::from_str(&f.env, "Tech A"),
+            image_url: String::from_str(&f.env, "a.png"),
             metadata: None,
             required_verifications: 1,
         },
@@ -2385,6 +2475,14 @@ fn test_category_backward_compatibility_unnormalized_mixed_case_raw_index() {
             description: String::from_str(&f.env, "Desc"),
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
+            name: String::from_str(&f.env, "Tech B"),
+            image_url: String::from_str(&f.env, "b.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+            name: String::from_str(&f.env, "Tech C"),
+            image_url: String::from_str(&f.env, "c.png"),
             metadata: None,
             required_verifications: 1,
         },
@@ -2465,6 +2563,38 @@ fn test_reregistration_after_close_does_not_reuse_id() {
             name: String::from_str(&f.env, "Old Store"),
             category: symbol_short!("tech"),
             image_url: String::from_str(&f.env, "url"),
+    // Move the middle merchant (id2) to "services"
+    f.client.update_merchant_profile(
+        &id2,
+        &owner2,
+        &String::from_str(&f.env, "Tech B"),
+        &String::from_str(&f.env, "Desc"),
+        &String::from_str(&f.env, "b.png"),
+        &Some(symbol_short!("services")),
+    );
+    // tech index: should contain only id1 and id3, in original registration order
+    let tech = f
+        .client
+        .get_merchants_by_category(&symbol_short!("tech"), &0, &10);
+    assert_eq!(tech.total, 2, "tech index must shrink to 2 after removal");
+    assert_eq!(tech.items.get(0).unwrap().id, id1);
+    assert_eq!(tech.items.get(1).unwrap().id, id3);
+    // services index: should contain only id2
+    let services = f
+        .get_merchants_by_category(&symbol_short!("services"), &0, &10);
+    assert_eq!(services.total, 1);
+    assert_eq!(services.items.get(0).unwrap().id, id2);
+    // Merchant records reflect updated categories
+    assert_eq!(
+        f.client.get_merchant(&id2).category,
+        symbol_short!("services")
+        f.client.get_merchant(&id1).category,
+        symbol_short!("tech")
+        f.client.get_merchant(&id3).category,
+/// A frozen (suspended) merchant cannot change category.
+fn test_category_change_blocked_when_suspended() {
+            name: String::from_str(&f.env, "Frozen Shop"),
+            image_url: String::from_str(&f.env, "t.png"),
             metadata: None,
             required_verifications: 1,
         },
@@ -2483,3 +2613,52 @@ fn test_reregistration_after_close_does_not_reuse_id() {
     assert_eq!(tech.items.get(0).unwrap().id, id2);
     assert_eq!(archived.unwrap().id, id1);
 }
+
+    f.client.suspend_merchant(&f.admin, &id);
+    let err = f.client.try_update_merchant_profile(
+        &id,
+        &owner,
+        &String::from_str(&f.env, "Frozen Shop"),
+        &String::from_str(&f.env, "Desc"),
+        &String::from_str(&f.env, "t.png"),
+        &Some(symbol_short!("books")),
+    );
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::MerchantFrozen);
+/// A non-owner cannot change the category.
+#[test]
+fn test_category_change_unauthorized() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let stranger = Address::generate(&f.env);
+    let id = f.client.register_merchant(
+        &RegisterParams {
+            name: String::from_str(&f.env, "Auth Shop"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "t.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+        &stranger,
+        &String::from_str(&f.env, "Auth Shop"),
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::Unauthorized);
+/// CategoryChange struct can be constructed with expected fields.
+fn test_category_change_struct_fields() {
+    let _env = Env::default();
+    let change = CategoryChange {
+        merchant_id: 42,
+        from: symbol_short!("tech"),
+        to: symbol_short!("books"),
+    };
+    assert_eq!(change.merchant_id, 42);
+    assert_eq!(change.from, symbol_short!("tech"));
+    assert_eq!(change.to, symbol_short!("books"));
+/// MerchantCategoryChangedEvent struct can be constructed and compared.
+fn test_merchant_category_changed_event_struct_fields() {
+    let event = MerchantCategoryChangedEvent {
+        merchant_id: 7,
+        from: symbol_short!("retail"),
+        to: symbol_short!("food"),
+    assert_eq!(event.merchant_id, 7);
+    assert_eq!(event.from, symbol_short!("retail"));
+    assert_eq!(event.to, symbol_short!("food"));

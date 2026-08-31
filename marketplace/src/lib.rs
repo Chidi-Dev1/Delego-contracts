@@ -209,6 +209,22 @@ pub struct MerchantProfileUpdatedEvent {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CategoryChange {
+    pub merchant_id: u64,
+    pub from: Symbol,
+    pub to: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MerchantCategoryChangedEvent {
+    pub merchant_id: u64,
+    pub from: Symbol,
+    pub to: Symbol,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct MerchantMetadataUpdatedEvent {
     pub merchant_id: u64,
@@ -649,12 +665,17 @@ impl MarketplaceContract {
         name: String,
         description: String,
         image_url: String,
+        new_category: Option<Symbol>,
     ) -> Result<(), MarketplaceError> {
         caller.require_auth();
 
         if name.is_empty() {
             return Err(MarketplaceError::InvalidParam);
         }
+
+        // Validate new_category when provided: must be a valid (non-default) Symbol.
+        // Soroban Symbol values are always non-empty when created via symbol_short! or
+        // Symbol::new, so no additional validation is needed here beyond type safety.
 
         let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
         Self::check_not_frozen_or_closed(&merchant)?;
@@ -677,6 +698,68 @@ impl MarketplaceContract {
 
         merchant.description = description;
         merchant.image_url = image_url;
+
+        // Re-index CategoryIndex when category changes.
+        if let Some(to_cat) = new_category {
+            let from_cat = merchant.category.clone();
+            if from_cat != to_cat {
+                // Remove merchant_id from old category index (filter-rebuild shrinks the Vec).
+                let old_cat_key = DataKey::CategoryIndex(from_cat.clone());
+                let old_ids: Vec<u64> = env
+                    .storage()
+                    .persistent()
+                    .get(&old_cat_key)
+                    .unwrap_or_else(|| Vec::new(&env));
+                let mut new_old_ids: Vec<u64> = Vec::new(&env);
+                for id in old_ids.iter() {
+                    if id != merchant_id {
+                        new_old_ids.push_back(id);
+                    }
+                }
+                env.storage()
+                    .persistent()
+                    .set(&old_cat_key, &new_old_ids);
+
+                // Append merchant_id to new category index.
+                let new_cat_key = DataKey::CategoryIndex(to_cat.clone());
+                let mut new_ids: Vec<u64> = env
+                    .storage()
+                    .persistent()
+                    .get(&new_cat_key)
+                    .unwrap_or_else(|| Vec::new(&env));
+                new_ids.push_back(merchant_id);
+                env.storage()
+                    .persistent()
+                    .set(&new_cat_key, &new_ids);
+
+                // Extend TTL for both category index keys.
+                let storage = env.storage().persistent();
+                storage.extend_ttl(
+                    &old_cat_key,
+                    PERSISTENT_BUMP_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+                storage.extend_ttl(
+                    &new_cat_key,
+                    PERSISTENT_BUMP_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+
+                // Update the merchant's stored category.
+                merchant.category = to_cat.clone();
+
+                // Emit category-changed event.
+                env.events().publish(
+                    (symbol_short!("mkplc"), symbol_short!("cat_chg")),
+                    MerchantCategoryChangedEvent {
+                        merchant_id,
+                        from: from_cat,
+                        to: to_cat,
+                    },
+                );
+            }
+        }
+
         merchant.updated_at = env.ledger().timestamp();
 
         env.storage()
