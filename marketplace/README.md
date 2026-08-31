@@ -60,7 +60,7 @@ pub fn close_merchant(env: Env, admin: Address, merchant_id: u64, reason: Symbol
 ```rust
 pub fn set_merchant_reputation(env: Env, admin: Address, merchant_id: u64, reputation: Option<Address>) -> Result<(), MarketplaceError>
 pub fn set_reputation_contract(env: Env, admin: Address, reputation: Address) -> Result<(), MarketplaceError>
-pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), MarketplaceError>
+pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<bool, MarketplaceError>
 pub fn accept_admin(env: Env, caller: Address) -> Result<(), MarketplaceError>
 pub fn set_metadata_cooldown(env: Env, admin: Address, cooldown_seconds: u64) -> Result<(), MarketplaceError>
 pub fn get_metadata_cooldown(env: Env) -> u64
