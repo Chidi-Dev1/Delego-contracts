@@ -434,6 +434,10 @@ impl DelegationRegistry {
 
         let snapshot = target_snapshot.ok_or(DelegationError::SnapshotNotFound)?;
 
+        if snapshot.record.permissions_contract != record.permissions_contract {
+            return Err(DelegationError::InvalidVersion);
+        }
+
         record = snapshot.record;
         record.version = Self::increment_version(&env, delegation_id);
         record.updated_at = env.ledger().timestamp();
