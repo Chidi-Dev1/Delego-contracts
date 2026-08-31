@@ -11,6 +11,7 @@ use crate::{
     AdminProposedEvent, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
     MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantRegisteredEvent,
     MerchantStatus, RegisterParams, Verifier,
+    MerchantStatus, MerchantValidationError, RegisterParams, Verifier,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -81,8 +82,8 @@ fn test_register_merchant_happy_path() {
     let merchant_addr = Address::generate(&f.env);
 
     let params = RegisterParams {
-        name: String::from_str(&f.env, "Acme Store"),
-        description: String::from_str(&f.env, "High quality tools"),
+        name: String::from_str(&f.env, "  Acme Store  "),
+        description: String::from_str(&f.env, "  High quality tools  "),
         category: symbol_short!("tools"),
         image_url: String::from_str(&f.env, "https://cdn.example.com/logo.png"),
         metadata: Some(String::from_str(&f.env, "ipfs://Qm123")),
@@ -96,6 +97,7 @@ fn test_register_merchant_happy_path() {
     assert_eq!(merchant.id, 1);
     assert_eq!(merchant.owner, Some(merchant_addr.clone()));
     assert_eq!(merchant.name, String::from_str(&f.env, "Acme Store"));
+    assert_eq!(merchant.description, String::from_str(&f.env, "High quality tools"));
     assert_eq!(merchant.category, symbol_short!("tools"));
     assert_eq!(merchant.commission_rate_bps, 0);
     assert!(!merchant.verified);
@@ -188,7 +190,55 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
     let err_empty = f.client.try_register_merchant(&merchant2, &params_empty);
     assert_eq!(
         err_empty.unwrap_err().unwrap(),
-        MarketplaceError::InvalidParam
+        MarketplaceError::MerchantValidationError(MerchantValidationError::EmptyName)
+    );
+
+    // Whitespace-only name
+    let params_ws_name = RegisterParams {
+        name: String::from_str(&f.env, "   "),
+        description: String::from_str(&f.env, "Desc"),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, ""),
+        metadata: None,
+        required_verifications: 1,
+    };
+
+    let err_ws_name = f.client.try_register_merchant(&merchant2, &params_ws_name);
+    assert_eq!(
+        err_ws_name.unwrap_err().unwrap(),
+        MarketplaceError::MerchantValidationError(MerchantValidationError::WhitespaceOnly)
+    );
+
+    // Empty description
+    let params_empty_desc = RegisterParams {
+        name: String::from_str(&f.env, "Valid Store"),
+        description: String::from_str(&f.env, ""),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, ""),
+        metadata: None,
+        required_verifications: 1,
+    };
+
+    let err_empty_desc = f.client.try_register_merchant(&merchant2, &params_empty_desc);
+    assert_eq!(
+        err_empty_desc.unwrap_err().unwrap(),
+        MarketplaceError::MerchantValidationError(MerchantValidationError::EmptyDescription)
+    );
+
+    // Whitespace-only description
+    let params_ws_desc = RegisterParams {
+        name: String::from_str(&f.env, "Valid Store"),
+        description: String::from_str(&f.env, "   "),
+        category: symbol_short!("retail"),
+        image_url: String::from_str(&f.env, ""),
+        metadata: None,
+        required_verifications: 1,
+    };
+
+    let err_ws_desc = f.client.try_register_merchant(&merchant2, &params_ws_desc);
+    assert_eq!(
+        err_ws_desc.unwrap_err().unwrap(),
+        MarketplaceError::MerchantValidationError(MerchantValidationError::WhitespaceOnly)
     );
 }
 
@@ -223,12 +273,64 @@ fn test_update_merchant_profile() {
         MarketplaceError::Unauthorized
     );
 
+    // Empty name rejected
+    let empty_name_err = f.client.try_update_merchant_profile(
+        &id,
+        &owner,
+        &String::from_str(&f.env, ""),
+        &String::from_str(&f.env, "New Desc"),
+        &String::from_str(&f.env, "new.png"),
+    );
+    assert_eq!(
+        empty_name_err.unwrap_err().unwrap(),
+        MarketplaceError::MerchantValidationError(MerchantValidationError::EmptyName)
+    );
+
+    // Whitespace-only name rejected
+    let ws_name_err = f.client.try_update_merchant_profile(
+        &id,
+        &owner,
+        &String::from_str(&f.env, "   "),
+        &String::from_str(&f.env, "New Desc"),
+        &String::from_str(&f.env, "new.png"),
+    );
+    assert_eq!(
+        ws_name_err.unwrap_err().unwrap(),
+        MarketplaceError::MerchantValidationError(MerchantValidationError::WhitespaceOnly)
+    );
+
+    // Empty description rejected
+    let empty_desc_err = f.client.try_update_merchant_profile(
+        &id,
+        &owner,
+        &String::from_str(&f.env, "Store A"),
+        &String::from_str(&f.env, ""),
+        &String::from_str(&f.env, "new.png"),
+    );
+    assert_eq!(
+        empty_desc_err.unwrap_err().unwrap(),
+        MarketplaceError::MerchantValidationError(MerchantValidationError::EmptyDescription)
+    );
+
+    // Whitespace-only description rejected
+    let ws_desc_err = f.client.try_update_merchant_profile(
+        &id,
+        &owner,
+        &String::from_str(&f.env, "Store A"),
+        &String::from_str(&f.env, "   "),
+        &String::from_str(&f.env, "new.png"),
+    );
+    assert_eq!(
+        ws_desc_err.unwrap_err().unwrap(),
+        MarketplaceError::MerchantValidationError(MerchantValidationError::WhitespaceOnly)
+    );
+
     // Owner succeeds
     f.client.update_merchant_profile(
         &id,
         &owner,
-        &String::from_str(&f.env, "Store A Updated"),
-        &String::from_str(&f.env, "New Desc"),
+        &String::from_str(&f.env, "  Store A Updated  "),
+        &String::from_str(&f.env, "  New Desc  "),
         &String::from_str(&f.env, "new.png"),
     );
 

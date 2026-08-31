@@ -132,6 +132,24 @@ pub struct ContractVersion {
     pub semver: Symbol,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MerchantValidationError {
+    EmptyName,
+    EmptyDescription,
+    WhitespaceOnly,
+}
+
+impl From<MerchantValidationError> for MarketplaceError {
+    fn from(e: MerchantValidationError) -> Self {
+        match e {
+            MerchantValidationError::EmptyName
+            | MerchantValidationError::EmptyDescription
+            | MerchantValidationError::WhitespaceOnly => MarketplaceError::InvalidParam,
+        }
+    }
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -418,6 +436,19 @@ impl MarketplaceContract {
         env.storage()
             .persistent()
             .get(&DataKey::ArchivedMerchant(id))
+    fn validate_merchant_input(
+        name: &String,
+        description: &String,
+    ) -> Result<(), MerchantValidationError> {
+        if name.is_empty() {
+            return Err(MerchantValidationError::EmptyName);
+        }
+        if name.trim().is_empty() {
+            return Err(MerchantValidationError::WhitespaceOnly);
+        if description.is_empty() {
+            return Err(MerchantValidationError::EmptyDescription);
+        if description.trim().is_empty() {
+        Ok(())
     }
 
     // --- Merchant Lifecycle ---
@@ -429,9 +460,7 @@ impl MarketplaceContract {
     ) -> Result<u64, MarketplaceError> {
         merchant.require_auth();
 
-        if params.name.is_empty() {
-            return Err(MarketplaceError::InvalidParam);
-        }
+        Self::validate_merchant_input(&params.name, &params.description)?;
 
         let name_key = DataKey::MerchantName(params.name.clone());
         if env.storage().persistent().has(&name_key) {
@@ -1189,6 +1218,21 @@ impl MarketplaceContract {
                 }
             }
             id += 1;
+        }
+
+        // Filter merchants by status if provided
+        let mut filtered_ids = Vec::new(&env);
+        for id in merchant_ids.iter() {
+            if let Ok(merchant) = Self::get_merchant(env.clone(), id) {
+                if let Some(status) = status_filter {
+                    if merchant.status == status {
+                        filtered_ids.push_back(id);
+                    }
+                } else {
+                    // No filter: include all
+                    filtered_ids.push_back(id);
+                }
+            }
         }
 
         let total = filtered_ids.len();
