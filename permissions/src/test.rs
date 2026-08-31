@@ -2949,5 +2949,24 @@ mod test {
 
         let res_over_cap = client.try_sweep_inactive_batch(&over_cap, &caller);
         assert_eq!(res_over_cap, Err(Ok(PermissionError::InvalidParam)));
+    fn test_stale_nonce_relay_reverts() {
+        let merchant = Address::generate(&env);
+        let relayer = Address::generate(&env);
+        client.grant(&owner, &delegate, &1000, &100, &merchants, &10000);
+        client.set_relayer_key(&owner, &delegate, &relayer);
+            li.sequence_number = 100;
+            client.try_execute_spend_via_relayer(&owner, &delegate, &50, &merchant, &1, &1000),
+            Err(Ok(PermissionError::InvalidNonce))
+    fn test_second_spend_inside_velocity_window_reverts() {
+        client.set_velocity_interval(&owner, &delegate, &10);
+            client.try_execute_spend(&owner, &delegate, &10, &merchant),
+        // A second spend inside the 10-ledger velocity window is rejected.
+            li.sequence_number = 105;
+            Err(Ok(PermissionError::VelocityLimitExceeded))
+        // Once the window has elapsed, spending is allowed again.
+            li.sequence_number = 110;
+    fn test_decrease_allowance_negative_amount_rejected() {
+        let result = client.try_decrease_allowance(&owner, &delegate, &-100);
+        assert!(result.is_err());
     }
 }
