@@ -1,6 +1,8 @@
 use crate::{
     AdminAcceptedEvent, AdminProposedEvent, MarketplaceContract, MarketplaceContractClient,
     MarketplaceError, MerchantRegisteredEvent, MerchantStatus, RegisterParams, Verifier,
+    DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantStatus,
+    RegisterParams, Verifier,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -586,6 +588,47 @@ fn test_multi_verifier_verification_and_revocation() {
     let revoked_state = f.client.get_merchant(&id);
     assert!(!revoked_state.verified);
     assert_eq!(revoked_state.status, MerchantStatus::Registered);
+}
+
+#[test]
+fn test_verify_merchant_verified_count_overflow() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let verifier = Address::generate(&f.env);
+
+    f.client.add_verifier(
+        &f.admin,
+        &Verifier {
+            address: verifier.clone(),
+            label: symbol_short!("kyc"),
+            registered_at: 1,
+        },
+    );
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Overflow Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+
+    f.env.as_contract(&f._contract_id, || {
+        f.env
+            .storage()
+            .instance()
+            .set(&DataKey::VerifiedCount(id), &u32::MAX);
+    });
+
+    let err = f.client.try_verify_merchant(&id, &verifier);
+    assert_eq!(
+        err.unwrap_err().unwrap(),
+        MarketplaceError::VerificationCountOverflow
+    );
 }
 
 #[test]
