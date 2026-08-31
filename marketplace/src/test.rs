@@ -1106,6 +1106,73 @@ fn test_status_filtered_discovery() {
 }
 
 #[test]
+fn test_merchant_state_ttl_survives_repeated_reads() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "TTL Survival Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+
+    let env = &f.env;
+    let contract_id = f._contract_id.clone();
+
+    let before: [u32; 6] = env.as_contract(&contract_id, || {
+        let keys = [
+            crate::DataKey::Merchant(id),
+            crate::DataKey::MerchantName(String::from_str(env, "TTL Survival Store")),
+            crate::DataKey::VerifiedCount(id),
+            crate::DataKey::RequiredVerifications(id),
+            crate::DataKey::MerchantVerifierList(id),
+            crate::DataKey::LastMetadataUpdate(id),
+        ];
+        let mut ttls = [0u32; 6];
+        for (i, key) in keys.iter().enumerate() {
+            ttls[i] = env.storage().persistent().get_ttl(key);
+        }
+        ttls
+    });
+
+    // Repeated reads must refresh every merchant-linked key, not just
+    // Merchant and MerchantName.
+    let _ = f.client.get_merchant(&id);
+    env.ledger().with_mutator(|li| li.sequence_number += 1);
+    let _ = f.client.get_merchant(&id);
+
+    let after: [u32; 6] = env.as_contract(&contract_id, || {
+        let keys = [
+            crate::DataKey::Merchant(id),
+            crate::DataKey::MerchantName(String::from_str(env, "TTL Survival Store")),
+            crate::DataKey::VerifiedCount(id),
+            crate::DataKey::RequiredVerifications(id),
+            crate::DataKey::MerchantVerifierList(id),
+            crate::DataKey::LastMetadataUpdate(id),
+        ];
+        let mut ttls = [0u32; 6];
+        for (i, key) in keys.iter().enumerate() {
+            ttls[i] = env.storage().persistent().get_ttl(key);
+        }
+        ttls
+    });
+
+    for (index, (old, new)) in before.iter().zip(after.iter()).enumerate() {
+        assert!(
+            *new > *old,
+            "merchant-linked key {} was not TTL-bumped by repeated reads",
+            index
+        );
+    }
+}
+
+#[test]
 fn test_status_filtered_discovery_by_category() {
     let f = TestFixture::setup();
     let owner1 = Address::generate(&f.env);

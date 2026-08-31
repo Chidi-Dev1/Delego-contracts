@@ -916,6 +916,7 @@ impl MarketplaceContract {
             .get(&DataKey::MerchantIds)
             .unwrap_or_else(|| Vec::new(&env));
         for id in merchant_ids.iter() {
+            Self::bump_merchant_state(&env, id);
             let policy: Option<VerificationPolicy> = env
                 .storage()
                 .persistent()
@@ -1092,22 +1093,34 @@ impl MarketplaceContract {
             .get(&DataKey::Merchant(merchant_id))
             .ok_or(MarketplaceError::MerchantNotFound)?;
 
-        let storage = env.storage().persistent();
-        storage.extend_ttl(
-            &DataKey::Merchant(merchant_id),
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-        storage.extend_ttl(
-            &DataKey::MerchantName(merchant.name.clone()),
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
+        Self::bump_merchant_state(&env, merchant_id);
 
         Ok(merchant)
     }
 
     pub fn get_merchant_view_detailed(env: Env, merchant_id: u64) -> Result<MerchantViewDetailed, MarketplaceError> {
+    fn bump_merchant_state(env: &Env, id: u64) {
+        let storage = env.storage().persistent();
+        let merchant: Merchant = match storage.get(&DataKey::Merchant(id)) {
+            Some(merchant) => merchant,
+            None => return,
+        };
+        let keys = [
+            DataKey::Merchant(id),
+            DataKey::MerchantName(merchant.name.clone()),
+            DataKey::VerifiedCount(id),
+            DataKey::VerificationPolicy(id),
+            DataKey::MerchantVerifierList(id),
+            DataKey::LastMetadataUpdate(id),
+        ];
+        for key in keys {
+            if storage.has(&key) {
+                storage.extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            }
+        }
+    }
+
+    pub fn get_merchant_view(env: Env, merchant_id: u64) -> Result<MerchantView, MarketplaceError> {
         let merchant = Self::get_merchant(env.clone(), merchant_id)?;
 
         let reputation_contract = merchant.reputation.clone().or_else(|| {
