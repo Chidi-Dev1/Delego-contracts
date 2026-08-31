@@ -1411,6 +1411,7 @@ impl MarketplaceContract {
         ContractVersion {
             name: symbol_short!("market"),
             semver: symbol_short!("0_2_0"),
+            semver: soroban_sdk::Symbol::new(&_env, env!("CARGO_PKG_VERSION_SYM")),
         }
     }
 

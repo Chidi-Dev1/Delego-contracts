@@ -76,6 +76,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Check Marketplace Version Consistency
+        run: bash scripts/check_version.sh
+
   build:
     name: Build WASM
     runs-on: ubuntu-latest

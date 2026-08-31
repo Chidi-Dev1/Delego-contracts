@@ -46,6 +46,8 @@ fn test_constructor_and_version() {
     let ver = f.client.version();
     assert_eq!(ver.name, symbol_short!("market"));
     assert_eq!(ver.semver, symbol_short!("0_2_0"));
+    let expected = env!("CARGO_PKG_VERSION").replace('.', "_");
+    assert_eq!(ver.semver, soroban_sdk::Symbol::new(&f.env, &expected));
 }
 
 #[test]
@@ -1293,4 +1295,18 @@ fn test_flight_merchant_lifecycle_and_discovery() {
     assert_eq!(item.commission_rate_bps, 350);
     assert!(item.verified);
     assert_eq!(item.status, MerchantStatus::Verified);
+}
+
+#[test]
+fn test_version_matches_cargo_toml() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let admin = Address::generate(&env);
+    let contract_id = env.register(crate::MarketplaceContract, (admin,));
+    let client = crate::MarketplaceContractClient::new(&env, &contract_id);
+    
+    let v = client.version();
+    let expected = env!("CARGO_PKG_VERSION").replace('.', "_");
+    assert_eq!(v.semver, soroban_sdk::Symbol::new(&env, &expected));
 }
