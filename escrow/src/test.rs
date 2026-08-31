@@ -1,7 +1,10 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod test {
-    use crate::{DataKey, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError, EscrowMetadataEvent};
+    use crate::{
+        DataKey, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
+        EscrowMetadataEvent,
+    };
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events, Ledger},
@@ -40,7 +43,7 @@ mod test {
         let max_amount = 10000i128;
 
         let res = client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
-        assert!(res);
+        assert_eq!(res, true);
 
         let res_try = client.try_initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
         assert_eq!(res_try, Err(Ok(EscrowError::AlreadyInitialized)));
@@ -74,7 +77,7 @@ mod test {
         };
 
         // Call constructor
-        let res = client.__constructor(&config);
+        let res = client.constructor(&config);
         assert_eq!(res, Ok(()));
 
         // Verify admin is set correctly
@@ -109,7 +112,7 @@ mod test {
         };
 
         // Initialize via constructor
-        let res = client.__constructor(&config);
+        let res = client.constructor(&config);
         assert_eq!(res, Ok(()));
 
         // Attempt to call initialize after constructor should fail
@@ -131,7 +134,7 @@ mod test {
             max_amount: 1_000_000i128,
         };
 
-        let res = client.try___constructor(&config);
+        let res = client.try_constructor(&config);
         assert_eq!(res, Err(Ok(EscrowError::InvalidAddress)));
     }
 
@@ -144,13 +147,13 @@ mod test {
         let treasury = Address::generate(&env);
         let config = EscrowConfig {
             admin: admin.clone(),
-            fee_bps: 1001u32,  // > 1000
+            fee_bps: 1001u32, // > 1000
             treasury,
             min_amount: 100i128,
             max_amount: 1_000_000i128,
         };
 
-        let res = client.try___constructor(&config);
+        let res = client.try_constructor(&config);
         assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
     }
 
@@ -167,11 +170,11 @@ mod test {
             admin: admin.clone(),
             fee_bps: 250u32,
             treasury: treasury.clone(),
-            min_amount: 0i128,  // <= 0
+            min_amount: 0i128, // <= 0
             max_amount: 1_000_000i128,
         };
 
-        let res = client.try___constructor(&config1);
+        let res = client.try_constructor(&config1);
         assert_eq!(res, Err(Ok(EscrowError::InvalidLimits)));
 
         // Test max_amount < min_amount
@@ -180,10 +183,10 @@ mod test {
             fee_bps: 250u32,
             treasury: treasury.clone(),
             min_amount: 1000i128,
-            max_amount: 500i128,  // < min_amount
+            max_amount: 500i128, // < min_amount
         };
 
-        let res = client.try___constructor(&config2);
+        let res = client.try_constructor(&config2);
         assert_eq!(res, Err(Ok(EscrowError::InvalidLimits)));
     }
 

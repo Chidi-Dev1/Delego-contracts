@@ -963,7 +963,7 @@ impl MarketplaceContract {
         if offset >= total || limit == 0 {
             return Ok(DiscoveryPage {
                 items: Vec::new(&env),
-                total: total as u32,
+                total,
                 next_offset: None,
             });
         }
@@ -982,7 +982,7 @@ impl MarketplaceContract {
 
         Ok(DiscoveryPage {
             items,
-            total: total as u32,
+            total,
             next_offset,
         })
     }
@@ -1041,7 +1041,7 @@ impl MarketplaceContract {
         if offset >= total || limit == 0 {
             return Ok(DiscoveryPage {
                 items: Vec::new(&env),
-                total: total as u32,
+                total,
                 next_offset: None,
             });
         }
@@ -1060,7 +1060,7 @@ impl MarketplaceContract {
 
         Ok(DiscoveryPage {
             items,
-            total: total as u32,
+            total,
             next_offset,
         })
     }

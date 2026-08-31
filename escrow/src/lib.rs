@@ -309,7 +309,7 @@ pub struct FeeConfig {
 }
 
 /// Complete escrow configuration including admin and fee parameters.
-/// Used by `__constructor` to atomically initialize the contract at deploy time
+/// Used by `constructor` to atomically initialize the contract at deploy time
 /// without requiring post-deployment initialization calls that could be front-run.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -877,7 +877,7 @@ impl EscrowContract {
     /// Returns [`EscrowError::InvalidFeeBps`] if fee_bps > 1000.
     /// Returns [`EscrowError::InvalidLimits`] if min_amount <= 0 or max_amount < min_amount.
     /// Returns [`EscrowError::InvalidAddress`] if treasury is a zero address.
-    pub fn __constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
+    pub fn constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
         // Validate configuration
         if config.fee_bps > 1000 {
             return Err(EscrowError::InvalidFeeBps);
@@ -892,12 +892,13 @@ impl EscrowContract {
         // Atomically store admin and configuration at deploy time
         env.storage().instance().set(&DataKey::Admin, &config.admin);
         env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeConfig, &FeeConfig {
+        env.storage().instance().set(
+            &DataKey::FeeConfig,
+            &FeeConfig {
                 fee_bps: config.fee_bps,
                 treasury: config.treasury.clone(),
-            });
+            },
+        );
         env.storage().instance().set(
             &DataKey::AmountLimits,
             &EscrowAmountLimits {
@@ -912,7 +913,7 @@ impl EscrowContract {
     /// Initialize the escrow contract with the admin, fee config, and amount limits.
     ///
     /// # Deprecation Note
-    /// For new deployments, prefer [`__constructor`] which is called atomically at deploy time
+    /// For new deployments, prefer [`constructor`] which is called atomically at deploy time
     /// and cannot be front-run. This function exists for backward compatibility with legacy
     /// contracts deployed before the constructor pattern was available.
     pub fn initialize(
@@ -937,9 +938,9 @@ impl EscrowContract {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeConfig, &FeeConfig { fee_bps, treasury });
+        env.storage().instance().set(
+            &DataKey::FeeConfig,
+            &FeeConfig { fee_bps, treasury });
         env.storage().instance().set(
             &DataKey::AmountLimits,
             &EscrowAmountLimits {
@@ -1967,8 +1968,8 @@ impl EscrowContract {
         buyer_ids.push_back(last_id);
         env.storage().persistent().set(&buyer_ids_key, &buyer_ids);
 
-        if let (Some(hash), Some(sch)) = (order_hash, schema) {
-            let metadata = EscrowMetadata {
+        if let (Some(hash), Some(sch)) = (order_hash.clone(), schema.clone()) {
+            let _metadata = EscrowMetadata {
                 order_hash: hash.clone(),
                 schema: sch.clone(),
             };
@@ -1983,7 +1984,7 @@ impl EscrowContract {
         }
 
         // The metadata event is only emitted once both halves are present.
-        if let (Some(hash), Some(sch)) = (order_hash, schema) {
+        if let (Some(hash), Some(sch)) = (order_hash.clone(), schema.clone()) {
             env.events().publish(
                 (symbol_short!("escrow"), symbol_short!("metadata")),
                 EscrowMetadataEvent {

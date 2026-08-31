@@ -51,16 +51,18 @@ The escrow contract holds funds in trust during agent-mediated purchases, releas
 
 ```rust
 struct EscrowRecord {
-    escrow_id: BytesN<32>,
+    escrow_id: u64,
     buyer: Address,
     seller: Address,
     token: Address,
     amount: i128,
-    fee_bps: u32,
+    released_amount: i128,
+    refunded_amount: i128,
     status: EscrowStatus,
+    order_id: BytesN<32>,
+    created_at: u64,
+    updated_at: u64,
     timeout_ledger: u32,
-    dispute_reason: Option<Symbol>,
-    create_paused: bool,
 }
 
 enum EscrowStatus {
