@@ -1214,4 +1214,36 @@ fn test_recency_weight_decay_curve() {
         );
         prev = curr;
     }
+fn test_event_namespace_consistency() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::TryIntoVal;
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Released,
+    client.rate_entity(&counterparty, &1u64, &entity, &9000u32);
+    client.flag_entity(&admin, &entity, &symbol_short!("fraud"), &None);
+    client.freeze_entity(&admin, &entity);
+    client.unfreeze_entity(&admin, &entity);
+    let new_admin = Address::generate(&env);
+    client.propose_admin(&admin, &new_admin);
+    client.accept_admin(&new_admin);
+    let events = env.events().all();
+    let contract_id = client.address;
+    
+    let mut contract_event_count = 0;
+    for (contract, topics, _) in events.into_iter() {
+        if contract == contract_id {
+            contract_event_count += 1;
+            let namespace: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            assert_eq!(namespace, symbol_short!("reput"), "All reputation events must use the 'reput' namespace");
+        }
+    assert!(contract_event_count > 0);
 }
