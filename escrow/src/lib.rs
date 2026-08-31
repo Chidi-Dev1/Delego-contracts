@@ -2181,7 +2181,11 @@ impl EscrowContract {
         )?;
 
         let key = DataKey::Escrow(escrow_id);
-        let mut record: EscrowRecord = env.storage().persistent().get(&key).unwrap();
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
 
         let token_client = soroban_sdk::token::Client::new(&env, &token);
         token_client.transfer(&buyer, &env.current_contract_address(), &amount);
@@ -2807,13 +2811,16 @@ impl EscrowContract {
     }
 
     /// Read-only getter for escrow state.
-    pub fn get_escrow(env: Env, escrow_id: u64) -> EscrowRecord {
+    ///
+    /// # Errors
+    /// Returns [`EscrowError::NotFound`] when no escrow exists for `escrow_id`.
+    pub fn get_escrow(env: Env, escrow_id: u64) -> Result<EscrowRecord, EscrowError> {
         let key = DataKey::Escrow(escrow_id);
         let record: EscrowRecord = env
             .storage()
             .persistent()
             .get(&key)
-            .expect("Escrow not found");
+            .ok_or(EscrowError::NotFound)?;
         // Reads extend the TTL so a long-lived, open escrow is not evicted
         // while it is still being read (mirrors marketplace `get_merchant`).
         env.storage().persistent().extend_ttl(
@@ -2824,7 +2831,7 @@ impl EscrowContract {
         env.storage()
             .instance()
             .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-        record
+        Ok(record)
     }
 
     /// Read-only buyer-facing receipt for an escrow.
