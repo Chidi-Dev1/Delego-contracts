@@ -17,6 +17,8 @@ use crate::{
     MerchantCategoryChangedEvent, MerchantRegisteredEvent, MerchantStatus, RegisterParams,
     Verifier,
     MerchantStats, MerchantStatus, RegisterParams, Verifier,
+    MerchantStatus, RegisterParams, Verifier, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN,
+    MAX_METADATA_LEN, MAX_NAME_LEN,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -2694,6 +2696,58 @@ fn test_reregistration_after_close_does_not_reuse_id() {
 fn test_category_change_blocked_when_suspended() {
             name: String::from_str(&f.env, "Frozen Shop"),
             image_url: String::from_str(&f.env, "t.png"),
+// --- RegisterParams normalization (#102) ---
+fn test_register_merchant_trims_whitespace_fields() {
+        name: String::from_str(&f.env, "  Padded Store  "),
+        description: String::from_str(&f.env, "\tPadded description\n"),
+        image_url: String::from_str(&f.env, "  https://cdn.example.com/logo.png  "),
+        metadata: Some(String::from_str(&f.env, "  ipfs://Qm123  ")),
+    assert_eq!(merchant.name, String::from_str(&f.env, "Padded Store"));
+        String::from_str(&f.env, "Padded description")
+        merchant.image_url,
+        String::from_str(&f.env, "https://cdn.example.com/logo.png")
+        merchant.metadata,
+        Some(String::from_str(&f.env, "ipfs://Qm123"))
+    // The name index must be keyed by the canonical (trimmed) name, not the
+    // raw whitespace-padded input.
+    assert!(!f
+        .is_name_available(&String::from_str(&f.env, "Padded Store")));
+fn test_register_merchant_whitespace_only_name_rejected() {
+        name: String::from_str(&f.env, "    "),
+        image_url: String::from_str(&f.env, ""),
+    let err = f.client.try_register_merchant(&merchant_addr, &params);
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
+fn test_register_merchant_rejects_over_length_name() {
+    let too_long_name = [b'a'; (MAX_NAME_LEN + 1) as usize];
+        name: String::from_bytes(&f.env, &too_long_name),
+        image_url: String::from_str(&f.env, "https://example.com/x.png"),
+fn test_register_merchant_rejects_over_length_description() {
+    let too_long_description = [b'b'; (MAX_DESCRIPTION_LEN + 1) as usize];
+        name: String::from_str(&f.env, "Valid Name"),
+        description: String::from_bytes(&f.env, &too_long_description),
+fn test_register_merchant_rejects_over_length_image_url() {
+    let too_long_image_url = [b'c'; (MAX_IMAGE_URL_LEN + 1) as usize];
+        image_url: String::from_bytes(&f.env, &too_long_image_url),
+fn test_register_merchant_rejects_over_length_metadata() {
+    let too_long_metadata = [b'd'; (MAX_METADATA_LEN + 1) as usize];
+        metadata: Some(String::from_bytes(&f.env, &too_long_metadata)),
+fn test_register_merchant_accepts_exact_cap_length() {
+    let exact_name = [b'e'; MAX_NAME_LEN as usize];
+    let exact_description = [b'f'; MAX_DESCRIPTION_LEN as usize];
+    let exact_image_url = [b'g'; MAX_IMAGE_URL_LEN as usize];
+    let exact_metadata = [b'h'; MAX_METADATA_LEN as usize];
+        name: String::from_bytes(&f.env, &exact_name),
+        description: String::from_bytes(&f.env, &exact_description),
+        image_url: String::from_bytes(&f.env, &exact_image_url),
+        metadata: Some(String::from_bytes(&f.env, &exact_metadata)),
+    assert_eq!(merchant.name.len(), MAX_NAME_LEN);
+    assert_eq!(merchant.description.len(), MAX_DESCRIPTION_LEN);
+    assert_eq!(merchant.image_url.len(), MAX_IMAGE_URL_LEN);
+    assert_eq!(merchant.metadata.map(|m| m.len()), Some(MAX_METADATA_LEN));
+fn test_update_merchant_profile_trims_and_bounds() {
+            name: String::from_str(&f.env, "Store A"),
+            description: String::from_str(&f.env, "Old Desc"),
+            image_url: String::from_str(&f.env, "old.png"),
             metadata: None,
             required_verifications: 1,
         },
@@ -2781,3 +2835,21 @@ fn test_register_merchant_event_carries_merchant_id_topic() {
             assert_eq!(t2, merchant_id, "reg topic must carry the merchant id");
             found = true;
     assert!(found, "reg event with merchant_id topic not found");
+    // Whitespace on the update path is trimmed the same way as registration.
+    f.client.update_merchant_profile(
+        &String::from_str(&f.env, "  Store A Updated  "),
+        &String::from_str(&f.env, "  New Desc  "),
+        &String::from_str(&f.env, "  new.png  "),
+    let updated = f.client.get_merchant(&id);
+    assert_eq!(updated.name, String::from_str(&f.env, "Store A Updated"));
+    assert_eq!(updated.description, String::from_str(&f.env, "New Desc"));
+    assert_eq!(updated.image_url, String::from_str(&f.env, "new.png"));
+    // An over-length name is rejected with a typed error and does not
+    // mutate stored state.
+    let too_long_name = [b'z'; (MAX_NAME_LEN + 1) as usize];
+        &String::from_bytes(&f.env, &too_long_name),
+        &String::from_str(&f.env, "New Desc"),
+        &String::from_str(&f.env, "new.png"),
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::InvalidParam);
+    let unchanged = f.client.get_merchant(&id);
+    assert_eq!(unchanged.name, String::from_str(&f.env, "Store A Updated"));
