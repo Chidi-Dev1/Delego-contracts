@@ -12,6 +12,15 @@ use soroban_sdk::{
     Address, Env, String,
 };
 
+const MAX_RECORD_CPU_INSTRUCTIONS: u64 = 3_000_000;
+const MAX_RECORD_MEMORY_BYTES: u64 = 3_000_000;
+
+fn assert_record_cost_within_thresholds(env: &Env) {
+    let budget = env.cost_estimate().budget();
+    assert!(budget.cpu_instruction_count() <= MAX_RECORD_CPU_INSTRUCTIONS);
+    assert!(budget.memory_bytes() <= MAX_RECORD_MEMORY_BYTES);
+}
+
 fn default_config() -> ReputationConfig {
     ReputationConfig {
         decay_window_seconds: 90 * 24 * 60 * 60,
@@ -194,6 +203,16 @@ fn test_masking_keeps_score_hidden_below_threshold() {
 }
 
 // --- record_transaction ---
+
+#[test]
+fn test_record_transaction_cost_stays_within_thresholds() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    client.record_transaction(&admin, &1u64, &entity, &counterparty, &1000i128, &TransactionOutcome::Released);
+    assert_record_cost_within_thresholds(&env);
+}
 
 #[test]
 fn test_record_transaction_released_scores_full() {

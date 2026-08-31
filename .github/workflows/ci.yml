@@ -141,3 +141,8 @@ jobs:
             echo "::error::Expected at least 5 .wasm artifacts (one per contract crate), found $count"
             exit 1
           fi
+      - name: Build every workspace member for WASM
+          for package in $(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print("\\n".join(package["name"] for package in json.load(sys.stdin)["packages"]))'); do
+            echo "Building ${package}"
+            cargo build --package "${package}" --target wasm32-unknown-unknown --release
+          done
