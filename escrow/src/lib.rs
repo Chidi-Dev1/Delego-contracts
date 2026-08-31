@@ -2125,6 +2125,7 @@ impl EscrowContract {
                 order_hash: hash.clone(),
                 schema: sch.clone(),
             };
+        if let Some(hash) = order_hash.clone() {
             env.storage()
                 .persistent()
                 .set(&DataKey::EscrowMetadataHash(last_id), &hash);
@@ -4164,6 +4165,17 @@ mod fee_distribution_tests {
     use soroban_sdk::testutils::Address as _;
         let contract_id = env.register(EscrowContract, ());
         client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
+        let contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 250u32,
+                treasury: treasury.clone(),
+                min_amount: 100i128,
+                max_amount: 1_000_000i128,
+            },),
+        );
+        let client = EscrowContractClient::new(env, &contract_id);
         (client, admin, contract_id)
     }
 

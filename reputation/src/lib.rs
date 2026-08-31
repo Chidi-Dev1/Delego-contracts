@@ -205,6 +205,11 @@ mod error_code_allocation {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes.len(), 9, "ReputationError codes must be unique");
+    /// resolve_flag called for a reporter whose flag is already resolved
+    /// (or never existed) — distinguishes the "no active flag" case from
+    /// the generic entity-not-found case.
+    /// resolve_flag called with a reporter that has no flag on this entity
+    /// (someone else's flag cannot be resolved through this reporter).
 }
 
 #[contracttype]
@@ -804,7 +809,7 @@ impl ReputationContract {
         admin.require_auth();
         Self::require_caller_is_admin(&env, &admin)?;
 
-        let key = DataKey::Flags(entity);
+        let key = DataKey::Flags(entity.clone());
         let mut flags: Vec<Flag> = env
             .storage()
             .persistent()
@@ -821,6 +826,21 @@ impl ReputationContract {
         if !has_any_flag {
             return Err(ReputationError::NotFlagReporter);
             return Err(ReputationError::NoActiveFlag);
+        // Error taxonomy (see ReputationError):
+        // - entity never seen on-chain (no reputation record, no relation) → EntityNotFound
+        // - entity known, but there is no flag to resolve for it → NoActiveFlag
+        // - entity has flags, but none from this reporter → NotFlagReporter
+        // - reporter's flag exists but is already resolved → NoActiveFlag
+            let entity_known = env
+                .storage()
+                .persistent()
+                .has(&DataKey::Reputation(entity.clone()))
+                || Self::has_transacted_with(&env, &entity, &reporter);
+            return Err(if entity_known {
+                ReputationError::NoActiveFlag
+            } else {
+                ReputationError::EntityNotFound
+            });
         }
 
         let idx = flags
@@ -837,8 +857,12 @@ impl ReputationContract {
                 .position(|f| f.reporter == reporter && !f.resolved)
                 .ok_or(ReputationError::NotFlagReporter)?
         };
+            .position(|f| f.reporter == reporter)
             .ok_or(ReputationError::NotFlagReporter)?;
         let mut flag = flags.get(idx as u32).unwrap();
+        if flag.resolved {
+            return Err(ReputationError::NoActiveFlag);
+        }
         flag.resolved = true;
         flags.set(idx as u32, flag);
         env.storage().persistent().set(&key, &flags);

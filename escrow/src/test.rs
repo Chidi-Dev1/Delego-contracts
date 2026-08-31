@@ -24,6 +24,16 @@ mod test {
             max_amount: 1_000_000i128,
         };
         let contract_id = env.register(EscrowContract, (config,));
+        let contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 250u32,
+                treasury: treasury.clone(),
+                min_amount: 100i128,
+                max_amount: 1_000_000i128,
+            },),
+        );
         let client = EscrowContractClient::new(env, &contract_id);
         (client, admin, contract_id)
     }
@@ -48,6 +58,23 @@ mod test {
         let res = client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
         assert_eq!(res, true);
 
+        let admin = Address::generate(&env);
+        let fee_bps = 250u32;
+        let min_amount = 100i128;
+        let max_amount = 10000i128;
+        // Register via constructor — the contract is now initialised at deploy time.
+        let contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps,
+                treasury: treasury.clone(),
+                min_amount,
+                max_amount,
+            },),
+        );
+        let client = EscrowContractClient::new(&env, &contract_id);
+        // The contract is already initialised; calling initialize again must fail.
         let res_try = client.try_initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
         let res_try = client.try_initialize(&admin, &250u32, &treasury, &100i128, &10000i128);
         assert_eq!(res_try, Err(Ok(EscrowError::AlreadyInitialized)));
@@ -181,13 +208,35 @@ mod test {
 
         let res = client.try_constructor(&config2);
         assert_eq!(res, Err(Ok(EscrowError::InvalidLimits)));
+    fn test_initialize_rejects_zero_treasury() {
+        // With the constructor pattern, the contract is initialized at deploy time.
+        // The legacy initialize() function is only for backward compat with pre-constructor
+        // contracts; once a constructor is used it always returns AlreadyInitialized.
+        // Zero-treasury validation via the constructor is covered by
+        // test_constructor_rejects_zero_treasury.
+        let contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps: 250u32,
+                treasury: treasury.clone(),
+                min_amount: 100i128,
+                max_amount: 1_000_000i128,
+            },),
+        );
+        // Calling initialize after constructor always fails — state is already set.
+        let res = client.try_initialize(
+            &admin,
+            &250u32,
+            &zero_account(&env),
+            &100i128,
+            &1_000_000i128,
+        assert_eq!(res, Err(Ok(EscrowError::AlreadyInitialized)));
     }
 
     #[test]
     fn test_constructor_initializes_atomically() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let config = EscrowConfig {
@@ -198,9 +247,11 @@ mod test {
             max_amount: 1_000_000i128,
         };
 
-        // Call constructor
-        let res = client.__constructor(&config);
-        assert_eq!(res, Ok(()));
+        // The constructor runs exactly once, atomically, during registration.
+        // (The generated client intentionally has no __constructor method:
+        // constructors are not invocable post-deployment.)
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
 
         // Verify admin is set correctly
         let admin_view = client.get_admin();
@@ -221,8 +272,6 @@ mod test {
     #[test]
     fn test_constructor_vs_initialize_race() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let config = EscrowConfig {
@@ -233,9 +282,9 @@ mod test {
             max_amount: 1_000_000i128,
         };
 
-        // Initialize via constructor
-        let res = client.__constructor(&config);
-        assert_eq!(res, Ok(()));
+        // Initialize via constructor (runs atomically during registration)
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
 
         // Attempt to call initialize after constructor should fail
         let res_try = client.try_initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
@@ -243,80 +292,71 @@ mod test {
     }
 
     #[test]
+    #[should_panic]
     fn test_constructor_rejects_zero_treasury() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let config = EscrowConfig {
-            admin: admin.clone(),
+            admin,
             fee_bps: 250u32,
             treasury: zero_account(&env),
             min_amount: 100i128,
             max_amount: 1_000_000i128,
         };
 
-        let res = client.try___constructor(&config);
-        assert_eq!(res, Err(Ok(EscrowError::InvalidAddress)));
+        // Invalid config aborts deployment: the constructor runs at register.
+        env.register(EscrowContract, (config,));
     }
 
     #[test]
+    #[should_panic]
     fn test_constructor_rejects_invalid_fee_bps() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let config = EscrowConfig {
-            admin: admin.clone(),
-            fee_bps: 1001u32,  // > 1000
+            admin,
+            fee_bps: 1001u32, // > 1000
             treasury,
             min_amount: 100i128,
             max_amount: 1_000_000i128,
         };
 
-        let res = client.try___constructor(&config);
-        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
+        // Invalid config aborts deployment: the constructor runs at register.
+        env.register(EscrowContract, (config,));
     }
 
     #[test]
-    fn test_constructor_rejects_invalid_limits() {
+    #[should_panic]
+    fn test_constructor_rejects_non_positive_min_amount() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
-
-        // Test min_amount <= 0
-        let config1 = EscrowConfig {
-            admin: admin.clone(),
+        let config = EscrowConfig {
+            admin,
             fee_bps: 250u32,
-            treasury: treasury.clone(),
-            min_amount: 0i128,  // <= 0
+            treasury,
+            min_amount: 0i128, // <= 0
             max_amount: 1_000_000i128,
         };
 
-        let res = client.try___constructor(&config1);
-        assert_eq!(res, Err(Ok(EscrowError::InvalidLimits)));
-
-        // Test max_amount < min_amount
-        let config2 = EscrowConfig {
-            admin: admin.clone(),
-            fee_bps: 250u32,
-            treasury: treasury.clone(),
-            min_amount: 1000i128,
-            max_amount: 500i128,  // < min_amount
-        };
-
-        let res = client.try___constructor(&config2);
-        assert_eq!(res, Err(Ok(EscrowError::InvalidLimits)));
+        // Invalid limits abort deployment: the constructor runs at register.
+        env.register(EscrowContract, (config,));
     }
 
     #[test]
-    fn test_getters_return_errors_before_initialization() {
+    #[should_panic]
+    fn test_constructor_rejects_max_below_min() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let config = EscrowConfig {
+            admin,
+            fee_bps: 250u32,
+            treasury,
+            min_amount: 1000i128,
+            max_amount: 500i128, // < min_amount
+        };
 
         assert_eq!(
             client.try_get_fee_config(),
@@ -328,6 +368,24 @@ mod test {
         );
         assert_eq!(client.try_get_admin(), Err(Ok(EscrowError::NotFound)));
         env.register(EscrowContract, (config1,));
+        // Invalid limits abort deployment: the constructor runs at register.
+        env.register(EscrowContract, (config,));
+    }
+
+    #[test]
+    fn test_getters_return_initialized_state() {
+        // The contract is always initialized via constructor at deploy time.
+        // Verify that after constructor registration all getters return expected state.
+        let env = Env::default();
+        let (client, admin, _contract_id) = setup_client(&env);
+        // All getters succeed after constructor initialization.
+        let fee_config = client.get_fee_config();
+        assert_eq!(fee_config.fee_bps, 250u32);
+        let limits = client.get_limits();
+        assert_eq!(limits.min_amount, 100i128);
+        assert_eq!(limits.max_amount, 1_000_000i128);
+        let admin_view = client.get_admin();
+        assert_eq!(admin_view.admin, admin);
     }
 
     #[test]
@@ -1684,6 +1742,19 @@ mod test {
 
         // Generate a dummy oracle address.
         let oracle_id = Address::generate(env);
+        // Register a dummy oracle contract so the address is valid.
+        let dummy_admin = Address::generate(env);
+        let dummy_treasury = Address::generate(env);
+        let oracle_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: dummy_admin,
+                fee_bps: 0u32,
+                treasury: dummy_treasury,
+                min_amount: 1i128,
+                max_amount: 1_000_000i128,
+            },),
+        );
         let condition_type = symbol_short!("delivery");
         client.set_release_condition(admin, &escrow_id, &condition_type, &oracle_id);
         escrow_id

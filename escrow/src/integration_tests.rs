@@ -54,6 +54,16 @@ impl TestEnv {
             max_amount,
         };
         let escrow_contract_id = env.register(EscrowContract, (config,));
+        let escrow_contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps,
+                treasury: treasury.clone(),
+                min_amount: 100i128,
+                max_amount: 10000i128,
+            },),
+        );
         let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
         escrow_client.add_token(&admin, &token_contract_id);
 
@@ -146,6 +156,16 @@ fn test_add_token_by_non_admin_fails() {
         max_amount,
     };
     let escrow_contract_id = env.register(EscrowContract, (config,));
+    let escrow_contract_id = env.register(
+        EscrowContract,
+        (EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 100i128,
+            max_amount: 10000i128,
+        },),
+    );
     let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
 
     let new_token = Address::generate(&env);
@@ -994,6 +1014,16 @@ fn test_version_callable_without_auth() {
         max_amount: 10000i128,
     };
     let contract_id = env.register(EscrowContract, (config,));
+    let contract_id = env.register(
+        EscrowContract,
+        (EscrowConfig {
+            admin,
+            fee_bps: 0u32,
+            treasury,
+            min_amount: 100i128,
+            max_amount: 10000i128,
+        },),
+    );
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let version = client.version();
