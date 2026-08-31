@@ -16,6 +16,13 @@ const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
 
 /// Represents the lifecycle status of a delegation.
+/// Contract version information for deployment scripts and runtime compatibility checks.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractVersion {
+    pub name: Symbol,
+    pub semver: Symbol,
+}
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DelegationStatus {
@@ -221,6 +228,15 @@ pub struct DelegationRegistry;
 #[contractimpl]
 impl DelegationRegistry {
     /// Initializes the registry with the admin address.
+    /// Return the contract name and semantic version.
+    /// Callable without authentication — safe for off-chain tooling.
+    pub fn version(_env: Env) -> ContractVersion {
+        ContractVersion {
+            name: symbol_short!("deleg_reg"),
+            semver: symbol_short!("0_0_1"),
+        }
+    }
+
     pub fn initialize(env: Env, admin: Address) -> Result<bool, DelegationError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(DelegationError::AlreadyInitialized);
