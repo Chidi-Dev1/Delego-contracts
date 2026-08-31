@@ -8,12 +8,6 @@
 #![cfg_attr(not(test), no_std)]
 #![warn(missing_docs)]
 #![no_std]
-// `create` and `deposit` have 9 parameters — more than clippy's default limit of 7.
-// These are Soroban contract entry points whose signatures are part of the
-// published on-chain ABI; restructuring them would be a breaking change.
-// The `contractargs` proc-macro also generates wrapper functions that exceed the
-// limit, which cannot be annotated individually from user code.
-#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     InvokeError, Symbol, Vec,
@@ -398,6 +392,7 @@ pub struct FeeConfig {
 
 /// Complete escrow configuration including admin and fee parameters.
 /// Used by `constructor` to atomically initialize the contract at deploy time
+/// Used by `__constructor` to atomically initialize the contract at deploy time
 /// without requiring post-deployment initialization calls that could be front-run.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -975,6 +970,7 @@ impl EscrowContract {
     /// Returns [`EscrowError::InvalidLimits`] if min_amount <= 0 or max_amount < min_amount.
     /// Returns [`EscrowError::InvalidAddress`] if treasury is a zero address.
     pub fn constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
+    pub fn __constructor(env: Env, config: EscrowConfig) -> Result<(), EscrowError> {
         // Validate configuration
         if config.fee_bps > 1000 {
             return Err(EscrowError::InvalidFeeBps);
@@ -996,6 +992,10 @@ impl EscrowContract {
                 treasury: config.treasury.clone(),
             },
         );
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfig, &FeeConfig {
+            });
         env.storage().instance().set(
             &DataKey::AmountLimits,
             &EscrowAmountLimits {
@@ -1011,6 +1011,7 @@ impl EscrowContract {
     ///
     /// # Deprecation Note
     /// For new deployments, prefer [`constructor`] which is called atomically at deploy time
+    /// For new deployments, prefer [`__constructor`] which is called atomically at deploy time
     /// and cannot be front-run. This function exists for backward compatibility with legacy
     /// contracts deployed before the constructor pattern was available.
     pub fn initialize(
@@ -1507,6 +1508,7 @@ impl EscrowContract {
 
         if shares.len() > MAX_TREASURIES {
             return Err(EscrowError::MaxTreasuriesExceeded);
+            return Err(EscrowError::InvalidFeeBps);
         }
 
         let mut total_bps: u32 = 0;
@@ -2943,6 +2945,7 @@ impl EscrowContract {
             .persistent()
             .get(&key)
             .ok_or(EscrowError::NotFound)?;
+            .expect("Escrow not found");
         // Reads extend the TTL so a long-lived, open escrow is not evicted
         // while it is still being read (mirrors marketplace `get_merchant`).
         env.storage().persistent().extend_ttl(
@@ -2954,6 +2957,7 @@ impl EscrowContract {
             .instance()
             .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         Ok(record)
+        record
     }
 
     /// Read-only buyer-facing receipt for an escrow.
@@ -4120,6 +4124,9 @@ mod fee_distribution_tests {
         let contract_id = env.register(EscrowContract, (config,));
         let client = EscrowContractClient::new(env, &contract_id);
         env.mock_all_auths();
+    use soroban_sdk::testutils::Address as _;
+        let contract_id = env.register(EscrowContract, ());
+        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
         (client, admin, contract_id)
     }
 
@@ -4186,6 +4193,37 @@ mod fee_distribution_tests {
 
         assert!(client.set_fee_distribution(&admin, &shares.clone()));
         assert_eq!(client.get_fee_distribution(), shares);
+    }
+}
+
+#[cfg(test)]
+mod batch_flow_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn batch_release_missing_escrow_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
+
+        let caller = Address::generate(&env);
+        let releases = soroban_sdk::vec![
+            &env,
+            BatchReleaseParams {
+                escrow_id: 999,
+                release_amount: 1,
+            }
+        ];
+
+        assert_eq!(
+            client.try_batch_release(&caller, &releases),
+            Err(Ok(EscrowError::NotFound))
+        );
     }
 }
 
