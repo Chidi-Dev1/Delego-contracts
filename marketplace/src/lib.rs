@@ -69,6 +69,16 @@ pub struct DiscoveryPage {
     pub total: u32,
     pub next_offset: Option<u32>,
     pub next_cursor: Option<u64>,
+pub struct MerchantOperationalView {
+    pub id: u64,
+    pub name: String,
+    pub status: MerchantStatus,
+    pub verified: bool,
+    pub effective: bool,   // verified && status == Verified
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1172,6 +1182,20 @@ impl MarketplaceContract {
     pub fn get_merchant_view(env: Env, merchant_id: u64) -> Result<MerchantView, MarketplaceError> {
         let detailed = Self::get_merchant_view_detailed(env, merchant_id)?;
         Ok(detailed.view)
+    pub fn get_merchant_operational_view(
+        env: Env,
+        merchant_id: u64,
+    ) -> Result<MerchantOperationalView, MarketplaceError> {
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
+
+        let effective = merchant.verified && merchant.status == MerchantStatus::Verified;
+        Ok(MerchantOperationalView {
+            id: merchant.id,
+            name: merchant.name,
+            status: merchant.status,
+            verified: merchant.verified,
+            effective,
+        })
     }
 
     pub fn get_merchants(
@@ -2041,3 +2065,107 @@ mod overflow_tests {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod merchant_operational_view_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Address, Env, String, Symbol};
+
+    fn seed_merchant(
+        env: &Env,
+        contract_id: &soroban_sdk::BytesN<32>,
+        id: u64,
+        status: MerchantStatus,
+        verified: bool,
+    ) {
+        let merchant = Merchant {
+            id,
+            owner: None,
+            name: String::from_slice(env, b"Matrix Merchant"),
+            description: String::from_slice(env, b""),
+            category: Symbol::new(env, "general"),
+            image_url: String::from_slice(env, b""),
+            commission_rate_bps: 0,
+            metadata: None,
+            status,
+            verified,
+            created_at: 0,
+            updated_at: 0,
+            reputation: None,
+        };
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Merchant(id), &merchant);
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantName(merchant.name.clone()), &id);
+        });
+    }
+
+    #[test]
+    fn operational_view_effective_matrix() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, MarketplaceContract);
+        let client = MarketplaceContractClient::new(&env, contract_id.clone());
+        drop(client.__constructor(&admin));
+
+        let cases = [
+            (MerchantStatus::Registered, false, false),
+            (MerchantStatus::Registered, true, false),
+            (MerchantStatus::Verified, false, false),
+            (MerchantStatus::Verified, true, true),
+            (MerchantStatus::Suspended, false, false),
+            (MerchantStatus::Suspended, true, false),
+            (MerchantStatus::Closed, false, false),
+            (MerchantStatus::Closed, true, false),
+        ];
+
+        for (i, (status, verified, effective)) in cases.iter().enumerate() {
+            let id = i as u64 + 1;
+            seed_merchant(&env, &contract_id, id, *status, *verified);
+            let view = client.get_merchant_operational_view(&id).unwrap();
+            assert_eq!(view.status, *status);
+            assert_eq!(view.verified, *verified);
+            assert_eq!(view.effective, *effective);
+        }
+    }
+
+    #[test]
+    fn suspend_keeps_verified_flag_but_not_effective() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register_contract(None, MarketplaceContract);
+        let client = MarketplaceContractClient::new(&env, contract_id.clone());
+        drop(client.__constructor(&admin));
+
+        let verifier = Verifier {
+            address: Address::generate(&env),
+            label: Symbol::new(&env, "gov"),
+            registered_at: 0,
+        };
+        drop(client.add_verifier(&admin, &verifier));
+
+        let owner = Address::generate(&env);
+        let params = RegisterParams {
+            name: String::from_slice(&env, b"Verified Merchant"),
+            description: String::from_slice(&env, b"desc"),
+            category: Symbol::new(&env, "general"),
+            image_url: String::from_slice(&env, b"https://example.com/img.png"),
+            metadata: None,
+            required_verifications: 1,
+        };
+        let id = client.register_merchant(&owner, &params).unwrap();
+        drop(client.verify_merchant(&id, &verifier.address));
+        drop(client.suspend_merchant(&admin, &id));
+
+        let view = client.get_merchant_operational_view(&id).unwrap();
+        assert_eq!(view.status, MerchantStatus::Suspended);
+        assert!(view.verified);
+        assert!(!view.effective);
+    }
+}

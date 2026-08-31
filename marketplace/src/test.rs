@@ -12,6 +12,7 @@ use crate::{
     MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantRegisteredEvent,
     MerchantStatus, RegisterParams, Verifier,
     MerchantStatus, MerchantValidationError, RegisterParams, Verifier,
+    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantOperationalView,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -107,6 +108,124 @@ fn test_register_merchant_happy_path() {
     assert_eq!(view.id, 1);
     assert!(!view.verified);
     assert_eq!(view.reputation_score, None);
+}
+
+#[test]
+fn test_merchant_operational_view_combinations() {
+    let f = TestFixture::setup();
+
+    // Registered + unverified
+    let owner1 = Address::generate(&f.env);
+    let id1 = f.client.register_merchant(
+        &owner1,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Registered Unverified"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+    let view: MerchantOperationalView = f.client.get_merchant_operational_view(&id1);
+    assert_eq!(view.id, id1);
+    assert_eq!(view.name, String::from_str(&f.env, "Registered Unverified"));
+    assert_eq!(view.status, MerchantStatus::Registered);
+    assert!(!view.verified);
+    assert!(!view.effective);
+
+    // Verified + verified (effective active)
+    let owner2 = Address::generate(&f.env);
+    let verifier = Address::generate(&f.env);
+    f.client.add_verifier(
+        &f.admin,
+        &Verifier {
+            address: verifier.clone(),
+            label: symbol_short!("kyc"),
+            registered_at: 1,
+        },
+    );
+    let id2 = f.client.register_merchant(
+        &owner2,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Verified Active"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+    f.client.verify_merchant(&id2, &verifier);
+    let view = f.client.get_merchant_operational_view(&id2);
+    assert_eq!(view.status, MerchantStatus::Verified);
+    assert!(view.verified);
+    assert!(view.effective);
+
+    // Suspended + verified (gap case)
+    f.client.suspend_merchant(&f.admin, &id2);
+    let view = f.client.get_merchant_operational_view(&id2);
+    assert_eq!(view.status, MerchantStatus::Suspended);
+    assert!(view.verified);
+    assert!(!view.effective);
+
+    // Suspended + unverified
+    let owner3 = Address::generate(&f.env);
+    let id3 = f.client.register_merchant(
+        &owner3,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Suspended Unverified"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+    f.client.suspend_merchant(&f.admin, &id3);
+    let view = f.client.get_merchant_operational_view(&id3);
+    assert_eq!(view.status, MerchantStatus::Suspended);
+    assert!(!view.verified);
+    assert!(!view.effective);
+
+    // Closed + verified
+    let owner4 = Address::generate(&f.env);
+    let id4 = f.client.register_merchant(
+        &owner4,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Closed Verified"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+    f.client.verify_merchant(&id4, &verifier);
+    f.client.close_merchant(&f.admin, &id4, &symbol_short!("miscond"));
+    let view = f.client.get_merchant_operational_view(&id4);
+    assert_eq!(view.status, MerchantStatus::Closed);
+    assert!(view.verified);
+    assert!(!view.effective);
+
+    // Closed + unverified
+    let owner5 = Address::generate(&f.env);
+    let id5 = f.client.register_merchant(
+        &owner5,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Closed Unverified"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+    f.client.close_merchant(&f.admin, &id5, &symbol_short!("miscond"));
+    let view = f.client.get_merchant_operational_view(&id5);
+    assert_eq!(view.status, MerchantStatus::Closed);
+    assert!(!view.verified);
+    assert!(!view.effective);
 }
 
 #[test]
