@@ -287,6 +287,10 @@ pub struct CategoryAddedEvent {
 pub struct CategoryRemovedEvent {
     pub key: Symbol,
     pub removed_by: Address,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantPrunedEvent {
+    pub pruned_count: u32,
+    pub pruned_by: Address,
 }
 
 // --- Storage Keys ---
@@ -1552,6 +1556,71 @@ impl MarketplaceContract {
         );
 
         Ok(())
+    }
+
+    /// Prunes closed merchants from `MerchantIds` and `CategoryIndex` (state maintenance).
+    ///
+    /// Callable by admin in bounded batches (`merchant_ids.len() <= MAX_PAGE_LIMIT`).
+    /// Returns the number of closed merchants pruned from active indices.
+    pub fn prune_closed_merchants(
+        env: Env,
+        admin: Address,
+        merchant_ids: Vec<u64>,
+    ) -> Result<u32, MarketplaceError> {
+        admin.require_auth();
+        let current_admin = Self::get_admin(env.clone())?;
+        if admin != current_admin {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        if merchant_ids.len() > MAX_PAGE_LIMIT {
+            return Err(MarketplaceError::InvalidParam);
+        }
+
+        let mut all_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantIds)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut pruned_count: u32 = 0;
+
+        for id in merchant_ids.iter() {
+            if let Ok(merchant) = Self::get_merchant(env.clone(), id) {
+                if merchant.status == MerchantStatus::Closed {
+                    let mut modified = false;
+                    if let Some(pos) = all_ids.iter().position(|x| x == id) {
+                        all_ids.remove(pos as u32);
+                        modified = true;
+                    }
+                    let cat_key = DataKey::CategoryIndex(merchant.category.clone());
+                    if let Some(mut cat_ids) =
+                        env.storage().persistent().get::<_, Vec<u64>>(&cat_key)
+                    {
+                        if let Some(pos) = cat_ids.iter().position(|x| x == id) {
+                            cat_ids.remove(pos as u32);
+                            env.storage().persistent().set(&cat_key, &cat_ids);
+                        }
+                    }
+                    if modified {
+                        pruned_count += 1;
+                    }
+                }
+            }
+        }
+
+        if pruned_count > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantIds, &all_ids);
+            env.events().publish(
+                (symbol_short!("mkplc"), symbol_short!("pruned")),
+                MerchantPrunedEvent {
+                    pruned_count,
+                    pruned_by: admin,
+                },
+            );
+        }
+
+        Ok(pruned_count)
     }
 
     // --- Reputation Pairing Config ---

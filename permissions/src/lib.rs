@@ -38,6 +38,7 @@ pub const MAX_VELOCITY_INTERVAL: u32 = 6_307_200;
 pub const DEFAULT_DECREASE_TIMELOCK_SECS: u64 = 86_400;
 /// Maximum configurable allowance-decrease timelock (30 days).
 pub const MAX_DECREASE_TIMELOCK_SECS: u64 = 2_592_000;
+pub const MAX_SWEEP_BATCH: u32 = 50;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -1714,6 +1715,7 @@ impl PermissionsContract {
         // since the last recorded spend ledger for this (owner, delegate) pair.
         // Shared with execute_spend so direct and relayed spends share the
         // same throttle (issue #179).
+        // Velocity check for relayed spend path
         Self::check_velocity(&env, &owner, &delegate)?;
 
         // Advance the nonce before mutating spend state so a replay attempt
@@ -2574,6 +2576,107 @@ impl PermissionsContract {
         Self::append_audit_log(&env, &owner, &delegate, caller, symbol_short!("expired"));
 
         Ok(true)
+    }
+
+    /// Bounded batch version of [`Self::sweep_expired`].
+    ///
+    /// Callable by anyone. Up to `MAX_SWEEP_BATCH` (50) `(owner, delegate)` pairs can be provided.
+    /// Iterates through the pairs, updating eligible records to `PermissionStatus::Expired`.
+    /// Returns the number of transitioned records.
+    pub fn sweep_expired_batch(
+        env: Env,
+        pairs: Vec<(Address, Address)>,
+        caller: Address,
+    ) -> Result<u32, PermissionError> {
+        caller.require_auth();
+
+        if pairs.len() > MAX_SWEEP_BATCH {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let mut transitioned: u32 = 0;
+        for (owner, delegate) in pairs.iter() {
+            let key = DataKey::Permission(owner.clone(), delegate.clone());
+            if let Some(mut record) = env.storage().persistent().get::<_, PermissionRecord>(&key) {
+                if record.status == PermissionStatus::Active
+                    && env.ledger().sequence() >= record.expires_at_ledger
+                {
+                    record.status = PermissionStatus::Expired;
+                    env.storage().persistent().set(&key, &record);
+                    Self::append_audit_log(
+                        &env,
+                        &owner,
+                        &delegate,
+                        caller.clone(),
+                        symbol_short!("expired"),
+                    );
+                    transitioned += 1;
+                }
+            }
+        }
+
+        Ok(transitioned)
+    }
+
+    /// Bounded batch version of [`Self::sweep_inactive`].
+    ///
+    /// Callable by anyone. Up to `MAX_SWEEP_BATCH` (50) `(owner, delegate)` pairs can be provided.
+    /// Iterates through the pairs, revoking inactive permissions that have sat idle past the inactivity threshold.
+    /// Returns the number of transitioned records.
+    pub fn sweep_inactive_batch(
+        env: Env,
+        pairs: Vec<(Address, Address)>,
+        caller: Address,
+    ) -> Result<u32, PermissionError> {
+        caller.require_auth();
+
+        if pairs.len() > MAX_SWEEP_BATCH {
+            return Err(PermissionError::InvalidParam);
+        }
+
+        let threshold = Self::get_inactivity_threshold(env.clone());
+        if threshold == 0 {
+            return Err(PermissionError::InactivityThresholdNotSet);
+        }
+
+        let current_time = env.ledger().timestamp();
+        let mut transitioned: u32 = 0;
+
+        for (owner, delegate) in pairs.iter() {
+            let key = DataKey::Permission(owner.clone(), delegate.clone());
+            if let Some(mut record) = env.storage().persistent().get::<_, PermissionRecord>(&key) {
+                if record.status == PermissionStatus::Active
+                    && record.spent == 0
+                    && current_time >= record.created_at + threshold
+                {
+                    record.status = PermissionStatus::Revoked;
+                    env.storage().persistent().set(&key, &record);
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::PendingDecrement(owner.clone(), delegate.clone()));
+
+                    env.events().publish(
+                        (symbol_short!("perm"), symbol_short!("autorevk")),
+                        PermissionRevokedEvent {
+                            owner: owner.clone(),
+                            delegate: delegate.clone(),
+                        },
+                    );
+
+                    Self::append_audit_log(
+                        &env,
+                        &owner,
+                        &delegate,
+                        caller.clone(),
+                        symbol_short!("autorevk"),
+                    );
+
+                    transitioned += 1;
+                }
+            }
+        }
+
+        Ok(transitioned)
     }
 
     /// Configure the minimum number of ledgers that must elapse between successive

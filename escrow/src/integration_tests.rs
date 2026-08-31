@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use crate::{
-    BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowContract,
+    BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig, EscrowContract,
     EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
     MAX_TREASURIES,
 };
@@ -44,11 +44,17 @@ impl TestEnv {
             soroban_sdk::token::StellarAssetClient::new(&env, &token_contract_id);
         token_admin_client.mint(&buyer, &10000);
 
-        let escrow_contract_id = env.register(EscrowContract, ());
-        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
         let min_amount = 100i128;
         let max_amount = 10000i128;
-        escrow_client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps,
+            treasury,
+            min_amount,
+            max_amount,
+        };
+        let escrow_contract_id = env.register(EscrowContract, (config,));
+        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
         escrow_client.add_token(&admin, &token_contract_id);
 
         TestEnv {
@@ -129,12 +135,18 @@ fn test_add_token_by_non_admin_fails() {
     let agent = Address::generate(&env);
     let treasury = Address::generate(&env);
 
-    let escrow_contract_id = env.register(EscrowContract, ());
-    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
     let fee_bps = 0u32;
     let min_amount = 100i128;
     let max_amount = 10000i128;
-    escrow_client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
+    let config = EscrowConfig {
+        admin: admin.clone(),
+        fee_bps,
+        treasury,
+        min_amount,
+        max_amount,
+    };
+    let escrow_contract_id = env.register(EscrowContract, (config,));
+    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
 
     let new_token = Address::generate(&env);
 
@@ -972,7 +984,16 @@ fn test_get_merchant_receipt_not_found() {
 fn test_version_callable_without_auth() {
     let env = Env::default();
     // Intentionally do NOT mock all auths — version() requires no auth.
-    let contract_id = env.register(EscrowContract, ());
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let config = EscrowConfig {
+        admin,
+        fee_bps: 0u32,
+        treasury,
+        min_amount: 100i128,
+        max_amount: 10000i128,
+    };
+    let contract_id = env.register(EscrowContract, (config,));
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let version = client.version();

@@ -4,6 +4,8 @@ use delego_escrow::{BatchDepositParams, EscrowContract, EscrowContractClient, Es
 use delego_marketplace::{
     ExternalReputationScore, MarketplaceContract, MarketplaceContractClient, MerchantView,
     ReputationResolution,
+use delego_escrow::{
+    BatchDepositParams, EscrowConfig, EscrowContract, EscrowContractClient, EscrowStatus,
 };
 use delego_permissions::{
     PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
@@ -70,14 +72,20 @@ impl TestEnv {
             soroban_sdk::token::StellarAssetClient::new(&env, &token_contract_id);
         token_admin_client.mint(&buyer, &10000);
 
-        let escrow_contract_id = env.register(EscrowContract, ());
-        let permissions_contract_id = env.register(PermissionsContract, ());
-
-        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
         let fee_bps = 0u32; // 0% for tests
         let min_amount = 100i128;
         let max_amount = 10000i128;
-        escrow_client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps,
+            treasury,
+            min_amount,
+            max_amount,
+        };
+        let escrow_contract_id = env.register(EscrowContract, (config,));
+        let permissions_contract_id = env.register(PermissionsContract, ());
+
+        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
         escrow_client.add_token(&admin, &token_contract_id);
 
         TestEnv {

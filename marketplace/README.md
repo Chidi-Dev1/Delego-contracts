@@ -49,11 +49,12 @@ pub fn set_merchant_commission(env: Env, merchant_id: u64, caller: Address, comm
 pub fn get_commission(env: Env, merchant_id: u64) -> Result<u32, MarketplaceError>
 ```
 
-### Moderation & Security
+### Moderation & Maintenance
 ```rust
 pub fn suspend_merchant(env: Env, admin: Address, merchant_id: u64) -> Result<(), MarketplaceError>
 pub fn unsuspend_merchant(env: Env, admin: Address, merchant_id: u64) -> Result<(), MarketplaceError>
 pub fn close_merchant(env: Env, admin: Address, merchant_id: u64, reason: Symbol) -> Result<(), MarketplaceError>
+pub fn prune_closed_merchants(env: Env, admin: Address, merchant_ids: Vec<u64>) -> Result<u32, MarketplaceError>
 ```
 
 ### Reputation & Admin

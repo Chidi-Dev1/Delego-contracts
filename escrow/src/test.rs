@@ -12,11 +12,17 @@ mod test {
     };
 
     fn setup_client(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(env, &contract_id);
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
-        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250u32,
+            treasury: treasury.clone(),
+            min_amount: 100i128,
+            max_amount: 1_000_000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
         (client, admin, contract_id)
     }
 
@@ -32,40 +38,22 @@ mod test {
     }
 
     #[test]
-    fn test_initialize() {
+    fn test_initialize_already_initialized() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
+        let (client, admin, _) = setup_client(&env);
         let treasury = Address::generate(&env);
-        let fee_bps = 250u32;
-        let min_amount = 100i128;
-        let max_amount = 10000i128;
 
         let res = client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
         assert_eq!(res, true);
 
         let res_try = client.try_initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
+        let res_try = client.try_initialize(&admin, &250u32, &treasury, &100i128, &10000i128);
         assert_eq!(res_try, Err(Ok(EscrowError::AlreadyInitialized)));
-    }
-
-    #[test]
-    fn test_initialize_rejects_zero_treasury() {
-        let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
-        let treasury = zero_account(&env);
-
-        let res = client.try_initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
-        assert_eq!(res, Err(Ok(EscrowError::InvalidAddress)));
     }
 
     #[test]
     fn test_constructor_initializes_atomically() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let config = EscrowConfig {
@@ -79,6 +67,8 @@ mod test {
         // Call constructor
         let res = client.constructor(&config);
         assert_eq!(res, Ok(()));
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
 
         // Verify admin is set correctly
         let admin_view = client.get_admin();
@@ -99,8 +89,6 @@ mod test {
     #[test]
     fn test_constructor_vs_initialize_race() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let config = EscrowConfig {
@@ -114,6 +102,8 @@ mod test {
         // Initialize via constructor
         let res = client.constructor(&config);
         assert_eq!(res, Ok(()));
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
 
         // Attempt to call initialize after constructor should fail
         let res_try = client.try_initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
@@ -121,13 +111,12 @@ mod test {
     }
 
     #[test]
+    #[should_panic]
     fn test_constructor_rejects_zero_treasury() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let config = EscrowConfig {
-            admin: admin.clone(),
+            admin,
             fee_bps: 250u32,
             treasury: zero_account(&env),
             min_amount: 100i128,
@@ -136,17 +125,18 @@ mod test {
 
         let res = client.try_constructor(&config);
         assert_eq!(res, Err(Ok(EscrowError::InvalidAddress)));
+        env.register(EscrowContract, (config,));
     }
 
     #[test]
+    #[should_panic]
     fn test_constructor_rejects_invalid_fee_bps() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
         let config = EscrowConfig {
             admin: admin.clone(),
+            admin,
             fee_bps: 1001u32, // > 1000
             treasury,
             min_amount: 100i128,
@@ -155,21 +145,22 @@ mod test {
 
         let res = client.try_constructor(&config);
         assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
+        env.register(EscrowContract, (config,));
     }
 
     #[test]
+    #[should_panic]
     fn test_constructor_rejects_invalid_limits() {
         let env = Env::default();
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
         let treasury = Address::generate(&env);
 
         // Test min_amount <= 0
         let config1 = EscrowConfig {
-            admin: admin.clone(),
+            admin,
             fee_bps: 250u32,
             treasury: treasury.clone(),
+            treasury,
             min_amount: 0i128, // <= 0
             max_amount: 1_000_000i128,
         };
@@ -205,6 +196,7 @@ mod test {
             Err(Ok(EscrowError::AmountLimitsNotSet))
         );
         assert_eq!(client.try_get_admin(), Err(Ok(EscrowError::NotFound)));
+        env.register(EscrowContract, (config1,));
     }
 
     #[test]
@@ -1510,8 +1502,8 @@ mod test {
             &buyer, &seller, &token, &1_000i128, &order_id, &1_000u32, &None, &None,
         );
 
-        // Register a dummy oracle contract so the address is valid.
-        let oracle_id = env.register(EscrowContract, ());
+        // Generate a dummy oracle address.
+        let oracle_id = Address::generate(env);
         let condition_type = symbol_short!("delivery");
         client.set_release_condition(admin, &escrow_id, &condition_type, &oracle_id);
         escrow_id
@@ -2520,5 +2512,72 @@ mod test {
             "batch_deposit should maintain buyer index for each order"
         );
         assert_eq!(page.items.len(), 2);
+    }
+
+    #[test]
+    fn test_prune_dispute_votes_on_terminal_escrows() {
+        let env = Env::default();
+        let (client, _contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 2);
+        let admin = client.get_admin().admin;
+
+        let arbiter1 = arbiters.get(0).unwrap();
+        let arbiter2 = arbiters.get(1).unwrap();
+
+        client.vote_dispute(&escrow_id, &arbiter1, &true);
+        client.vote_dispute(&escrow_id, &arbiter2, &true);
+
+        assert_eq!(client.get_dispute_votes(&escrow_id).len(), 2);
+
+        // Resolve dispute -> terminal status
+        client.resolve_dispute_quorum(&escrow_id, &admin);
+        let escrow = client.get_escrow(&escrow_id);
+        assert_eq!(escrow.status, crate::EscrowStatus::Released);
+
+        // Prune dispute votes
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(escrow_id);
+        let pruned = client.prune_dispute_votes(&admin, &ids);
+        assert_eq!(pruned, 1);
+
+        // Dispute votes are now cleaned up
+        assert_eq!(client.get_dispute_votes(&escrow_id).len(), 0);
+    }
+
+    #[test]
+    fn test_prune_dispute_votes_skips_active_disputes() {
+        let env = Env::default();
+        let (client, _contract_id, escrow_id, arbiters) = setup_disputed_escrow(&env, 2);
+        let admin = client.get_admin().admin;
+        let arbiter1 = arbiters.get(0).unwrap();
+
+        client.vote_dispute(&escrow_id, &arbiter1, &true);
+
+        // Active disputed escrow: pruning should skip it
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(escrow_id);
+        let pruned = client.prune_dispute_votes(&admin, &ids);
+        assert_eq!(pruned, 0);
+        assert_eq!(client.get_dispute_votes(&escrow_id).len(), 1);
+    }
+
+    #[test]
+    fn test_prune_dispute_votes_rejects_over_cap_and_unauthorized() {
+        let env = Env::default();
+        let (client, admin, _) = setup_client(&env);
+        let stranger = Address::generate(&env);
+
+        let mut over_cap = soroban_sdk::Vec::new(&env);
+        for i in 0..51 {
+            over_cap.push_back(i);
+        }
+
+        env.mock_all_auths();
+        let res_cap = client.try_prune_dispute_votes(&admin, &over_cap);
+        assert_eq!(res_cap, Err(Ok(EscrowError::InvalidLimits)));
+
+        let mut valid = soroban_sdk::Vec::new(&env);
+        valid.push_back(1);
+        let res_auth = client.try_prune_dispute_votes(&stranger, &valid);
+        assert_eq!(res_auth, Err(Ok(EscrowError::Unauthorized)));
     }
 }

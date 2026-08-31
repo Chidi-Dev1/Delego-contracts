@@ -1,7 +1,9 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod test {
-    use crate::{PermissionError, PermissionsContract, PermissionsContractClient};
+    use crate::{
+        PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
+    };
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
         Address, Env, IntoVal, TryIntoVal, Vec,
@@ -2816,5 +2818,136 @@ mod test {
         // confirming the rejected calls left no half-written state.
             client.try_grant(&owner, &delegate, &1000, &100, &merchants, &10_000),
             11_000
+    }
+
+    // --- Batch sweep tests ---
+
+    #[test]
+    fn test_sweep_expired_batch_transitions_eligible() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate1 = Address::generate(&env);
+        let delegate2 = Address::generate(&env);
+        let caller = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let merchants = Vec::<Address>::new(&env);
+        // delegate1 expires at ledger 10, delegate2 expires at ledger 100
+        client.grant(&owner, &delegate1, &1000, &100, &merchants, &10);
+        client.grant(&owner, &delegate2, &1000, &100, &merchants, &100);
+
+        // Advance ledger to 50
+        env.ledger().set_sequence_number(50);
+
+        let mut pairs = Vec::<(Address, Address)>::new(&env);
+        pairs.push_back((owner.clone(), delegate1.clone()));
+        pairs.push_back((owner.clone(), delegate2.clone()));
+
+        let transitioned = client.sweep_expired_batch(&pairs, &caller);
+        assert_eq!(transitioned, 1);
+
+        let perm1 = client.get_permission(&owner, &delegate1);
+        assert_eq!(perm1.status, PermissionStatus::Expired);
+
+        let perm2 = client.get_permission(&owner, &delegate2);
+        assert_eq!(perm2.status, PermissionStatus::Active);
+    }
+
+    #[test]
+    fn test_sweep_expired_batch_rejects_over_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let caller = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let mut pairs = Vec::<(Address, Address)>::new(&env);
+        for _ in 0..51 {
+            pairs.push_back((owner.clone(), delegate.clone()));
+        }
+
+        let res = client.try_sweep_expired_batch(&pairs, &caller);
+        assert_eq!(res, Err(Ok(PermissionError::InvalidParam)));
+    }
+
+    #[test]
+    fn test_sweep_inactive_batch_transitions_eligible() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let delegate1 = Address::generate(&env);
+        let delegate2 = Address::generate(&env);
+        let caller = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        client.set_admin(&admin);
+        client.set_inactivity_threshold(&admin, &1000);
+
+        env.ledger().set_timestamp(100);
+        let merchants = Vec::<Address>::new(&env);
+        client.grant(&owner, &delegate1, &1000, &100, &merchants, &10000);
+
+        env.ledger().set_timestamp(800);
+        client.grant(&owner, &delegate2, &1000, &100, &merchants, &10000);
+
+        // Advance timestamp to 1200: delegate1 (created 100, elapsed 1100 > 1000) is eligible,
+        // delegate2 (created 800, elapsed 400 < 1000) is not eligible.
+        env.ledger().set_timestamp(1200);
+
+        let mut pairs = Vec::<(Address, Address)>::new(&env);
+        pairs.push_back((owner.clone(), delegate1.clone()));
+        pairs.push_back((owner.clone(), delegate2.clone()));
+
+        let transitioned = client.sweep_inactive_batch(&pairs, &caller);
+        assert_eq!(transitioned, 1);
+
+        let perm1 = client.get_permission(&owner, &delegate1);
+        assert_eq!(perm1.status, PermissionStatus::Revoked);
+
+        let perm2 = client.get_permission(&owner, &delegate2);
+        assert_eq!(perm2.status, PermissionStatus::Active);
+    }
+
+    #[test]
+    fn test_sweep_inactive_batch_rejects_unset_threshold_or_over_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+        let caller = Address::generate(&env);
+
+        let contract_id = env.register(PermissionsContract, ());
+        let client = PermissionsContractClient::new(&env, &contract_id);
+
+        let mut pairs = Vec::<(Address, Address)>::new(&env);
+        pairs.push_back((owner.clone(), delegate.clone()));
+
+        // Threshold not set
+        let res_no_thresh = client.try_sweep_inactive_batch(&pairs, &caller);
+        assert_eq!(
+            res_no_thresh,
+            Err(Ok(PermissionError::InactivityThresholdNotSet))
+        );
+
+        let admin = Address::generate(&env);
+        client.set_admin(&admin);
+        client.set_inactivity_threshold(&admin, &1000);
+
+        let mut over_cap = Vec::<(Address, Address)>::new(&env);
+        for _ in 0..51 {
+            over_cap.push_back((owner.clone(), delegate.clone()));
+        }
+
+        let res_over_cap = client.try_sweep_inactive_batch(&over_cap, &caller);
+        assert_eq!(res_over_cap, Err(Ok(PermissionError::InvalidParam)));
     }
 }

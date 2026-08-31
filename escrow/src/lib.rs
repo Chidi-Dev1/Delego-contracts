@@ -565,6 +565,13 @@ pub struct AdminView {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeVotesPrunedEvent {
+    pub pruned_count: u32,
+    pub pruned_by: Address,
+}
+
+#[contracttype]
 pub enum DataKey {
     Admin,
     Escrow(u64),
@@ -3264,6 +3271,68 @@ impl EscrowContract {
         Ok(true)
     }
 
+    /// Prune dispute and timeout votes for settled/terminal escrows (`Released`, `Refunded`, `Cancelled`, `ResolvedSeller`, `ResolvedBuyer`).
+    ///
+    /// Callable by admin in bounded batches (`escrow_ids.len() <= MAX_PAGE_LIMIT`).
+    /// Returns the number of escrows whose auxiliary dispute data was pruned from persistent storage.
+    pub fn prune_dispute_votes(
+        env: Env,
+        admin: Address,
+        escrow_ids: soroban_sdk::Vec<u64>,
+    ) -> Result<u32, EscrowError> {
+        admin.require_auth();
+        let primary_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(EscrowError::NotFound)?;
+        if admin != primary_admin {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        if escrow_ids.len() > MAX_PAGE_LIMIT {
+            return Err(EscrowError::InvalidLimits);
+        }
+
+        let mut pruned_count: u32 = 0;
+
+        for id in escrow_ids.iter() {
+            let key = DataKey::Escrow(id);
+            if let Some(record) = env.storage().persistent().get::<_, EscrowRecord>(&key) {
+                let is_terminal = EscrowTerminalState::from_status(&record.status).is_some();
+
+                if is_terminal {
+                    let votes_key = DataKey::DisputeVotes(id);
+                    let ext_key = DataKey::TimeoutExtensionVotes(id);
+                    let mut had_data = false;
+                    if env.storage().persistent().has(&votes_key) {
+                        env.storage().persistent().remove(&votes_key);
+                        had_data = true;
+                    }
+                    if env.storage().persistent().has(&ext_key) {
+                        env.storage().persistent().remove(&ext_key);
+                        had_data = true;
+                    }
+                    if had_data {
+                        pruned_count += 1;
+                    }
+                }
+            }
+        }
+
+        if pruned_count > 0 {
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("pruned")),
+                DisputeVotesPrunedEvent {
+                    pruned_count,
+                    pruned_by: admin,
+                },
+            );
+        }
+
+        Ok(pruned_count)
+    }
+
     /// Remove a co-admin. Must be called by the primary admin.
     pub fn remove_co_admin(
         env: Env,
@@ -4039,12 +4108,18 @@ mod fee_distribution_tests {
     use soroban_sdk::testutils::{Address as _};
 
     fn setup(env: &Env) -> (EscrowContractClient<'_>, Address, Address) {
-        let contract_id = env.register(EscrowContract, ());
-        let client = EscrowContractClient::new(env, &contract_id);
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250u32,
+            treasury: treasury.clone(),
+            min_amount: 100i128,
+            max_amount: 1_000_000i128,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(env, &contract_id);
         env.mock_all_auths();
-        client.initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
         (client, admin, contract_id)
     }
 

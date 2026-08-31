@@ -132,6 +132,8 @@ pub enum ReputationError {
     /// Reporter did not flag the entity.
     /// No flags exist for this entity.
     /// The caller is not the reporter who flagged this entity.
+    /// Entity has no flags on file.
+    /// Reporter is not the creator of an active flag.
     NotFlagReporter = 11,
 }
 
@@ -184,9 +186,17 @@ pub struct AdminProposedEvent {
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminAcceptedEvent {
     pub new_admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntityHistoryPrunedEvent {
+    pub entity: Address,
+    pub pruned_count: u32,
+    pub pruned_by: Address,
 }
 
 #[contracttype]
@@ -703,6 +713,7 @@ impl ReputationContract {
         let has_any_flag = flags.iter().any(|f| f.reporter == reporter);
         if !has_any_flag {
             return Err(ReputationError::NotFlagReporter);
+            return Err(ReputationError::NoActiveFlag);
         }
 
         let idx = flags
@@ -719,6 +730,7 @@ impl ReputationContract {
                 .position(|f| f.reporter == reporter && !f.resolved)
                 .ok_or(ReputationError::NotFlagReporter)?
         };
+            .ok_or(ReputationError::NotFlagReporter)?;
         let mut flag = flags.get(idx as u32).unwrap();
         flag.resolved = true;
         flags.set(idx as u32, flag);
@@ -765,6 +777,65 @@ impl ReputationContract {
             },
         );
         Ok(())
+    }
+
+    /// Prune an entity's transaction history records that are outside the scoring window (`SCORE_WINDOW` = 200).
+    ///
+    /// Callable by admin for state maintenance / cold-storage hygiene. Bounded by `max_records_to_prune` (capped at 50).
+    /// Returns the number of pruned records.
+    pub fn prune_entity_history(
+        env: Env,
+        admin: Address,
+        entity: Address,
+        max_records_to_prune: u32,
+    ) -> Result<u32, ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+
+        if max_records_to_prune == 0 {
+            return Ok(0);
+        }
+        let cap = max_records_to_prune.min(50);
+
+        let hist_key = DataKey::TransactionHistory(entity.clone());
+        let history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&hist_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if history.len() <= SCORE_WINDOW {
+            return Ok(0);
+        }
+
+        let excess = (history.len() - SCORE_WINDOW).min(cap);
+        let mut pruned_count: u32 = 0;
+
+        let mut new_history = Vec::new(&env);
+        for (i, id) in history.iter().enumerate() {
+            if (i as u32) < excess {
+                let record_key = DataKey::TransactionRecord(id);
+                env.storage().persistent().remove(&record_key);
+                pruned_count += 1;
+            } else {
+                new_history.push_back(id);
+            }
+        }
+
+        env.storage().persistent().set(&hist_key, &new_history);
+
+        if pruned_count > 0 {
+            env.events().publish(
+                (symbol_short!("reput"), symbol_short!("pruned")),
+                EntityHistoryPrunedEvent {
+                    entity,
+                    pruned_count,
+                    pruned_by: admin,
+                },
+            );
+        }
+
+        Ok(pruned_count)
     }
 
     pub fn update_config(
