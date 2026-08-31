@@ -9,6 +9,8 @@ use crate::{
     MarketplaceError, Merchant, MerchantRegisteredEvent, MerchantStatus, RegisterParams,
     VerificationPolicy, Verifier,
     AdminProposedEvent, MarketplaceContract, MarketplaceContractClient, MarketplaceError,
+    MarketplaceContract, MarketplaceContractClient, MarketplaceError, MerchantRegisteredEvent,
+    MerchantStatus, RegisterParams, Verifier,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
@@ -767,6 +769,8 @@ fn test_suspension_closing_and_mutation_locking() {
 
     // Admin closes merchant permanently
     f.client.close_merchant(&f.admin, &id, &symbol_short!("bad_cond"));
+    f.client
+        .close_merchant(&f.admin, &id, &symbol_short!("miscond"));
     let closed = f.client.get_merchant(&id);
     assert_eq!(closed.status, MerchantStatus::Closed);
 
@@ -947,6 +951,8 @@ fn test_status_filtered_discovery() {
     let registered = f
         .client
         .get_merchants_by_status(&MerchantStatus::Registered, &0, &10);
+    f.client.close_merchant(&f.admin, &id3, &symbol_short!("test"));
+    let registered = f.client.get_merchants_by_status(&MerchantStatus::Registered, &0, &10);
     assert_eq!(registered.items.len(), 2);
     assert_eq!(registered.total, 2);
     assert_eq!(registered.next_offset, None);
@@ -977,6 +983,11 @@ fn test_status_filtered_discovery() {
     let closed = f
         .client
         .get_merchants_by_status(&MerchantStatus::Closed, &0, &10);
+    assert_eq!(registered.items.get(0).unwrap().status, MerchantStatus::Registered);
+    assert_eq!(registered.items.get(1).unwrap().status, MerchantStatus::Registered);
+    let suspended = f.client.get_merchants_by_status(&MerchantStatus::Suspended, &0, &10);
+    assert_eq!(suspended.items.get(0).unwrap().status, MerchantStatus::Suspended);
+    let closed = f.client.get_merchants_by_status(&MerchantStatus::Closed, &0, &10);
     assert_eq!(closed.items.len(), 1);
     assert_eq!(closed.total, 1);
     assert_eq!(closed.items.get(0).unwrap().id, id3);
@@ -986,6 +997,7 @@ fn test_status_filtered_discovery() {
     let verified = f
         .client
         .get_merchants_by_status(&MerchantStatus::Verified, &0, &10);
+    let verified = f.client.get_merchants_by_status(&MerchantStatus::Verified, &0, &10);
     assert_eq!(verified.items.len(), 0);
     assert_eq!(verified.total, 0);
     assert_eq!(verified.next_offset, None);
@@ -1052,6 +1064,7 @@ fn test_status_filtered_discovery_by_category() {
     f.client.suspend_merchant(&f.admin, &id2);
     f.client
         .close_merchant(&f.admin, &id3, &symbol_short!("test"));
+    f.client.close_merchant(&f.admin, &id3, &symbol_short!("test"));
 
     // Get tech merchants by Registered status (should be id1 and id4)
     let registered = f.client.get_merchants_by_category_status(
@@ -1135,6 +1148,7 @@ fn test_discovery_page_cursor_fields() {
         Some(3),
         "First page should have next_offset = 3"
     );
+    assert_eq!(page1.next_offset, Some(3), "First page should have next_offset = 3");
 
     let page2 = f.client.get_merchants(&page1.next_offset.unwrap(), &3);
     assert_eq!(page2.total, 10);
@@ -1144,6 +1158,7 @@ fn test_discovery_page_cursor_fields() {
         Some(6),
         "Second page should have next_offset = 6"
     );
+    assert_eq!(page2.next_offset, Some(6), "Second page should have next_offset = 6");
 
     let page3 = f.client.get_merchants(&page2.next_offset.unwrap(), &3);
     assert_eq!(page3.total, 10);
@@ -1153,6 +1168,7 @@ fn test_discovery_page_cursor_fields() {
         Some(9),
         "Third page should have next_offset = 9"
     );
+    assert_eq!(page3.next_offset, Some(9), "Third page should have next_offset = 9");
 
     let page4 = f.client.get_merchants(&page3.next_offset.unwrap(), &3);
     assert_eq!(page4.total, 10);
@@ -1161,6 +1177,7 @@ fn test_discovery_page_cursor_fields() {
         page4.next_offset, None,
         "Last page should have None for next_offset"
     );
+    assert_eq!(page4.next_offset, None, "Last page should have None for next_offset");
 }
 
 #[test]
@@ -1192,6 +1209,8 @@ fn test_two_step_admin_transfer() {
     assert_eq!(proposed.current_admin, f.admin);
     assert_eq!(proposed.new_admin, new_admin);
 
+    // Current admin proposes new admin
+    f.client.propose_admin(&f.admin, &new_admin);
     // Stranger (wrong caller, proposal exists) -> Unauthorized
     let stranger_acc = f.client.try_accept_admin(&stranger);
     assert_eq!(
@@ -1648,6 +1667,9 @@ fn test_prune_closed_merchants_removes_from_indices() {
             description: String::from_str(&f.env, "Desc 1"),
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "1.png"),
+fn test_close_merchant_prunes_indexes_and_archives() {
+    f.env.ledger().set_timestamp(5_000);
+            name: String::from_str(&f.env, "Pruned Store"),
             metadata: None,
             required_verifications: 1,
         },
@@ -2071,6 +2093,10 @@ fn test_category_backward_compatibility_unnormalized_mixed_case_raw_index() {
             description: String::from_str(&f.env, "Desc 2"),
             category: symbol_short!("goods"),
             image_url: String::from_str(&f.env, "2.png"),
+            name: String::from_str(&f.env, "Kept Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
             metadata: None,
             required_verifications: 1,
         },
@@ -2123,4 +2149,49 @@ fn test_prune_closed_merchants_rejects_over_cap_and_unauthorized() {
     valid.push_back(1);
     let res_auth = f.client.try_prune_closed_merchants(&stranger, &valid);
     assert_eq!(res_auth, Err(Ok(MarketplaceError::Unauthorized)));
+
+    let all_before = f.client.get_merchants(&0, &10);
+    assert_eq!(all_before.total, 2);
+    let tech_before = f.client.get_merchants_by_category(&symbol_short!("tech"), &0, &10);
+    assert_eq!(tech_before.total, 2);
+    f.env.ledger().set_timestamp(9_000);
+    f.client.close_merchant(&f.admin, &id1, &symbol_short!("fraud"));
+    let all_after = f.client.get_merchants(&0, &10);
+    assert_eq!(all_after.total, 1);
+    assert_eq!(all_after.items.get(0).unwrap().id, id2);
+    let tech_after = f.client.get_merchants_by_category(&symbol_short!("tech"), &0, &10);
+    assert_eq!(tech_after.total, 1);
+    assert_eq!(tech_after.items.get(0).unwrap().id, id2);
+    let archived = f.client.get_archived_merchant(&id1);
+    assert!(archived.is_some());
+    let archived = archived.unwrap();
+    assert_eq!(archived.id, id1);
+    assert_eq!(archived.closed_at, 9_000);
+    assert_eq!(archived.last_view.id, id1);
+    assert_eq!(archived.last_view.status, MerchantStatus::Closed);
+    assert!(f.client.get_archived_merchant(&id2).is_none());
+fn test_reregistration_after_close_does_not_reuse_id() {
+    f.env.ledger().set_timestamp(1_000);
+    let id1 = f.client.register_merchant(
+        &RegisterParams {
+            name: String::from_str(&f.env, "Old Store"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            required_verifications: 1,
+        },
+    );
+    f.env.ledger().set_timestamp(2_000);
+    f.client.close_merchant(&f.admin, &id1, &symbol_short!("voluntary"));
+    let id2 = f.client.register_merchant(
+            name: String::from_str(&f.env, "New Store"),
+    assert_ne!(id2, id1);
+    assert_eq!(id2, 2);
+    let all = f.client.get_merchants(&0, &10);
+    assert_eq!(all.total, 1);
+    assert_eq!(all.items.get(0).unwrap().id, id2);
+    let tech = f.client.get_merchants_by_category(&symbol_short!("tech"), &0, &10);
+    assert_eq!(tech.total, 1);
+    assert_eq!(tech.items.get(0).unwrap().id, id2);
+    assert_eq!(archived.unwrap().id, id1);
 }

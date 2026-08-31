@@ -10,6 +10,7 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::too_many_arguments)]
 #![warn(missing_docs)]
+#![no_std]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, InvokeError,
@@ -76,6 +77,10 @@ pub struct MerchantCursor {
     pub after_id: u64,
     pub status: MerchantStatus,
     pub limit: u32,
+pub struct NameRelease {
+    pub name: String,
+    pub released_at: u64,
+    pub previous_merchant: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,6 +309,7 @@ pub enum DataKey {
     MerchantName(String),
     FreedName(String),
     ArchivedMerchant(u64),
+    MerchantArchivedAt(u64),
     VerifiedCount(u64),
     Verifiers,
     MerchantIds,
@@ -404,6 +410,14 @@ impl MarketplaceContract {
         );
 
         Ok(())
+    }
+
+    // --- Archived Merchant ---
+
+    pub fn get_archived_merchant(env: Env, id: u64) -> Option<ArchivedMerchant> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ArchivedMerchant(id))
     }
 
     // --- Merchant Lifecycle ---
@@ -1159,6 +1173,11 @@ impl MarketplaceContract {
         let mut filtered_ids = Vec::new(&env);
         let mut id = 1u64;
         while id < next_merchant_id {
+        let merchant_ids: Vec<u64> = env
+            .persistent()
+            .get(&DataKey::MerchantIds)
+            .unwrap_or_else(|| Vec::new(&env));
+        for id in merchant_ids.iter() {
             if let Ok(merchant) = Self::get_merchant(env.clone(), id) {
                 if let Some(status) = status_filter {
                     if merchant.status == status {
@@ -1179,6 +1198,7 @@ impl MarketplaceContract {
                 total,
                 next_offset: None,
                 next_cursor: None,
+                total: total as u32,
             });
         }
 
@@ -1205,6 +1225,7 @@ impl MarketplaceContract {
             total,
             next_offset,
             next_cursor,
+            total: total as u32,
         })
     }
 
@@ -1398,6 +1419,33 @@ impl MarketplaceContract {
             total: 0,
             next_offset: None,
             next_cursor,
+        // Filter merchants by status if provided
+        let mut filtered_ids = Vec::new(&env);
+        for id in cat_ids.iter() {
+            if let Ok(merchant) = Self::get_merchant(env.clone(), id) {
+                if let Some(status) = status_filter {
+                    if merchant.status == status {
+                        filtered_ids.push_back(id);
+                    }
+                } else {
+                    // No filter: include all
+                    filtered_ids.push_back(id);
+                }
+            }
+        let total = filtered_ids.len();
+        if offset >= total || limit == 0 {
+            return Ok(DiscoveryPage {
+                items: Vec::new(&env),
+                total: total as u32,
+                next_offset: None,
+            });
+        let end = offset.saturating_add(limit).min(total);
+        let mut i = offset;
+        while i < end {
+            let id = filtered_ids.get(i).unwrap();
+        let next_offset = if end < total { Some(end) } else { None };
+            total: total as u32,
+            next_offset,
         })
     }
 
@@ -1538,6 +1586,55 @@ impl MarketplaceContract {
 
         let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
         merchant.status = MerchantStatus::Closed;
+
+        // Prune from global merchant index
+        let mut merchant_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantIds)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(pos) = merchant_ids.iter().position(|&x| x == id) {
+            merchant_ids.swap_remove(pos as u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantIds, &merchant_ids);
+        }
+
+        // Prune from category index
+        let cat_key = DataKey::CategoryIndex(merchant.category.clone());
+        let mut cat_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&cat_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(pos) = cat_ids.iter().position(|&x| x == id) {
+            cat_ids.swap_remove(pos as u32);
+            env.storage()
+                .persistent()
+                .set(&cat_key, &cat_ids);
+        }
+
+        // Archive the merchant snapshot
+        let closed_at = env.ledger().timestamp();
+        let archived = ArchivedMerchant {
+            id: merchant.id,
+            closed_at,
+            last_view: MerchantView {
+                id: merchant.id,
+                name: merchant.name.clone(),
+                category: merchant.category.clone(),
+                commission_rate_bps: merchant.commission_rate_bps,
+                verified: merchant.verified,
+                status: merchant.status,
+                reputation_score: None,
+            },
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ArchivedMerchant(id), &archived);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantArchivedAt(id), &closed_at);
         merchant.updated_at = env.ledger().timestamp();
 
         env.storage()
