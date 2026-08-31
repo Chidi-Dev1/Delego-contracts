@@ -1,7 +1,7 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod test {
-    use crate::{DataKey, EscrowContract, EscrowContractClient, EscrowError, EscrowMetadataEvent};
+    use crate::{DataKey, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError, EscrowMetadataEvent};
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events, Ledger},
@@ -56,6 +56,135 @@ mod test {
 
         let res = client.try_initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
         assert_eq!(res, Err(Ok(EscrowError::InvalidAddress)));
+    }
+
+    #[test]
+    fn test_constructor_initializes_atomically() {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250u32,
+            treasury: treasury.clone(),
+            min_amount: 100i128,
+            max_amount: 1_000_000i128,
+        };
+
+        // Call constructor
+        let res = client.__constructor(&config);
+        assert_eq!(res, Ok(()));
+
+        // Verify admin is set correctly
+        let admin_view = client.get_admin();
+        assert_eq!(admin_view.admin, admin);
+        assert_eq!(admin_view.pending_admin, None);
+
+        // Verify fee config is set correctly
+        let fee_config = client.get_fee_config();
+        assert_eq!(fee_config.fee_bps, 250u32);
+        assert_eq!(fee_config.treasury, treasury);
+
+        // Verify limits are set correctly
+        let limits = client.get_limits();
+        assert_eq!(limits.min_amount, 100i128);
+        assert_eq!(limits.max_amount, 1_000_000i128);
+    }
+
+    #[test]
+    fn test_constructor_vs_initialize_race() {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250u32,
+            treasury: treasury.clone(),
+            min_amount: 100i128,
+            max_amount: 1_000_000i128,
+        };
+
+        // Initialize via constructor
+        let res = client.__constructor(&config);
+        assert_eq!(res, Ok(()));
+
+        // Attempt to call initialize after constructor should fail
+        let res_try = client.try_initialize(&admin, &250u32, &treasury, &100i128, &1_000_000i128);
+        assert_eq!(res_try, Err(Ok(EscrowError::AlreadyInitialized)));
+    }
+
+    #[test]
+    fn test_constructor_rejects_zero_treasury() {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250u32,
+            treasury: zero_account(&env),
+            min_amount: 100i128,
+            max_amount: 1_000_000i128,
+        };
+
+        let res = client.try___constructor(&config);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidAddress)));
+    }
+
+    #[test]
+    fn test_constructor_rejects_invalid_fee_bps() {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 1001u32,  // > 1000
+            treasury,
+            min_amount: 100i128,
+            max_amount: 1_000_000i128,
+        };
+
+        let res = client.try___constructor(&config);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
+    }
+
+    #[test]
+    fn test_constructor_rejects_invalid_limits() {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        // Test min_amount <= 0
+        let config1 = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250u32,
+            treasury: treasury.clone(),
+            min_amount: 0i128,  // <= 0
+            max_amount: 1_000_000i128,
+        };
+
+        let res = client.try___constructor(&config1);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidLimits)));
+
+        // Test max_amount < min_amount
+        let config2 = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 250u32,
+            treasury: treasury.clone(),
+            min_amount: 1000i128,
+            max_amount: 500i128,  // < min_amount
+        };
+
+        let res = client.try___constructor(&config2);
+        assert_eq!(res, Err(Ok(EscrowError::InvalidLimits)));
     }
 
     #[test]
@@ -194,8 +323,14 @@ mod test {
         let key_token_b: soroban_sdk::Val = DataKey::AllowedToken(addr_b.clone()).into_val(&env);
         let key_token_at: soroban_sdk::Val = DataKey::AllowedTokenAt(0).into_val(&env);
         let key_pause: soroban_sdk::Val = DataKey::PauseState.into_val(&env);
-        let key_metadata_0: soroban_sdk::Val = DataKey::EscrowMetadata(0u64).into_val(&env);
-        let key_metadata_1: soroban_sdk::Val = DataKey::EscrowMetadata(1u64).into_val(&env);
+        let key_metadata_hash_0: soroban_sdk::Val =
+            DataKey::EscrowMetadataHash(0u64).into_val(&env);
+        let key_metadata_hash_1: soroban_sdk::Val =
+            DataKey::EscrowMetadataHash(1u64).into_val(&env);
+        let key_metadata_schema_0: soroban_sdk::Val =
+            DataKey::EscrowMetadataSchema(0u64).into_val(&env);
+        let key_metadata_schema_1: soroban_sdk::Val =
+            DataKey::EscrowMetadataSchema(1u64).into_val(&env);
         let key_migration: soroban_sdk::Val = DataKey::MigrationFlag.into_val(&env);
         let key_fee_dist: soroban_sdk::Val = DataKey::FeeDistribution.into_val(&env);
         let key_require_cond_0: soroban_sdk::Val =
@@ -219,8 +354,10 @@ mod test {
             key_token_b,
             key_token_at,
             key_pause,
-            key_metadata_0,
-            key_metadata_1,
+            key_metadata_hash_0,
+            key_metadata_hash_1,
+            key_metadata_schema_0,
+            key_metadata_schema_1,
             key_migration,
             key_fee_dist,
             key_require_cond_0,
@@ -273,17 +410,34 @@ mod test {
     #[test]
     fn test_metadata_keys_differ_per_escrow_id() {
         let env = Env::default();
-        // Different escrow IDs must map to different metadata storage keys.
-        let k0: soroban_sdk::Val = DataKey::EscrowMetadata(0u64).into_val(&env);
-        let k1: soroban_sdk::Val = DataKey::EscrowMetadata(1u64).into_val(&env);
-        let k999: soroban_sdk::Val = DataKey::EscrowMetadata(999u64).into_val(&env);
+        // Different escrow IDs must map to different metadata storage keys,
+        // for both the hash and schema halves.
+        let kh0: soroban_sdk::Val = DataKey::EscrowMetadataHash(0u64).into_val(&env);
+        let kh1: soroban_sdk::Val = DataKey::EscrowMetadataHash(1u64).into_val(&env);
+        let kh999: soroban_sdk::Val = DataKey::EscrowMetadataHash(999u64).into_val(&env);
         assert_ne!(
-            soroban_sdk::Val::get_payload(k0),
-            soroban_sdk::Val::get_payload(k1)
+            soroban_sdk::Val::get_payload(kh0),
+            soroban_sdk::Val::get_payload(kh1)
         );
         assert_ne!(
-            soroban_sdk::Val::get_payload(k1),
-            soroban_sdk::Val::get_payload(k999)
+            soroban_sdk::Val::get_payload(kh1),
+            soroban_sdk::Val::get_payload(kh999)
+        );
+        let ks0: soroban_sdk::Val = DataKey::EscrowMetadataSchema(0u64).into_val(&env);
+        let ks1: soroban_sdk::Val = DataKey::EscrowMetadataSchema(1u64).into_val(&env);
+        let ks999: soroban_sdk::Val = DataKey::EscrowMetadataSchema(999u64).into_val(&env);
+        assert_ne!(
+            soroban_sdk::Val::get_payload(ks0),
+            soroban_sdk::Val::get_payload(ks1)
+        );
+        assert_ne!(
+            soroban_sdk::Val::get_payload(ks1),
+            soroban_sdk::Val::get_payload(ks999)
+        );
+        // The hash half and the schema half must never collide for the same id.
+        assert_ne!(
+            soroban_sdk::Val::get_payload(kh0),
+            soroban_sdk::Val::get_payload(ks0)
         );
     }
 
@@ -351,8 +505,7 @@ mod test {
 
         let buyer = Address::generate(&env);
         let seller = Address::generate(&env);
-        let token_admin_client =
-            soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
         token_admin_client.mint(&buyer, &1_000_000i128);
 
         let order_id = BytesN::from_array(&env, &[7u8; 32]);
@@ -476,7 +629,8 @@ mod test {
             &None,
         );
 
-        // Verify metadata is not stored when only one parameter is provided
+        // Metadata is not readable while only one half is present; the missing
+        // half can be filled in later via set_escrow_metadata_schema.
         let res = client.try_get_escrow_metadata(&escrow_id);
         assert_eq!(res, Err(Ok(EscrowError::NotFound)));
     }
@@ -490,6 +644,173 @@ mod test {
         // Try to get metadata for non-existent escrow
         let res = client.try_get_escrow_metadata(&999u64);
         assert_eq!(res, Err(Ok(EscrowError::NotFound)));
+    }
+
+    // ─── Issue #39: Partial metadata halves persisted independently ──────────
+
+    /// A hash-only deposit persists the hash half; the missing schema half can
+    /// be filled in post-creation and the combined metadata is then readable.
+    #[test]
+    fn test_fill_missing_schema_half_post_creation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[1u8; 32]);
+        let order_hash = BytesN::from_array(&env, &[2u8; 32]);
+        let schema = symbol_short!("order_v1");
+
+        // Deposit with only the hash half.
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &1000i128,
+            &order_id,
+            &100u32,
+            &Some(order_hash.clone()),
+            &None,
+        );
+
+        // Incomplete metadata is not readable yet.
+        let res = client.try_get_escrow_metadata(&escrow_id);
+        assert_eq!(res, Err(Ok(EscrowError::NotFound)));
+
+        // Fill the missing schema half post-creation.
+        client.set_escrow_metadata_schema(&escrow_id, &buyer, &schema);
+
+        let metadata = client.get_escrow_metadata(&escrow_id);
+        assert_eq!(metadata.order_hash, order_hash);
+        assert_eq!(metadata.schema, schema);
+    }
+
+    /// A schema-only deposit persists the schema half; the missing hash half
+    /// can be filled in post-creation and the combined metadata is readable.
+    #[test]
+    fn test_fill_missing_hash_half_post_creation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[3u8; 32]);
+        let order_hash = BytesN::from_array(&env, &[4u8; 32]);
+        let schema = symbol_short!("order_v2");
+
+        // Deposit with only the schema half.
+        let escrow_id = client.deposit(
+            &buyer,
+            &seller,
+            &token,
+            &1000i128,
+            &order_id,
+            &100u32,
+            &None,
+            &Some(schema.clone()),
+        );
+
+        // Incomplete metadata is not readable yet.
+        let res = client.try_get_escrow_metadata(&escrow_id);
+        assert_eq!(res, Err(Ok(EscrowError::NotFound)));
+
+        // Fill the missing hash half post-creation.
+        client.set_escrow_metadata_hash(&escrow_id, &buyer, &order_hash);
+
+        let metadata = client.get_escrow_metadata(&escrow_id);
+        assert_eq!(metadata.order_hash, order_hash);
+        assert_eq!(metadata.schema, schema);
+    }
+
+    /// Both halves can be filled entirely post-creation for an escrow that
+    /// was deposited without any metadata.
+    #[test]
+    fn test_fill_both_metadata_halves_post_creation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[5u8; 32]);
+        let order_hash = BytesN::from_array(&env, &[6u8; 32]);
+        let schema = symbol_short!("order_v3");
+
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1000i128, &order_id, &100u32, &None, &None,
+        );
+
+        let res = client.try_get_escrow_metadata(&escrow_id);
+        assert_eq!(res, Err(Ok(EscrowError::NotFound)));
+
+        client.set_escrow_metadata_hash(&escrow_id, &buyer, &order_hash);
+        client.set_escrow_metadata_schema(&escrow_id, &buyer, &schema);
+
+        let metadata = client.get_escrow_metadata(&escrow_id);
+        assert_eq!(metadata.order_hash, order_hash);
+        assert_eq!(metadata.schema, schema);
+    }
+
+    /// Only the buyer or an admin may fill metadata halves post-creation.
+    #[test]
+    fn test_set_escrow_metadata_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _contract_id) = setup_client(&env);
+
+        let buyer = Address::generate(&env);
+        let seller = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+        token_admin_client.mint(&buyer, &10000i128);
+        client.add_token(&admin, &token);
+
+        let order_id = BytesN::from_array(&env, &[7u8; 32]);
+        let escrow_id = client.deposit(
+            &buyer, &seller, &token, &1000i128, &order_id, &100u32, &None, &None,
+        );
+
+        let stranger = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[8u8; 32]);
+        let schema = symbol_short!("order_v4");
+
+        let res = client.try_set_escrow_metadata_hash(&escrow_id, &stranger, &hash);
+        assert_eq!(res, Err(Ok(EscrowError::Unauthorized)));
+        let res = client.try_set_escrow_metadata_schema(&escrow_id, &stranger, &schema);
+        assert_eq!(res, Err(Ok(EscrowError::Unauthorized)));
+
+        // The admin can fill the halves.
+        client.set_escrow_metadata_hash(&escrow_id, &admin, &hash);
+        client.set_escrow_metadata_schema(&escrow_id, &admin, &schema);
     }
 
     // ─── Issue #175: Escrow Metadata Event Tests ─────────────────────────────
@@ -988,10 +1309,7 @@ mod test {
 
         let treasury = Address::generate(&env);
         let mut shares = soroban_sdk::Vec::new(&env);
-        shares.push_back(crate::TreasuryShare {
-            treasury,
-            bps: 0,
-        });
+        shares.push_back(crate::TreasuryShare { treasury, bps: 0 });
 
         let res = client.try_set_fee_distribution(&admin, &shares);
         assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
@@ -1013,7 +1331,7 @@ mod test {
         }
 
         let res = client.try_set_fee_distribution(&admin, &shares);
-        assert_eq!(res, Err(Ok(EscrowError::MaxTreasuriesExceeded)));
+        assert_eq!(res, Err(Ok(EscrowError::InvalidFeeBps)));
         assert_eq!(client.get_fee_distribution().len(), 0);
     }
 
@@ -2169,7 +2487,10 @@ mod test {
 
         // Buyer index should contain both escrows created via batch_deposit.
         let page = client.list_escrows_by_buyer(&buyer, &0u32, &10u32);
-        assert_eq!(page.total, 2, "batch_deposit should maintain buyer index for each order");
+        assert_eq!(
+            page.total, 2,
+            "batch_deposit should maintain buyer index for each order"
+        );
         assert_eq!(page.items.len(), 2);
     }
 }

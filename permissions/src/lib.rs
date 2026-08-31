@@ -2,7 +2,6 @@
 //! Spending limits, delegated authority, and time-locked allowance decrements
 
 #![cfg_attr(not(test), no_std)]
-#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, BytesN,
     Env, Symbol, Vec,
@@ -84,9 +83,11 @@ pub enum PermissionError {
     PendingDecreaseExists = 408,
     /// Time-lock on pending allowance decrease has not elapsed yet
     TimeLockActive = 409,
+    /// Decrease would drop the allowance limit below what has already been spent
+    LimitBelowSpent = 410,
     /// A multi-owner spend accumulation would overflow or exceed the
     /// permission's total allowance
-    ExceedsAllowance = 410,
+    ExceedsAllowance = 411,
     /// Admin-gated call made before `set_admin` has ever been called
     NotInitialized = 500,
 }
@@ -579,6 +580,11 @@ pub enum DataKey {
 #[contract]
 pub struct PermissionsContract;
 
+// The `#[contractimpl]` macro generates client/wrapper functions that mirror
+// the ABI entry-point signatures above; they cannot be annotated individually
+// from user code, so the allow lives on the impl block for those generated
+// wrappers only. User-defined functions carry their own scoped allows.
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl PermissionsContract {
     /// Records a (owner, delegate) delegation as a **first grant**.
@@ -1394,25 +1400,11 @@ impl PermissionsContract {
             merchant.clone(),
         )?;
 
-        // #324: Velocity check — reject if min_spend_interval has not yet elapsed
+        // #54: Velocity check — reject if min_spend_interval has not yet elapsed
         // since the last recorded spend ledger for this (owner, delegate) pair.
+        Self::check_velocity(&env, &owner, &delegate)?;
+
         let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
-        if let Some(last_ledger) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, u32>(&velocity_key)
-        {
-            if let Some(min_interval) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u32>(&DataKey::MinSpendInterval)
-            {
-                let current = env.ledger().sequence();
-                if current < last_ledger + min_interval {
-                    return Err(PermissionError::VelocityLimitExceeded);
-                }
-            }
-        }
 
         let remaining = Self::apply_spend(&env, &owner, &delegate, amount)?;
 
@@ -1499,6 +1491,37 @@ impl PermissionsContract {
         Ok(remaining)
     }
 
+    /// Rejects a spend when the configured velocity limit (`MinSpendInterval`)
+    /// has not yet elapsed since the last recorded spend ledger for this
+    /// (owner, delegate) pair (issue #54). Called from both `execute_spend`
+    /// and `execute_spend_via_relayer` before the new spend is recorded, so
+    /// direct and relayed spends share the same throttle. No-op when no
+    /// interval has been configured or no prior spend exists.
+    fn check_velocity(
+        env: &Env,
+        owner: &Address,
+        delegate: &Address,
+    ) -> Result<(), PermissionError> {
+        let velocity_key = DataKey::LastSpendLedger(owner.clone(), delegate.clone());
+        if let Some(last_ledger) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&velocity_key)
+        {
+            if let Some(min_interval) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u32>(&DataKey::MinSpendInterval)
+            {
+                let current = env.ledger().sequence();
+                if current < last_ledger + min_interval {
+                    return Err(PermissionError::VelocityLimitExceeded);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Register (or rotate) the ed25519 public key used to verify this
     /// delegate's signed messages in `execute_spend_via_relayer`. Must be
     /// called by the delegate directly (a real, gas-paying transaction) —
@@ -1567,6 +1590,9 @@ impl PermissionsContract {
     /// delegate's registered public key, the `nonce` must match the
     /// delegate's next expected nonce (preventing replay), and
     /// `expiration_ledger` must not yet have been reached.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_spend_via_relayer(
         env: Env,
         relayer: Address,
@@ -1647,6 +1673,9 @@ impl PermissionsContract {
     /// the minimum number of owner signatures required to authorize a spend
     /// (1 <= threshold <= owners.len()). The caller must be one of `owners`.
     /// Stored keyed by `(owners[0], delegate)`.
+    // Reason: Soroban ABI entry point — signature is part of the published
+    // on-chain ABI and cannot be restructured without a breaking change.
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_multi_owner(
         env: Env,
         caller: Address,
@@ -2038,12 +2067,20 @@ impl PermissionsContract {
     ) -> Result<(), PermissionError> {
         owner.require_auth();
 
+        if amount <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
+
         let perm_key = DataKey::Permission(owner.clone(), delegate.clone());
-        let _record: PermissionRecord = env.storage().persistent().get(&perm_key).unwrap();
+        let record: PermissionRecord = env.storage().persistent().get(&perm_key).unwrap();
 
         let pend_key = DataKey::PendingDecrement(owner.clone(), delegate.clone());
         if env.storage().persistent().has(&pend_key) {
             return Err(PermissionError::PendingDecreaseExists);
+        }
+
+        if record.limit_total - amount < record.spent {
+            return Err(PermissionError::LimitBelowSpent);
         }
 
         let execution_time = env.ledger().timestamp() + 86400;
@@ -2068,6 +2105,10 @@ impl PermissionsContract {
         let pend_key = DataKey::PendingDecrement(owner.clone(), delegate.clone());
         let pending: PendingAllowanceDecrement = env.storage().persistent().get(&pend_key).unwrap();
 
+        if pending.amount <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
+
         if env.ledger().timestamp() < pending.execution_time {
             return Err(PermissionError::TimeLockActive);
         }
@@ -2078,7 +2119,7 @@ impl PermissionsContract {
         let previous_limit = record.limit_total;
         let new_limit = record.limit_total - pending.amount;
         if new_limit < record.spent {
-            return Err(PermissionError::ExceedsTotalLimit);
+            return Err(PermissionError::LimitBelowSpent);
         }
 
         record.limit_total = new_limit;

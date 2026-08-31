@@ -2,8 +2,8 @@
 
 use crate::{
     BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowContract,
-    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState,
-    MAX_TREASURIES, TreasuryShare,
+    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
+    MAX_TREASURIES,
 };
 use soroban_sdk::{
     symbol_short,
@@ -990,11 +990,11 @@ fn test_set_fee_distribution_accepts_valid_multi_treasury_config() {
     let mut config = Vec::new(&t.env);
     config.push_back(TreasuryShare {
         treasury: Address::generate(&t.env),
-        bps: 6000,
+        bps: 400,
     });
     config.push_back(TreasuryShare {
         treasury: Address::generate(&t.env),
-        bps: 4000,
+        bps: 600,
     });
 
     let _ = escrow_client.set_fee_distribution(&t.admin, &config);
@@ -1044,7 +1044,7 @@ fn test_set_fee_distribution_rejects_too_many_treasuries() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
 
-    let max_treasuries = MAX_TREASURIES as u32;
+    let max_treasuries = MAX_TREASURIES;
     let mut config = Vec::new(&t.env);
     for _ in 0..max_treasuries {
         config.push_back(TreasuryShare {

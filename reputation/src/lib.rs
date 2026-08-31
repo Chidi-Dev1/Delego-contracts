@@ -4,10 +4,6 @@
 //! platform, driven by escrow transaction outcomes and counterparty ratings.
 
 #![no_std]
-// Several entry points mirror escrow/permissions call shapes and exceed
-// clippy's default 7-argument limit; restructuring them would break the
-// published ABI these contracts are reviewed against.
-#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
@@ -281,6 +277,10 @@ impl ReputationContract {
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Config, &config);
+        // Keep the contract instance alive from deployment.
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         Ok(())
     }
 
@@ -348,6 +348,10 @@ impl ReputationContract {
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+        // The contract instance must stay alive alongside its records.
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
         if existing.is_none() {
             let hist_key = DataKey::TransactionHistory(entity.clone());
@@ -358,6 +362,11 @@ impl ReputationContract {
                 .unwrap_or_else(|| Vec::new(&env));
             history.push_back(escrow_id);
             env.storage().persistent().set(&hist_key, &history);
+            env.storage().persistent().extend_ttl(
+                &hist_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
 
             // Record the symmetric counterpart relationship in both directions so
             // a transaction between A and B reads as transacted for both A->B and
@@ -366,9 +375,19 @@ impl ReputationContract {
                 &DataKey::Transacted(entity.clone(), record.counterparty.clone()),
                 &true,
             );
+            env.storage().persistent().extend_ttl(
+                &DataKey::Transacted(entity.clone(), record.counterparty.clone()),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
             env.storage().persistent().set(
                 &DataKey::Transacted(record.counterparty.clone(), entity.clone()),
                 &true,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::Transacted(record.counterparty.clone(), entity.clone()),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
             );
             Self::apply_new_transaction_counts(&env, &entity, &outcome);
         } else if let Some(prior) = &existing {
@@ -848,6 +867,11 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Reputation(entity.clone()), &rep);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Reputation(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     /// Adjusts `entity`'s lifetime counters when an already-recorded escrow's
@@ -875,6 +899,11 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Reputation(entity.clone()), &rep);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Reputation(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     /// Recomputes and persists `entity`'s `score`/`avg_rating`/
@@ -967,6 +996,11 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Reputation(entity.clone()), &rep);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Reputation(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         Ok(rep)
     }
 }
