@@ -43,6 +43,16 @@ pub struct ReputationScore {
 /// and high-value transactions are weighted equally in reputation calculations.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScoreDecomposition {
+    pub entity: Address,
+    pub base_score_bps: i128,
+    pub penalty_bps: i128,
+    pub total_transactions: u64,
+    pub final_score: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionRecord {
     pub escrow_id: u64,
     pub entity: Address,
@@ -539,6 +549,19 @@ impl ReputationContract {
             record.avg_rating = 0;
         }
         Ok(record)
+    }
+
+    /// Returns the raw base/penalty breakdown behind `entity`'s current
+    /// score, including the clamped final score that `get_reputation`
+    /// reports.
+    pub fn get_score_decomposition(
+        env: Env,
+        entity: Address,
+    ) -> Result<ScoreDecomposition, ReputationError> {
+        let rep = Self::load_or_default_reputation(&env, &entity);
+        let (decomposition, _, _) =
+            Self::compute_score_components(&env, &entity, rep.total_transactions)?;
+        Ok(decomposition)
     }
 
     pub fn get_reputation_breakdown(
@@ -1190,29 +1213,16 @@ impl ReputationContract {
         Ok(rep)
     }
 
-    /// Recomputes and persists `entity`'s `score`/`avg_rating`/
-    /// `last_updated`, per the score formula:
-    ///
-    /// ```text
-    /// score = sum(recency_weight(r) * outcome_value(r)) / sum(recency_weight(r))
-    /// ```
-    ///
-    /// with an additional flat penalty of `dispute_penalty_bps` subtracted
-    /// per still-relevant (non-fully-decayed) `Disputed` record.
-    /// `avg_rating` is computed the same way over records carrying a rating.
-    ///
-    /// Only the most recent `SCORE_WINDOW` records feed this computation, so
-    /// `record_transaction` and `rate_entity` stay bounded-cost regardless of
-    /// how large an entity's lifetime history grows; records older than that
-    /// already carry a recency weight close to zero for any realistic
-    /// `decay_window_seconds`, so excluding them from the average has
-    /// negligible effect. `total_transactions` / `successful_transactions` /
-    /// `disputed_transactions` are exact lifetime counts maintained
-    /// separately and incrementally — see [`Self::apply_new_transaction_counts`]
-    /// and [`Self::apply_outcome_change_counts`] — so they are left as-is here.
-    fn recompute_score(env: &Env, entity: &Address) -> Result<ReputationScore, ReputationError> {
+    /// Computes the raw score decomposition and the time-decayed average
+    /// rating in a single pass over the recency window. Does not persist;
+    /// `recompute_score` uses the returned values to update and emit the
+    /// breakdown, while `get_score_decomposition` returns them directly.
+    fn compute_score_components(
+        env: &Env,
+        entity: &Address,
+        total_transactions: u64,
+    ) -> Result<(ScoreDecomposition, u32, u64), ReputationError> {
         let config = Self::get_config(env.clone())?;
-        let mut rep = Self::load_or_default_reputation(env, entity);
 
         let history: Vec<u64> = env
             .storage()
@@ -1278,12 +1288,51 @@ impl ReputationContract {
             0
         };
         let penalty = disputed_recent * (config.dispute_penalty_bps as i128);
-        rep.score = (base_score - penalty).clamp(0, BPS_SCALE) as u32;
-        rep.avg_rating = if rating_weight_sum > 0 {
+        let avg_rating = if rating_weight_sum > 0 {
             (rating_weighted_sum / rating_weight_sum).clamp(0, BPS_SCALE) as u32
         } else {
             0
         };
+
+        Ok((
+            ScoreDecomposition {
+                entity: entity.clone(),
+                base_score_bps: base_score,
+                penalty_bps: penalty,
+                total_transactions,
+                final_score: (base_score - penalty).clamp(0, BPS_SCALE) as u32,
+            },
+            avg_rating,
+            now,
+        ))
+    }
+
+    /// Recomputes and persists `entity`'s `score`/`avg_rating`/
+    /// `last_updated`, per the score formula:
+    ///
+    /// ```text
+    /// score = sum(recency_weight(r) * outcome_value(r)) / sum(recency_weight(r))
+    /// ```
+    ///
+    /// with an additional flat penalty of `dispute_penalty_bps` subtracted
+    /// per still-relevant (non-fully-decayed) `Disputed` record.
+    /// `avg_rating` is computed the same way over records carrying a rating.
+    ///
+    /// Only the most recent `SCORE_WINDOW` records feed this computation, so
+    /// `record_transaction` and `rate_entity` stay bounded-cost regardless of
+    /// how large an entity's lifetime history grows; records older than that
+    /// already carry a recency weight close to zero for any realistic
+    /// `decay_window_seconds`, so excluding them from the average has
+    /// negligible effect. `total_transactions` / `successful_transactions` /
+    /// `disputed_transactions` are exact lifetime counts maintained
+    /// separately and incrementally — see [`Self::apply_new_transaction_counts`]
+    /// and [`Self::apply_outcome_change_counts`] — so they are left as-is here.
+    fn recompute_score(env: &Env, entity: &Address) -> Result<ReputationScore, ReputationError> {
+        let mut rep = Self::load_or_default_reputation(env, entity);
+        let (decomposition, avg_rating, now) =
+            Self::compute_score_components(env, entity, rep.total_transactions)?;
+        rep.score = decomposition.final_score;
+        rep.avg_rating = avg_rating;
         rep.last_updated = now;
 
         env.storage()
@@ -1302,6 +1351,10 @@ impl ReputationContract {
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+
+        env.events().publish(
+            (symbol_short!("reput"), symbol_short!("score_dec")),
+            decomposition,
         Ok(rep)
     }
 }
