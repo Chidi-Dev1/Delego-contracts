@@ -126,6 +126,9 @@ pub struct ContractVersion {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
+    /// Symbol encoding of the semver, e.g. `0_2_0` for 0.2.0.
+    /// Parsed by `scripts/check-changelog.sh` to validate CHANGELOG entries.
+    pub semver: Symbol,
 }
 
 // ─── Events ───────────────────────────────────────────────────────────────────
@@ -1113,6 +1116,7 @@ impl MarketplaceContract {
             major: 0,
             minor: 2,
             patch: 0,
+            semver: symbol_short!("0_2_0"),
         }
     }
 

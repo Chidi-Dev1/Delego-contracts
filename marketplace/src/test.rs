@@ -774,6 +774,7 @@ fn test_version() {
     assert_eq!(v.major, 0);
     assert_eq!(v.minor, 2);
     assert_eq!(v.patch, 0);
+    assert_eq!(v.semver, symbol_short!("0_2_0"));
 }
 
 // ── Not found ─────────────────────────────────────────────────────────────────
