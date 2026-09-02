@@ -68,6 +68,12 @@ pub enum PermissionError {
     VelocityLimitExceeded = 406,
     /// sweep_inactive called before admin has configured an inactivity threshold
     InactivityThresholdNotSet = 407,
+    /// Decrease allowance time-lock has not elapsed yet
+    TimeLockActive = 408,
+    /// A pending allowance decrease already exists for this permission
+    PendingDecreaseExists = 409,
+    /// Decreasing by this amount would set the limit below the already-spent amount
+    LimitBelowSpent = 410,
 }
 
 #[contracttype]
@@ -458,6 +464,8 @@ pub enum DataKey {
     LastSpendLedger(Address, Address),
     /// Append-only audit log for a (owner, delegate) pair.
     AuditLog(Address, Address),
+    /// Instance-level timelock duration in seconds for allowance decreases (default 86400).
+    DecreaseTimelockSecs,
 }
 
 #[contract]
@@ -1603,18 +1611,73 @@ impl PermissionsContract {
         Ok(())
     }
 
-    pub fn decrease_allowance(env: Env, owner: Address, delegate: Address, amount: i128) -> bool {
+    /// Returns the current allowance-decrease timelock in seconds (default 86 400 = 24 h).
+    pub fn get_decrease_timelock_secs(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::DecreaseTimelockSecs)
+            .unwrap_or(86_400u64)
+    }
+
+    /// Admin sets the allowance-decrease timelock.  Must be in (0, 2_592_000] seconds.
+    pub fn set_decrease_timelock_secs(
+        env: Env,
+        admin: Address,
+        secs: u64,
+    ) -> Result<(), PermissionError> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PermissionError::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(PermissionError::Unauthorized);
+        }
+        if secs == 0 || secs > 2_592_000 {
+            return Err(PermissionError::InvalidParam);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DecreaseTimelockSecs, &secs);
+        Ok(())
+    }
+
+    pub fn decrease_allowance(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+        amount: i128,
+    ) -> Result<bool, PermissionError> {
         owner.require_auth();
 
+        if amount <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
+
         let perm_key = DataKey::Permission(owner.clone(), delegate.clone());
-        let _record: PermissionRecord = env.storage().persistent().get(&perm_key).unwrap();
+        let record: PermissionRecord = env
+            .storage()
+            .persistent()
+            .get(&perm_key)
+            .ok_or(PermissionError::NotFound)?;
+
+        // Reject if the scheduled decrease would land below already-spent.
+        if record.limit_total - amount < record.spent {
+            return Err(PermissionError::LimitBelowSpent);
+        }
 
         let pend_key = DataKey::PendingDecrement(owner.clone(), delegate.clone());
         if env.storage().persistent().has(&pend_key) {
-            panic!("Pending decrement already exists for this delegation");
+            return Err(PermissionError::PendingDecreaseExists);
         }
 
-        let execution_time = env.ledger().timestamp() + 86400;
+        let timelock: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DecreaseTimelockSecs)
+            .unwrap_or(86_400u64);
+        let execution_time = env.ledger().timestamp() + timelock;
 
         let pending = PendingAllowanceDecrement {
             amount,
@@ -1623,26 +1686,38 @@ impl PermissionsContract {
 
         env.storage().persistent().set(&pend_key, &pending);
 
-        true
+        Ok(true)
     }
 
-    pub fn execute_decrease_allowance(env: Env, owner: Address, delegate: Address) -> bool {
+    pub fn execute_decrease_allowance(
+        env: Env,
+        owner: Address,
+        delegate: Address,
+    ) -> Result<bool, PermissionError> {
         owner.require_auth();
 
         let pend_key = DataKey::PendingDecrement(owner.clone(), delegate.clone());
-        let pending: PendingAllowanceDecrement = env.storage().persistent().get(&pend_key).unwrap();
+        let pending: PendingAllowanceDecrement = env
+            .storage()
+            .persistent()
+            .get(&pend_key)
+            .ok_or(PermissionError::NotFound)?;
 
         if env.ledger().timestamp() < pending.execution_time {
-            panic!("Time-lock has not elapsed yet");
+            return Err(PermissionError::TimeLockActive);
         }
 
         let perm_key = DataKey::Permission(owner.clone(), delegate.clone());
-        let mut record: PermissionRecord = env.storage().persistent().get(&perm_key).unwrap();
+        let mut record: PermissionRecord = env
+            .storage()
+            .persistent()
+            .get(&perm_key)
+            .ok_or(PermissionError::NotFound)?;
 
         let previous_limit = record.limit_total;
         let new_limit = record.limit_total - pending.amount;
         if new_limit < record.spent {
-            panic!("Decrease would exceed current spent amount");
+            return Err(PermissionError::LimitBelowSpent);
         }
 
         record.limit_total = new_limit;
@@ -1659,7 +1734,7 @@ impl PermissionsContract {
             },
         );
 
-        true
+        Ok(true)
     }
 
     pub fn pause(env: Env, owner: Address, delegate: Address) -> Result<(), PermissionError> {
