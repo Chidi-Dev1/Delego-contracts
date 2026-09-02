@@ -3,11 +3,7 @@ use soroban_sdk::{testutils::Address as _, Address, Env};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn setup() -> (
-    Env,
-    super::ReputationContractClient<'static>,
-    Address,
-) {
+fn setup() -> (Env, super::ReputationContractClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(ReputationContract, ());

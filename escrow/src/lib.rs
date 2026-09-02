@@ -3544,11 +3544,7 @@ impl EscrowContract {
     /// exists but no metadata was stored.
     pub fn get_escrow_metadata(env: Env, escrow_id: u64) -> Result<EscrowMetadata, EscrowError> {
         // First verify the escrow record itself exists.
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::Escrow(escrow_id))
-        {
+        if !env.storage().persistent().has(&DataKey::Escrow(escrow_id)) {
             return Err(EscrowError::NotFound);
         }
         let order_hash: BytesN<32> = env

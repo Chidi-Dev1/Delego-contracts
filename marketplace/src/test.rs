@@ -3,11 +3,7 @@ use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env, String};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn setup() -> (
-    Env,
-    super::MarketplaceContractClient<'static>,
-    Address,
-) {
+fn setup() -> (Env, super::MarketplaceContractClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(MarketplaceContract, ());
@@ -193,11 +189,7 @@ fn test_update_metadata_first_time_succeeds() {
     let (env, client, _admin) = setup();
     let merchant = Address::generate(&env);
     let id = client.register_merchant(&merchant, &make_params(&env, "MetaTest"));
-    client.update_metadata(
-        &id,
-        &merchant,
-        &Some(String::from_str(&env, "QmHash1")),
-    );
+    client.update_metadata(&id, &merchant, &Some(String::from_str(&env, "QmHash1")));
     let m = client.get_merchant(&id);
     assert_eq!(m.metadata, Some(String::from_str(&env, "QmHash1")));
 }
@@ -213,19 +205,12 @@ fn test_update_metadata_cooldown_blocks_rapid_update() {
     client.set_metadata_cooldown(&admin_addr, &120);
 
     env.ledger().set_timestamp(1000);
-    client.update_metadata(
-        &id,
-        &merchant,
-        &Some(String::from_str(&env, "QmFirst")),
-    );
+    client.update_metadata(&id, &merchant, &Some(String::from_str(&env, "QmFirst")));
 
     // Advance only 60 seconds — still within 120s cooldown.
     env.ledger().set_timestamp(1060);
-    let result = client.try_update_metadata(
-        &id,
-        &merchant,
-        &Some(String::from_str(&env, "QmSecond")),
-    );
+    let result =
+        client.try_update_metadata(&id, &merchant, &Some(String::from_str(&env, "QmSecond")));
     assert_eq!(result, Err(Ok(MarketplaceError::MetadataLockActive)));
 }
 
@@ -238,19 +223,11 @@ fn test_update_metadata_cooldown_passes_after_window() {
     client.set_metadata_cooldown(&admin, &120);
 
     env.ledger().set_timestamp(1000);
-    client.update_metadata(
-        &id,
-        &merchant,
-        &Some(String::from_str(&env, "QmFirst")),
-    );
+    client.update_metadata(&id, &merchant, &Some(String::from_str(&env, "QmFirst")));
 
     // Advance past the 120s cooldown.
     env.ledger().set_timestamp(1200);
-    client.update_metadata(
-        &id,
-        &merchant,
-        &Some(String::from_str(&env, "QmSecond")),
-    );
+    client.update_metadata(&id, &merchant, &Some(String::from_str(&env, "QmSecond")));
     assert_eq!(
         client.get_merchant(&id).metadata,
         Some(String::from_str(&env, "QmSecond"))
@@ -266,19 +243,11 @@ fn test_update_metadata_admin_bypasses_cooldown() {
     client.set_metadata_cooldown(&admin, &3600);
 
     env.ledger().set_timestamp(1000);
-    client.update_metadata(
-        &id,
-        &merchant,
-        &Some(String::from_str(&env, "QmFirst")),
-    );
+    client.update_metadata(&id, &merchant, &Some(String::from_str(&env, "QmFirst")));
 
     // Admin bypasses the cooldown.
     env.ledger().set_timestamp(1010);
-    client.update_metadata(
-        &id,
-        &admin,
-        &Some(String::from_str(&env, "QmAdmin")),
-    );
+    client.update_metadata(&id, &admin, &Some(String::from_str(&env, "QmAdmin")));
     assert_eq!(
         client.get_merchant(&id).metadata,
         Some(String::from_str(&env, "QmAdmin"))

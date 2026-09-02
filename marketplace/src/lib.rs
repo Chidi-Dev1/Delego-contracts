@@ -294,10 +294,9 @@ impl MarketplaceContract {
         env.storage()
             .instance()
             .set(&DataKey::NextMerchantId, &1u64);
-        env.storage().instance().set(
-            &DataKey::MetadataCooldown,
-            &DEFAULT_COOLDOWN_SECONDS,
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::MetadataCooldown, &DEFAULT_COOLDOWN_SECONDS);
         // Initialise empty verifier list.
         let verifiers: Vec<Verifier> = Vec::new(&env);
         env.storage()
@@ -382,11 +381,7 @@ impl MarketplaceContract {
         Self::append_to_category_index(&env, &params.category, id);
 
         env.events().publish(
-            (
-                symbol_short!("mkplc"),
-                symbol_short!("reg"),
-                id,
-            ),
+            (symbol_short!("mkplc"), symbol_short!("reg"), id),
             MerchantRegisteredEvent {
                 merchant_id: id,
                 owner: merchant,
@@ -400,9 +395,7 @@ impl MarketplaceContract {
 
     /// Check whether a merchant name is still available.
     pub fn is_name_available(env: Env, name: String) -> bool {
-        !env.storage()
-            .persistent()
-            .has(&DataKey::MerchantName(name))
+        !env.storage().persistent().has(&DataKey::MerchantName(name))
     }
 
     /// Owner or admin may update name, description, and image URL.
@@ -439,9 +432,11 @@ impl MarketplaceContract {
             // Claim the new name.
             let nk = DataKey::MerchantName(name.clone());
             env.storage().persistent().set(&nk, &merchant_id);
-            env.storage()
-                .persistent()
-                .extend_ttl(&nk, PERSISTENT_TTL_LEDGERS, PERSISTENT_TTL_LEDGERS);
+            env.storage().persistent().extend_ttl(
+                &nk,
+                PERSISTENT_TTL_LEDGERS,
+                PERSISTENT_TTL_LEDGERS,
+            );
 
             record.name = name;
         }
@@ -479,11 +474,7 @@ impl MarketplaceContract {
                 .unwrap_or(DEFAULT_COOLDOWN_SECONDS);
             let now = env.ledger().timestamp();
             let last_key = DataKey::LastMetadataUpdate(merchant_id);
-            if let Some(last_ts) = env
-                .storage()
-                .persistent()
-                .get::<_, u64>(&last_key)
-            {
+            if let Some(last_ts) = env.storage().persistent().get::<_, u64>(&last_key) {
                 if now < last_ts + cooldown {
                     return Err(MarketplaceError::MetadataLockActive);
                 }
@@ -615,15 +606,8 @@ impl MarketplaceContract {
         );
 
         let count_key = DataKey::VerifiedCount(merchant_id);
-        let verified_count: u32 = env
-            .storage()
-            .persistent()
-            .get(&count_key)
-            .unwrap_or(0u32)
-            + 1;
-        env.storage()
-            .persistent()
-            .set(&count_key, &verified_count);
+        let verified_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0u32) + 1;
+        env.storage().persistent().set(&count_key, &verified_count);
         env.storage().persistent().extend_ttl(
             &count_key,
             PERSISTENT_TTL_LEDGERS,
@@ -699,10 +683,7 @@ impl MarketplaceContract {
     }
 
     /// Retrieve a lightweight `MerchantView` with live reputation snapshot.
-    pub fn get_merchant_view(
-        env: Env,
-        merchant_id: u64,
-    ) -> Result<MerchantView, MarketplaceError> {
+    pub fn get_merchant_view(env: Env, merchant_id: u64) -> Result<MerchantView, MarketplaceError> {
         let record = Self::load_merchant(&env, merchant_id)?;
         let reputation_score = Self::fetch_reputation_score(&env, &record);
         Ok(MerchantView {
@@ -886,11 +867,7 @@ impl MarketplaceContract {
         Self::save_merchant(&env, merchant_id, &record);
 
         env.events().publish(
-            (
-                symbol_short!("mkplc"),
-                symbol_short!("unsusp"),
-                merchant_id,
-            ),
+            (symbol_short!("mkplc"), symbol_short!("unsusp"), merchant_id),
             MerchantUnsuspendedEvent { merchant_id },
         );
         Ok(())
@@ -915,12 +892,11 @@ impl MarketplaceContract {
         Self::save_merchant(&env, merchant_id, &record);
 
         env.events().publish(
-            (
-                symbol_short!("mkplc"),
-                symbol_short!("closed"),
+            (symbol_short!("mkplc"), symbol_short!("closed"), merchant_id),
+            MerchantClosedEvent {
                 merchant_id,
-            ),
-            MerchantClosedEvent { merchant_id, reason },
+                reason,
+            },
         );
         Ok(())
     }
@@ -1161,9 +1137,7 @@ impl MarketplaceContract {
     }
 
     fn check_not_frozen(record: &Merchant) -> Result<(), MarketplaceError> {
-        if record.status == MerchantStatus::Suspended
-            || record.status == MerchantStatus::Closed
-        {
+        if record.status == MerchantStatus::Suspended || record.status == MerchantStatus::Closed {
             return Err(MarketplaceError::MerchantFrozen);
         }
         Ok(())
@@ -1247,7 +1221,8 @@ impl MarketplaceContract {
     /// Symbol to value. We look up the `average_rating` key.
     fn extract_average_rating(env: &Env, val: soroban_sdk::Val) -> Option<u32> {
         use soroban_sdk::{IntoVal, TryFromVal};
-        let map = soroban_sdk::Map::<soroban_sdk::Val, soroban_sdk::Val>::try_from_val(env, &val).ok()?;
+        let map =
+            soroban_sdk::Map::<soroban_sdk::Val, soroban_sdk::Val>::try_from_val(env, &val).ok()?;
         let key: soroban_sdk::Val = soroban_sdk::Symbol::new(env, "average_rating").into_val(env);
         let avg_val = map.get(key)?;
         u32::try_from_val(env, &avg_val).ok()

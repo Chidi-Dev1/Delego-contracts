@@ -208,9 +208,11 @@ impl ReputationContract {
         history.push_back(record);
 
         env.storage().persistent().set(&history_key, &history);
-        env.storage()
-            .persistent()
-            .extend_ttl(&history_key, PERSISTENT_TTL_LEDGERS, PERSISTENT_TTL_LEDGERS);
+        env.storage().persistent().extend_ttl(
+            &history_key,
+            PERSISTENT_TTL_LEDGERS,
+            PERSISTENT_TTL_LEDGERS,
+        );
 
         // Recompute aggregate score.
         let score = Self::compute_score(&env, &entity, &history, now);
@@ -218,9 +220,11 @@ impl ReputationContract {
         let transaction_count = score.transaction_count;
         let score_key = DataKey::EntityScore(entity.clone());
         env.storage().persistent().set(&score_key, &score);
-        env.storage()
-            .persistent()
-            .extend_ttl(&score_key, PERSISTENT_TTL_LEDGERS, PERSISTENT_TTL_LEDGERS);
+        env.storage().persistent().extend_ttl(
+            &score_key,
+            PERSISTENT_TTL_LEDGERS,
+            PERSISTENT_TTL_LEDGERS,
+        );
 
         env.events().publish(
             (

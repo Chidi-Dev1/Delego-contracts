@@ -518,7 +518,6 @@ mod test {
         assert_eq!(before, after);
     }
 
-
     // ─── Issue #172: Escrow Creation Metadata Hash Tests ─────────────────────
 
     #[test]
