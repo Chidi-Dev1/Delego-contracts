@@ -1,11 +1,11 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod test {
+    use crate::integration_tests::{deposit_escrow, TestEnv};
     use crate::{
         DataKey, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
         EscrowMetadataEvent,
     };
-    use crate::integration_tests::{deposit_escrow, TestEnv};
     const MAX_DEPOSIT_CPU_INSTRUCTIONS: u64 = 3_000_000;
     const MAX_DEPOSIT_MEMORY_BYTES: u64 = 3_000_000;
 
