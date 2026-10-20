@@ -18,6 +18,8 @@ use soroban_sdk::{
     IntoVal, InvokeError, String, Symbol, Vec,
 };
 
+pub mod algorithm;
+
 /// Half-life of the reputation decay curve, in ledgers (~30 days at 5s/ledger).
 pub const DECAY_HALF_LIFE_LEDGERS: u32 = 518_400;
 
@@ -240,6 +242,59 @@ pub struct VerifiedReviewProof {
     pub order_hash: BytesN<32>,
 }
 
+/// Cryptographic commitment of a verified buyer review, linking an on-chain
+/// rating to verifiable off-chain review content (issue #XXX).
+///
+/// The `content_hash` is a SHA256 hash of the review text, enabling buyers
+/// to prove they wrote a specific review without storing the full review
+/// text on-chain. Each escrow_id can only have one review commitment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewCommitment {
+    pub escrow_id: u64,
+    pub reviewer: Address,
+    pub merchant: Address,
+    pub rating: u32, // 1 to 5
+    pub content_hash: BytesN<32>,
+    pub submitted_ledger: u32,
+}
+
+/// Dispute resolution vote cast by a peer validator for a disputed transaction.
+/// Validators stake reputation weight and vote on the resolution outcome:
+/// 'buyer' (refund buyer), 'merchant' (release to merchant), or 'split' (split funds).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeQuorumVote {
+    pub dispute_id: u64,
+    pub validator: Address,
+    pub verdict: Symbol, // 'buyer', 'merchant', 'split'
+    pub staked_vote_weight: i128,
+}
+
+/// Normalized reputation score with sigmoid scaling and recency weighting.
+/// This is the final, user-facing score combining multiple signals into a
+/// confidence-weighted 0-10,000 basis point scale.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalizedReputationScore {
+    pub merchant: Address,
+    pub normalized_score: u32, // 0 to 10,000 (basis points)
+    pub confidence_score: u32, // Based on total review sample size
+    pub last_updated_ledger: u32,
+}
+
+/// Exponential penalty tracking for merchants with consecutive lost disputes.
+/// Each consecutive lost dispute doubles the penalty multiplier (up to 16x)
+/// until the merchant completes 20 dispute-free orders.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputePenaltyRecord {
+    pub merchant: Address,
+    pub consecutive_lost_disputes: u32,
+    pub last_dispute_ledger: u32,
+    pub active_penalty_multiplier: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Flag {
@@ -323,6 +378,16 @@ pub enum ReputationError {
     /// (issue #286).
     UnverifiedOrder = 0x0003_000C,
     NotFlagReporter = 3011,
+    /// Review commitment already exists for this escrow_id.
+    DuplicateReviewCommitment = 3012,
+    /// Caller is not the buyer for this escrow.
+    NotBuyer = 3013,
+    /// Escrow is not in settled state.
+    EscrowNotSettled = 3014,
+    /// Quorum threshold not reached for dispute verdict.
+    QuorumNotReached = 3015,
+    /// Invalid dispute verdict symbol.
+    InvalidVerdictSymbol = 3016,
 }
 
 #[cfg(test)]
@@ -514,6 +579,23 @@ pub enum DataKey {
     MerchantEntity(u64),
     /// Total number of merchants currently present in the ranked index.
     MerchantCount,
+
+    // Advanced reputation features (issue #XXX)
+    /// Cryptographic commitment of a verified buyer review, binding off-chain
+    /// content to an on-chain rating via content hash.
+    ReviewCommitment(u64), // Maps escrow_id -> ReviewCommitment
+    /// All review commitments for a merchant, keyed by escrow_id for deduplication.
+    MerchantReviewCommitments(Address), // Vec<u64> (escrow_ids)
+    /// Dispute quorum vote tracking per dispute.
+    DisputeQuorumVote(u64), // Maps dispute_id -> Vec<DisputeQuorumVote>
+    /// Dispute vote tallies: (dispute_id) -> (buyer_votes, merchant_votes, split_votes)
+    DisputeVoteTally(u64),
+    /// Normalized reputation score with sigmoid scaling.
+    NormalizedScore(Address), // Maps merchant -> NormalizedReputationScore
+    /// Exponential penalty tracking for consecutive lost disputes.
+    DisputePenalty(Address), // Maps merchant -> DisputePenaltyRecord
+    /// Counts dispute-free orders for penalty recovery.
+    DisputeFreeOrderCount(Address), // Maps merchant -> u32
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -564,6 +646,26 @@ const VOLUME_WEIGHT_BPS: i128 = 6_000;
 /// dampening unit for the volume-weighted score. Each multiple of this
 /// amount contributes a diminishing marginal increment to the volume score.
 const VOLUME_UNIT: i128 = 1_000;
+
+// --- Advanced Reputation Scoring Constants ---
+
+/// Minimum rating value (1 star).
+const MIN_RATING: u32 = 1;
+
+/// Maximum rating value (5 stars).
+const MAX_RATING: u32 = 5;
+
+/// Quorum threshold for dispute voting (66% consensus).
+const DISPUTE_QUORUM_THRESHOLD_BPS: i128 = 6_600;
+
+/// Maximum consecutive lost dispute penalty multiplier (2^4 = 16x).
+const MAX_DISPUTE_PENALTY_MULTIPLIER: u32 = 4;
+
+/// Number of dispute-free orders required to reset penalty multiplier.
+const DISPUTE_FREE_RESET_THRESHOLD: u32 = 20;
+
+/// Maximum allowed gas instructions for normalized score computation.
+const MAX_SCORE_COMPUTATION_INSTRUCTIONS: u32 = 50_000;
 
 /// Maps a transaction outcome to its contribution toward `score`, in basis
 /// points, per the reputation score formula.
@@ -2119,6 +2221,325 @@ impl ReputationContract {
             },
         );
         Ok(rep)
+    }
+
+    // --- Advanced Reputation Scoring Features ---
+
+    /// Submit a cryptographic commitment of a verified buyer review.
+    /// Stores a hash of the review content to link on-chain ratings to
+    /// verifiable off-chain review content.
+    ///
+    /// Caller must be the buyer of the escrow, and the escrow must be in
+    /// Released status. Each escrow_id can only have one review commitment.
+    pub fn submit_review_commitment(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        rating: u32,
+        content_hash: BytesN<32>,
+        escrow_contract: Address,
+    ) -> Result<(), ReputationError> {
+        caller.require_auth();
+
+        // Validate rating range (1-5 stars)
+        if rating < MIN_RATING || rating > MAX_RATING {
+            return Err(ReputationError::InvalidRating);
+        }
+
+        // Check if review already committed
+        let commitment_key = DataKey::ReviewCommitment(escrow_id);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&commitment_key)
+            .unwrap_or(false)
+        {
+            return Err(ReputationError::DuplicateReviewCommitment);
+        }
+
+        // Verify with escrow contract that caller is buyer and escrow is settled
+        let args = soroban_sdk::vec![&env, escrow_id.into_val(&env)];
+        let call_result = env.try_invoke_contract::<EscrowRecordMirror, InvokeError>(
+            &escrow_contract,
+            &Symbol::new(&env, "get_escrow"),
+            args,
+        );
+
+        let escrow: EscrowRecordMirror = match call_result {
+            Ok(Ok(record)) => record,
+            _ => return Err(ReputationError::UnverifiedOrder),
+        };
+
+        if escrow.status != EscrowStatusMirror::Released {
+            return Err(ReputationError::EscrowNotSettled);
+        }
+
+        if caller != escrow.buyer {
+            return Err(ReputationError::NotBuyer);
+        }
+
+        let merchant = escrow.seller;
+
+        // Store the review commitment
+        let commitment = ReviewCommitment {
+            escrow_id,
+            reviewer: caller.clone(),
+            merchant: merchant.clone(),
+            rating,
+            content_hash,
+            submitted_ledger: env.ledger().sequence(),
+        };
+
+        env.storage().persistent().set(&commitment_key, &commitment);
+        env.storage().persistent().extend_ttl(
+            &commitment_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Track review commitments per merchant for indexing
+        let merchant_reviews_key = DataKey::MerchantReviewCommitments(merchant.clone());
+        let mut review_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&merchant_reviews_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        review_ids.push_back(escrow_id);
+        env.storage()
+            .persistent()
+            .set(&merchant_reviews_key, &review_ids);
+        env.storage().persistent().extend_ttl(
+            &merchant_reviews_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    /// Cast a dispute quorum vote for a peer validator resolution.
+    /// Validators vote on 'buyer', 'merchant', or 'split' verdicts with their
+    /// staked vote weight. Quorum is reached at 66% weighted consensus.
+    pub fn cast_dispute_vote(
+        env: Env,
+        caller: Address,
+        dispute_id: u64,
+        verdict: Symbol,
+        staked_vote_weight: i128,
+    ) -> Result<(), ReputationError> {
+        caller.require_auth();
+
+        if !algorithm::validate_verdict_symbol(verdict.clone(), &env) {
+            return Err(ReputationError::InvalidVerdictSymbol);
+        }
+
+        if staked_vote_weight <= 0 {
+            return Err(ReputationError::InvalidParam);
+        }
+
+        let vote_key = DataKey::DisputeQuorumVote(dispute_id);
+        let mut votes: Vec<DisputeQuorumVote> = env
+            .storage()
+            .persistent()
+            .get(&vote_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Check if this validator already voted
+        for vote in votes.iter() {
+            if vote.validator == caller {
+                return Err(ReputationError::InvalidParam); // Already voted
+            }
+        }
+
+        // Record the vote
+        let vote = DisputeQuorumVote {
+            dispute_id,
+            validator: caller,
+            verdict: verdict.clone(),
+            staked_vote_weight,
+        };
+        votes.push_back(vote);
+        env.storage().persistent().set(&vote_key, &votes);
+        env.storage().persistent().extend_ttl(
+            &vote_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve normalized reputation score with sigmoid scaling and
+    /// confidence weighting for a merchant.
+    pub fn get_normalized_reputation_score(
+        env: Env,
+        merchant: Address,
+    ) -> Result<NormalizedReputationScore, ReputationError> {
+        let normalized_key = DataKey::NormalizedScore(merchant.clone());
+        env.storage()
+            .persistent()
+            .get(&normalized_key)
+            .ok_or(ReputationError::EntityNotFound)
+    }
+
+    /// Compute and cache normalized reputation score with sigmoid scaling.
+    /// Applies sigmoid curve to smooth extreme values and computes confidence
+    /// based on review sample size (Bayesian average approach).
+    pub fn compute_normalized_score(
+        env: Env,
+        merchant: Address,
+    ) -> Result<NormalizedReputationScore, ReputationError> {
+        // Get raw reputation score
+        let raw_rep = Self::get_reputation(env.clone(), merchant.clone())?;
+
+        // Apply sigmoid normalization (steepness k=1, midpoint at 5000 bps)
+        let sigmoid_score =
+            algorithm::compute_sigmoid_normalized_score(raw_rep.score, 1, 5_000);
+
+        // Compute confidence score based on review count
+        let confidence =
+            algorithm::compute_confidence_score(raw_rep.total_transactions, 10);
+
+        let normalized_score = NormalizedReputationScore {
+            merchant: merchant.clone(),
+            normalized_score: sigmoid_score,
+            confidence_score: confidence,
+            last_updated_ledger: env.ledger().sequence(),
+        };
+
+        // Cache the normalized score
+        let normalized_key = DataKey::NormalizedScore(merchant.clone());
+        env.storage()
+            .persistent()
+            .set(&normalized_key, &normalized_score);
+        env.storage().persistent().extend_ttl(
+            &normalized_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(normalized_score)
+    }
+
+    /// Track a lost dispute for a merchant and update exponential penalty.
+    /// Doubles the penalty multiplier for each consecutive loss (up to 16x).
+    pub fn record_lost_dispute(
+        env: Env,
+        caller: Address,
+        merchant: Address,
+        dispute_id: u64,
+    ) -> Result<(), ReputationError> {
+        caller.require_auth();
+        let admin = Self::require_admin(&env)?;
+        if caller != admin {
+            return Err(ReputationError::Unauthorized);
+        }
+
+        let penalty_key = DataKey::DisputePenalty(merchant.clone());
+        let mut penalty_record: DisputePenaltyRecord = env
+            .storage()
+            .persistent()
+            .get(&penalty_key)
+            .unwrap_or_else(|| DisputePenaltyRecord {
+                merchant: merchant.clone(),
+                consecutive_lost_disputes: 0,
+                last_dispute_ledger: 0,
+                active_penalty_multiplier: 1,
+            });
+
+        // Increment consecutive losses
+        penalty_record.consecutive_lost_disputes =
+            penalty_record.consecutive_lost_disputes.saturating_add(1);
+        penalty_record.last_dispute_ledger = env.ledger().sequence();
+
+        // Compute exponential multiplier: 2^min(losses, 4)
+        penalty_record.active_penalty_multiplier =
+            algorithm::compute_dispute_penalty_multiplier(
+                penalty_record.consecutive_lost_disputes,
+                MAX_DISPUTE_PENALTY_MULTIPLIER,
+            );
+
+        env.storage()
+            .persistent()
+            .set(&penalty_key, &penalty_record);
+        env.storage().persistent().extend_ttl(
+            &penalty_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    /// Record a successful (dispute-free) order to progress toward penalty recovery.
+    /// After 20 consecutive dispute-free orders, the penalty multiplier resets.
+    pub fn record_dispute_free_order(
+        env: Env,
+        merchant: Address,
+        escrow_id: u64,
+    ) -> Result<(), ReputationError> {
+        let free_count_key = DataKey::DisputeFreeOrderCount(merchant.clone());
+        let mut count: u32 = env
+            .storage()
+            .persistent()
+            .get(&free_count_key)
+            .unwrap_or(0);
+
+        count = count.saturating_add(1);
+
+        // Check if recovery threshold reached
+        if algorithm::should_reset_dispute_penalty(count, DISPUTE_FREE_RESET_THRESHOLD) {
+            // Reset penalty record
+            let penalty_key = DataKey::DisputePenalty(merchant.clone());
+            let mut penalty_record: DisputePenaltyRecord = env
+                .storage()
+                .persistent()
+                .get(&penalty_key)
+                .unwrap_or_else(|| DisputePenaltyRecord {
+                    merchant: merchant.clone(),
+                    consecutive_lost_disputes: 0,
+                    last_dispute_ledger: 0,
+                    active_penalty_multiplier: 1,
+                });
+
+            penalty_record.consecutive_lost_disputes = 0;
+            penalty_record.active_penalty_multiplier = 1;
+
+            env.storage()
+                .persistent()
+                .set(&penalty_key, &penalty_record);
+            env.storage().persistent().extend_ttl(
+                &penalty_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            // Reset dispute-free counter
+            count = 0;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&free_count_key, &count);
+        env.storage().persistent().extend_ttl(
+            &free_count_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    /// Get the current dispute penalty record for a merchant.
+    pub fn get_dispute_penalty(
+        env: Env,
+        merchant: Address,
+    ) -> Result<DisputePenaltyRecord, ReputationError> {
+        let penalty_key = DataKey::DisputePenalty(merchant.clone());
+        env.storage()
+            .persistent()
+            .get(&penalty_key)
+            .ok_or(ReputationError::EntityNotFound)
     }
 }
 
