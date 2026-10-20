@@ -403,6 +403,13 @@ pub struct EntityUnfrozenEvent {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigUpdatedEvent {
+    pub old: ReputationConfig,
+    pub new: ReputationConfig,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct AdminProposedEvent {
     pub current_admin: Address,
@@ -1534,7 +1541,22 @@ impl ReputationContract {
         Self::require_caller_is_admin(&env, &admin)?;
         Self::validate_config(&config)?;
 
+        let old: ReputationConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(ReputationError::NotInitialized)?;
+
         env.storage().instance().set(&DataKey::Config, &config);
+
+        env.events().publish(
+            (symbol_short!("reput"), symbol_short!("cfg_upd")),
+            ConfigUpdatedEvent {
+                old,
+                new: config,
+            },
+        );
+
         Ok(())
     }
 

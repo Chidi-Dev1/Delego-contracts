@@ -2172,3 +2172,194 @@ fn test_score_recalculates_after_feedback_submission() {
         "expected a (reput, updated, entity) score-updated event"
     );
 }
+
+// --- ConfigUpdatedEvent tests ---
+//
+// Each test confirms that `update_config` emits a `(reput, cfg_upd)` event
+// carrying the exact old and new `ReputationConfig` values.  One test per
+// mutable field satisfies the "field-level change tests" acceptance criterion.
+
+/// Helper: find the single `ConfigUpdatedEvent` emitted by the contract and
+/// return it, panicking if none (or more than one) is found.
+#[cfg(test)]
+fn extract_config_updated_event(
+    env: &Env,
+    contract_id: &Address,
+) -> crate::ConfigUpdatedEvent {
+    use soroban_sdk::{testutils::Events, IntoVal, TryIntoVal};
+
+    let events = env.events().all();
+    let mut found: Vec<crate::ConfigUpdatedEvent> = std::vec![];
+    for (contract, topics, data) in events.into_iter() {
+        if contract != *contract_id {
+            continue;
+        }
+        if topics.len() < 2 {
+            continue;
+        }
+        let ns: soroban_sdk::Symbol = match topics.get(0).unwrap().try_into_val(env) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let name: soroban_sdk::Symbol = match topics.get(1).unwrap().try_into_val(env) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if ns == symbol_short!("reput") && name == symbol_short!("cfg_upd") {
+            let evt: crate::ConfigUpdatedEvent = data.try_into_val(env).unwrap();
+            found.push(evt);
+        }
+    }
+    assert_eq!(found.len(), 1, "expected exactly one cfg_upd event, got {}", found.len());
+    found.remove(0)
+}
+
+#[test]
+fn test_update_config_emits_event_with_old_and_new_config() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let old_config = default_config();
+    let mut new_config = old_config.clone();
+    new_config.min_transactions_threshold = 3;
+
+    client.update_config(&admin, &new_config);
+
+    let evt = extract_config_updated_event(&env, &client.address);
+    assert_eq!(evt.old, old_config);
+    assert_eq!(evt.new, new_config);
+}
+
+#[test]
+fn test_update_config_event_decay_window_change() {
+    // Changing decay_window_seconds: old and new differ only in that field.
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let old_config = default_config();
+    let mut new_config = old_config.clone();
+    new_config.decay_window_seconds = old_config.decay_window_seconds * 2;
+
+    client.update_config(&admin, &new_config);
+
+    let evt = extract_config_updated_event(&env, &client.address);
+    assert_eq!(evt.old.decay_window_seconds, old_config.decay_window_seconds);
+    assert_eq!(evt.new.decay_window_seconds, new_config.decay_window_seconds);
+    // All other fields are identical.
+    assert_eq!(evt.old.min_transactions_threshold, evt.new.min_transactions_threshold);
+    assert_eq!(evt.old.dispute_penalty_bps, evt.new.dispute_penalty_bps);
+    assert_eq!(evt.old.freeze_threshold_flags, evt.new.freeze_threshold_flags);
+}
+
+#[test]
+fn test_update_config_event_min_transactions_threshold_change() {
+    // Changing min_transactions_threshold: old and new differ only in that field.
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let old_config = default_config();
+    let mut new_config = old_config.clone();
+    new_config.min_transactions_threshold = old_config.min_transactions_threshold + 1;
+
+    client.update_config(&admin, &new_config);
+
+    let evt = extract_config_updated_event(&env, &client.address);
+    assert_eq!(evt.old.min_transactions_threshold, old_config.min_transactions_threshold);
+    assert_eq!(evt.new.min_transactions_threshold, new_config.min_transactions_threshold);
+    assert_eq!(evt.old.decay_window_seconds, evt.new.decay_window_seconds);
+    assert_eq!(evt.old.dispute_penalty_bps, evt.new.dispute_penalty_bps);
+    assert_eq!(evt.old.freeze_threshold_flags, evt.new.freeze_threshold_flags);
+}
+
+#[test]
+fn test_update_config_event_dispute_penalty_bps_change() {
+    // Changing dispute_penalty_bps: old and new differ only in that field.
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let old_config = default_config();
+    let mut new_config = old_config.clone();
+    new_config.dispute_penalty_bps = old_config.dispute_penalty_bps + 100;
+
+    client.update_config(&admin, &new_config);
+
+    let evt = extract_config_updated_event(&env, &client.address);
+    assert_eq!(evt.old.dispute_penalty_bps, old_config.dispute_penalty_bps);
+    assert_eq!(evt.new.dispute_penalty_bps, new_config.dispute_penalty_bps);
+    assert_eq!(evt.old.decay_window_seconds, evt.new.decay_window_seconds);
+    assert_eq!(evt.old.min_transactions_threshold, evt.new.min_transactions_threshold);
+    assert_eq!(evt.old.freeze_threshold_flags, evt.new.freeze_threshold_flags);
+}
+
+#[test]
+fn test_update_config_event_freeze_threshold_flags_change() {
+    // Changing freeze_threshold_flags: old and new differ only in that field.
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let old_config = default_config();
+    let mut new_config = old_config.clone();
+    new_config.freeze_threshold_flags = old_config.freeze_threshold_flags + 2;
+
+    client.update_config(&admin, &new_config);
+
+    let evt = extract_config_updated_event(&env, &client.address);
+    assert_eq!(evt.old.freeze_threshold_flags, old_config.freeze_threshold_flags);
+    assert_eq!(evt.new.freeze_threshold_flags, new_config.freeze_threshold_flags);
+    assert_eq!(evt.old.decay_window_seconds, evt.new.decay_window_seconds);
+    assert_eq!(evt.old.min_transactions_threshold, evt.new.min_transactions_threshold);
+    assert_eq!(evt.old.dispute_penalty_bps, evt.new.dispute_penalty_bps);
+}
+
+#[test]
+fn test_update_config_emits_no_event_on_unauthorized_call() {
+    // A rejected call must not emit any cfg_upd event.
+    use soroban_sdk::testutils::Events;
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let not_admin = Address::generate(&env);
+
+    let _ = client.try_update_config(&not_admin, &default_config());
+
+    let events = env.events().all();
+    let cfg_upd_count = events.iter().filter(|(contract, topics, _)| {
+        use soroban_sdk::{IntoVal, TryIntoVal};
+        *contract == client.address
+            && topics.get(1)
+                .and_then(|v| v.try_into_val::<_, soroban_sdk::Symbol>(&env).ok())
+                .map(|s| s == symbol_short!("cfg_upd"))
+                .unwrap_or(false)
+    }).count();
+    assert_eq!(cfg_upd_count, 0, "unauthorized call must not emit cfg_upd event");
+}
+
+#[test]
+fn test_update_config_event_namespace_is_reput() {
+    // Confirm the event topics follow the ('reput', 'cfg_upd') schema required
+    // by the namespace-consistency rule checked in test_event_namespace_consistency.
+    use soroban_sdk::{testutils::Events, IntoVal, TryIntoVal};
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let mut new_config = default_config();
+    new_config.dispute_penalty_bps = 200;
+    client.update_config(&admin, &new_config);
+
+    let events = env.events().all();
+    let cfg_upd_events: Vec<_> = events
+        .iter()
+        .filter(|(contract, topics, _)| {
+            *contract == client.address
+                && topics
+                    .get(1)
+                    .and_then(|v| v.try_into_val::<_, soroban_sdk::Symbol>(&env).ok())
+                    .map(|s| s == symbol_short!("cfg_upd"))
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    assert_eq!(cfg_upd_events.len(), 1, "expected exactly one cfg_upd event");
+    let (_, topics, _) = &cfg_upd_events[0];
+    let ns: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(ns, symbol_short!("reput"), "cfg_upd event namespace must be 'reput'");
+}
