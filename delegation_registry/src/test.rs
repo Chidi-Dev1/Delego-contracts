@@ -2207,3 +2207,211 @@ fn test_get_delegations_by_agent_bumps_ttl() {
     });
     assert!(refreshed_ttl > 17_280);
 }
+
+// ── Emergency delegation circuit breaker ────────────────────────────────────
+
+#[test]
+fn test_killswitch_freezes_account_and_invalidates_sessions() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Killswitch_Agent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    // Baseline: the delegation is live and the agent is authorized.
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Active);
+    assert!(client.is_authorized(&id, &agent_id));
+    assert_eq!(
+        client.get_circuit_breaker_status(&owner),
+        AccountCircuitBreakerStatus::Normal
+    );
+
+    // Trigger the kill-switch: every active session key must be invalidated
+    // immediately, without waiting for expiry or per-delegation revocation.
+    client.trigger_emergency_killswitch(&owner);
+
+    assert_eq!(
+        client.get_circuit_breaker_status(&owner),
+        AccountCircuitBreakerStatus::Frozen
+    );
+    assert!(!client.is_authorized(&id, &agent_id));
+    assert!(!client.is_authorized_for(&id, &agent_id, &PERM_FLAG_SPEND));
+}
+
+#[test]
+fn test_killswitch_invalidates_all_active_delegations_for_owner() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Killswitch_Multi");
+    let id_a = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let id_b = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let id_c = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    assert!(client.is_authorized(&id_a, &agent_id));
+    assert!(client.is_authorized(&id_b, &agent_id));
+    assert!(client.is_authorized(&id_c, &agent_id));
+
+    client.trigger_emergency_killswitch(&owner);
+
+    // Every session key under the buyer's account fails validation at once.
+    assert!(!client.is_authorized(&id_a, &agent_id));
+    assert!(!client.is_authorized(&id_b, &agent_id));
+    assert!(!client.is_authorized(&id_c, &agent_id));
+}
+
+#[test]
+fn test_killswitch_does_not_affect_other_accounts() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let other_owner = Address::generate(&env);
+    let label = Symbol::new(&env, "Killswitch_Scope");
+
+    let frozen_id =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let live_id = client.create_delegation(
+        &other_owner,
+        &agent_id,
+        &permissions_contract,
+        &label,
+        &1000,
+    );
+
+    client.trigger_emergency_killswitch(&owner);
+
+    // Only the triggering account is frozen.
+    assert!(!client.is_authorized(&frozen_id, &agent_id));
+    assert!(client.is_authorized(&live_id, &agent_id));
+    assert_eq!(
+        client.get_circuit_breaker_status(&other_owner),
+        AccountCircuitBreakerStatus::Normal
+    );
+}
+
+#[test]
+fn test_killswitch_blocks_new_delegations_while_frozen() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Killswitch_New");
+    client.trigger_emergency_killswitch(&owner);
+
+    // A frozen account cannot mint fresh session keys to route around the
+    // kill-switch.
+    let result =
+        client.try_create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    assert_eq!(result, Err(Ok(DelegationError::AccountFrozen)));
+}
+
+#[test]
+fn test_killswitch_emits_critical_alert_event() {
+    let (env, client, _, owner, _, _) = setup();
+    env.mock_all_auths();
+
+    client.trigger_emergency_killswitch(&owner);
+
+    let events = env.events().all();
+    let found = events.iter().any(|(_, topics, _)| {
+        let t: soroban_sdk::Vec<soroban_sdk::Val> = topics;
+        t.len() >= 2
+            && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
+            && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok()
+                == Some(symbol_short!("cb_trig"))
+    });
+    assert!(found, "DelegationCircuitBreakerTriggered event not emitted");
+}
+
+#[test]
+fn test_killswitch_is_idempotent() {
+    let (env, client, _, owner, _, _) = setup();
+    env.mock_all_auths();
+
+    client.trigger_emergency_killswitch(&owner);
+    // A second trigger must not error; the account simply stays frozen.
+    client.trigger_emergency_killswitch(&owner);
+
+    assert_eq!(
+        client.get_circuit_breaker_status(&owner),
+        AccountCircuitBreakerStatus::Frozen
+    );
+}
+
+#[test]
+fn test_reactivate_account_restores_normal_status() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Reactivate_Agent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+
+    client.trigger_emergency_killswitch(&owner);
+    assert!(!client.is_authorized(&id, &agent_id));
+
+    // Reactivation requires the master key confirmation.
+    client.reactivate_account(&owner);
+
+    assert_eq!(
+        client.get_circuit_breaker_status(&owner),
+        AccountCircuitBreakerStatus::Normal
+    );
+}
+
+#[test]
+fn test_reactivate_account_requires_master_key_auth() {
+    let (env, client, _, owner, _, _) = setup();
+    env.mock_all_auths();
+
+    client.trigger_emergency_killswitch(&owner);
+
+    // Without the master key's authorization, reactivation must be refused.
+    env.set_auths(&[]);
+    let result = client.try_reactivate_account(&owner);
+    assert!(result.is_err());
+
+    assert_eq!(
+        client.get_circuit_breaker_status(&owner),
+        AccountCircuitBreakerStatus::Frozen
+    );
+}
+
+#[test]
+fn test_reactivate_account_when_not_frozen_returns_typed_error() {
+    let (env, client, _, owner, _, _) = setup();
+    env.mock_all_auths();
+
+    let result = client.try_reactivate_account(&owner);
+    assert_eq!(result, Err(Ok(DelegationError::NotFrozen)));
+}
+
+#[test]
+fn test_reactivate_account_emits_event() {
+    let (env, client, _, owner, _, _) = setup();
+    env.mock_all_auths();
+
+    client.trigger_emergency_killswitch(&owner);
+    client.reactivate_account(&owner);
+
+    let events = env.events().all();
+    let found = events.iter().any(|(_, topics, _)| {
+        let t: soroban_sdk::Vec<soroban_sdk::Val> = topics;
+        t.len() >= 2
+            && Symbol::try_from_val(&env, &t.get(0).unwrap()).ok() == Some(symbol_short!("deleg"))
+            && Symbol::try_from_val(&env, &t.get(1).unwrap()).ok()
+                == Some(symbol_short!("cb_react"))
+    });
+    assert!(found, "AccountReactivated event not emitted");
+}
+
+#[test]
+fn test_reactivated_account_can_create_delegations_again() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "Reactivate_New");
+    client.trigger_emergency_killswitch(&owner);
+    client.reactivate_account(&owner);
+
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    assert!(client.is_authorized(&id, &agent_id));
+}

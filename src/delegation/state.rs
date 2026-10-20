@@ -1,6 +1,13 @@
-use soroban_sdk::{contracttype, Env, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 use soroban_sdk::token::{Token, TokenType};
 use soroban_sdk::types::ContractData;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+put enum AccountCircuitBreakerStatus {
+    Normal,
+    Frozen,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,4 +44,13 @@ impl DelegationState {
         self.epoch_config.current_epoch += 1;
         self.epoch_config.epoch_started_ledger = env.ledger().sequence();
     }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountCircuitBreaker {
+    pub delegator: Address,
+    pub status: AccountCircuitBreakerStatus,
+    pub frozen_epoch: u32,
+    pub frozen_at: u32,
 }
