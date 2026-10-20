@@ -2,9 +2,9 @@
 #![allow(clippy::module_inception)]
 
 use crate::{
-    CompositeScore, DataKey, ReputationConfig, ReputationContract, ReputationContractClient,
-    ReputationError, TransactionOutcome, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD,
-    SCORE_WINDOW,
+    CompositeScore, DataKey, EntityRole, ReputationConfig, ReputationContract,
+    ReputationContractClient, ReputationError, TransactionOutcome, PERSISTENT_BUMP_AMOUNT,
+    PERSISTENT_BUMP_THRESHOLD, SCORE_WINDOW,
 };
 use soroban_sdk::{
     symbol_short,
@@ -2171,4 +2171,250 @@ fn test_score_recalculates_after_feedback_submission() {
         found,
         "expected a (reput, updated, entity) score-updated event"
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Issue #396: Role-specific scoring weight models
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_set_entity_role_classifies_merchant() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::Merchant);
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.role, EntityRole::Merchant);
+}
+
+#[test]
+fn test_set_entity_role_classifies_buyer_agent() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::BuyerAgent);
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.role, EntityRole::BuyerAgent);
+}
+
+#[test]
+fn test_set_entity_role_rejects_non_admin() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let not_admin = Address::generate(&env);
+
+    let res = client.try_set_entity_role(
+        &not_admin,
+        &entity.clone(),
+        &EntityRole::Merchant,
+    );
+    assert_eq!(res, Err(Ok(ReputationError::Unauthorized)));
+}
+
+#[test]
+fn test_get_role_specific_metrics_merchant() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::Merchant);
+
+    // 4 Released, 1 Disputed out of 5 total.
+    for i in 0..4u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+    client.record_transaction(
+        &admin,
+        &4u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+
+    let metrics = client.get_role_specific_metrics(&entity);
+    // fulfillment = 4/5 * 10000 = 8000
+    assert_eq!(metrics.fulfillment_rate_bps, 8000);
+    // dispute frequency = 1/5 * 10000 = 2000
+    assert_eq!(metrics.dispute_frequency_bps, 2000);
+    assert_eq!(metrics.role, EntityRole::Merchant);
+    assert_eq!(metrics.timely_payment_rate_bps, 8000);
+}
+
+#[test]
+fn test_get_role_specific_metrics_buyer_agent() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::BuyerAgent);
+
+    // All Released -> no disputes, full fulfillment/timely payment.
+    for i in 0..5u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let metrics = client.get_role_specific_metrics(&entity);
+    assert_eq!(metrics.fulfillment_rate_bps, 10_000);
+    assert_eq!(metrics.dispute_frequency_bps, 0);
+    assert_eq!(metrics.timely_payment_rate_bps, 10_000);
+    assert_eq!(metrics.role, EntityRole::BuyerAgent);
+}
+
+#[test]
+fn test_get_merchant_metrics_rejects_buyer_agent() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::BuyerAgent);
+
+    let res = client.try_get_merchant_metrics(&entity);
+    assert_eq!(res, Err(Ok(ReputationError::EntityNotFound)));
+}
+
+#[test]
+fn test_get_buyer_agent_metrics_rejects_merchant() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::Merchant);
+
+    let res = client.try_get_buyer_agent_metrics(&entity);
+    assert_eq!(res, Err(Ok(ReputationError::EntityNotFound)));
+}
+
+#[test]
+fn test_get_merchant_metrics_returns_for_merchant() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::Merchant);
+
+    for i in 0..5u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let metrics = client.get_merchant_metrics(&entity);
+    assert_eq!(metrics.role, EntityRole::Merchant);
+    assert_eq!(metrics.fulfillment_rate_bps, 10_000);
+    assert_eq!(metrics.dispute_frequency_bps, 0);
+}
+
+#[test]
+fn test_get_buyer_agent_metrics_returns_for_buyer_agent() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::BuyerAgent);
+
+    // 3 Released, 2 Disputed out of 5 total.
+    for i in 0..3u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+    for i in 3..5u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1000i128,
+            &TransactionOutcome::Disputed,
+        );
+    }
+
+    let metrics = client.get_buyer_agent_metrics(&entity);
+    assert_eq!(metrics.role, EntityRole::BuyerAgent);
+    // fulfillment = 3/5 * 10000 = 6000
+    assert_eq!(metrics.fulfillment_rate_bps, 6000);
+    // dispute frequency = 2/5 * 10000 = 4000
+    assert_eq!(metrics.dispute_frequency_bps, 4000);
+    assert_eq!(metrics.timely_payment_rate_bps, 6000);
+}
+
+#[test]
+fn test_role_specific_metrics_entity_not_found() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let entity = Address::generate(&env);
+
+    assert_eq!(
+        client.try_get_role_specific_metrics(&entity),
+        Err(Ok(ReputationError::EntityNotFound))
+    );
+}
+
+#[test]
+fn test_role_metrics_update_on_outcome_change() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    client.set_entity_role(&admin, &entity.clone(), &EntityRole::Merchant);
+
+    // Start with a Disputed outcome.
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::Disputed,
+    );
+    let metrics_after_dispute = client.get_role_specific_metrics(&entity);
+    assert_eq!(metrics_after_dispute.dispute_frequency_bps, 10_000);
+
+    // Lifecycle update to ResolvedSeller: dispute count drops, fulfillment rises.
+    client.record_transaction(
+        &admin,
+        &1u64,
+        &entity,
+        &counterparty,
+        &1000i128,
+        &TransactionOutcome::ResolvedSeller,
+    );
+    let metrics_after_resolve = client.get_role_specific_metrics(&entity);
+    assert_eq!(metrics_after_resolve.dispute_frequency_bps, 0);
+    assert_eq!(metrics_after_resolve.fulfillment_rate_bps, 10_000);
 }
