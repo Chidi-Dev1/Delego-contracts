@@ -1,13 +1,9 @@
 #![cfg(test)]
 
 use crate::{
-    BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig, EscrowContract,
-    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, MerchantVolumeRecord,
-    TreasuryShare, MAX_TREASURIES,
-
     AffiliateConfig, BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig,
-    EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
-    MAX_TREASURIES,
+    EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState,
+    MerchantVolumeRecord, TreasuryShare, MAX_TREASURIES,
     BatchDepositItem, BatchDepositParams, BatchDepositResult, BatchRefundParams,
     BatchReleaseParams, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
     EscrowStatus, EscrowTerminalState, TreasuryShare, MAX_TREASURIES,
