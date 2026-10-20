@@ -12,9 +12,12 @@
 #![warn(missing_docs)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, InvokeError,
-    String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    InvokeError, String, Symbol, Vec,
 };
+
+/// Storefront metadata storage and update support.
+pub mod storefront;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -258,6 +261,8 @@ pub enum MarketplaceError {
     MerchantCategoryNotAllowed = 5020,
     /// `metadata_uri` field exceeds [`MAX_METADATA_URI_LEN`] bytes.
     MetadataUriTooLong = 4021,
+    /// Storefront metadata contains an invalid IPFS CID.
+    InvalidIpfsCid = 5021,
     /// Insufficient registration deposit provided
     InsufficientDeposit = 4022,
     /// Cannot refund deposit while merchant has open escrows
@@ -776,6 +781,8 @@ pub enum DataKey {
     SkuInventory(u64, String),
     /// List of all SKU IDs for a merchant.
     MerchantSkuList(u64),
+    /// Storefront metadata record for a merchant.
+    StorefrontMetadata(u64),
 }
 
 /// Mirror of `ReputationScore` from `delego-reputation` for cross-contract deserialization.
@@ -1439,6 +1446,16 @@ impl MarketplaceContract {
         );
 
         Ok(())
+    }
+
+    pub fn set_storefront_metadata(
+        env: Env,
+        merchant_id: u64,
+        caller: Address,
+        ipfs_cid: String,
+        content_hash: BytesN<32>,
+    ) -> Result<(), MarketplaceError> {
+        storefront::set_storefront_metadata(env, merchant_id, caller, ipfs_cid, content_hash)
     }
 
     // --- Category Management ---
