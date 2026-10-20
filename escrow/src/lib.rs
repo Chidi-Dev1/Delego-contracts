@@ -491,6 +491,18 @@ pub struct EscrowCreatedEvent {
     pub timeout_ledger: u32,
 }
 
+/// Standard payload shape for escrow funding and settlement events.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StandardEscrowEventPayload {
+    pub escrow_id: u64,
+    pub buyer: Address,
+    pub merchant: Address,
+    pub amount_stroops: i128,
+    pub token: Address,
+    pub event_timestamp: u64,
+}
+
 /// Emitted when escrow creation includes an off-chain order metadata hash.
 ///
 /// `escrow_id` is the 32-byte order id so indexers can join contract events
