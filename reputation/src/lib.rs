@@ -24,6 +24,11 @@ pub use scoring::{
     FeedbackReview,
 };
 
+pub mod antisybil;
+pub use antisybil::{
+    calculate_reviewer_weight, get_buyer_completed_orders, EscrowListPageMirror,
+};
+
 /// Half-life of the reputation decay curve, in ledgers (~30 days at 5s/ledger).
 pub const DECAY_HALF_LIFE_LEDGERS: u32 = 518_400;
 
