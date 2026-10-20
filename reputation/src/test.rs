@@ -2,14 +2,15 @@
 #![allow(clippy::module_inception)]
 
 use crate::{
-    CompositeScore, DataKey, ReputationConfig, ReputationContract, ReputationContractClient,
-    ReputationError, TransactionOutcome, PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD,
-    SCORE_WINDOW,
+    oracle_proof::test_signing_payload, CarrierProof, CompositeScore, DataKey, ReputationConfig,
+    ReputationContract, ReputationContractClient, ReputationError, TransactionOutcome,
+    PERSISTENT_BUMP_AMOUNT, PERSISTENT_BUMP_THRESHOLD, SCORE_WINDOW,
 };
+use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     symbol_short,
-    testutils::{storage::Persistent, Address as _, Ledger},
-    Address, Env, String,
+    testutils::{storage::Persistent, Address as _, Events, Ledger},
+    Address, BytesN, Env, String,
 };
 
 const MAX_RECORD_CPU_INSTRUCTIONS: u64 = 3_000_000;
@@ -36,6 +37,80 @@ fn setup(env: &Env) -> (ReputationContractClient<'_>, Address) {
     let contract_id = env.register(ReputationContract, (admin.clone(), default_config()));
     let client = ReputationContractClient::new(env, &contract_id);
     (client, admin)
+}
+
+fn signed_carrier_proof(
+    env: &Env,
+    contract: &Address,
+    carrier_oracle: Address,
+    signing_key: &SigningKey,
+) -> CarrierProof {
+    let mut proof = CarrierProof {
+        carrier_oracle,
+        tracking_number_hash: BytesN::from_array(env, &[7; 32]),
+        delivery_status: symbol_short!("delivered"),
+        signature: BytesN::from_array(env, &[0; 64]),
+    };
+    let payload = test_signing_payload(env, contract, &proof);
+    let payload_len = payload.len() as usize;
+    let mut payload_bytes = [0u8; 512];
+    payload.copy_into_slice(&mut payload_bytes[..payload_len]);
+    proof.signature = BytesN::from_array(
+        env,
+        &signing_key.sign(&payload_bytes[..payload_len]).to_bytes(),
+    );
+    proof
+}
+
+#[test]
+fn carrier_proof_verifies_and_emits_event_for_registered_oracle() {
+    use soroban_sdk::IntoVal;
+
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let carrier_oracle = Address::generate(&env);
+    let signing_key = SigningKey::from_bytes(&[42; 32]);
+    let public_key = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+    client.set_carrier_oracle(&admin, &carrier_oracle, &public_key);
+    let proof = signed_carrier_proof(&env, &client.address, carrier_oracle.clone(), &signing_key);
+
+    client.verify_carrier_proof(&proof);
+
+    let events = env.events().all();
+    assert!(events.iter().any(|(contract, topics, _)| {
+        contract == client.address
+            && topics.len() == 3
+            && topics.get(0) == Some(symbol_short!("reput").into_val(&env))
+            && topics.get(1) == Some(symbol_short!("carproof").into_val(&env))
+            && topics.get(2) == Some(carrier_oracle.clone().into_val(&env))
+    }));
+}
+
+#[test]
+fn carrier_proof_rejects_unregistered_oracle() {
+    let env = Env::default();
+    let (client, _) = setup(&env);
+    let signing_key = SigningKey::from_bytes(&[43; 32]);
+    let proof = signed_carrier_proof(&env, &client.address, Address::generate(&env), &signing_key);
+
+    assert_eq!(
+        client.try_verify_carrier_proof(&proof),
+        Err(Ok(ReputationError::CarrierOracleNotAuthorized))
+    );
+}
+
+#[test]
+fn carrier_proof_rejects_signature_not_matching_registered_key() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let carrier_oracle = Address::generate(&env);
+    let registered_key = SigningKey::from_bytes(&[44; 32]);
+    let forged_key = SigningKey::from_bytes(&[45; 32]);
+    let public_key = BytesN::from_array(&env, &registered_key.verifying_key().to_bytes());
+    client.set_carrier_oracle(&admin, &carrier_oracle, &public_key);
+    let proof = signed_carrier_proof(&env, &client.address, carrier_oracle, &forged_key);
+
+    assert!(client.try_verify_carrier_proof(&proof).is_err());
 }
 
 fn advance_time(env: &Env, seconds: u64) {
