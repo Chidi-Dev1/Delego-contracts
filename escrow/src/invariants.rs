@@ -5,6 +5,16 @@
 //! mathematical guarantees about contract behavior.
 
 use crate::{EscrowRecord, EscrowStatus};
+use soroban_sdk::{contracttype, Address, Env, Vec};
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipientDisbursement {
+    pub merchant: Address,
+    pub amount_stroops: i128,
+    pub fee_stroops: i128,
+    pub sub_order_id: u64,
+}
 
 /// Invariant 1: Conservation of Value
 ///
