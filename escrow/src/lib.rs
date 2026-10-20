@@ -16363,6 +16363,41 @@ mod min_fee_floor_tests {
 }
 
 #[cfg(test)]
+mod upgrade_proposal_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn propose_upgrade_stores_hash_and_rejects_duplicate_pending_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0,
+            treasury: Address::generate(&env),
+            min_amount: 1,
+            max_amount: 1_000,
+        };
+        let contract_id = env.register(EscrowContract, (config,));
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let wasm_hash = BytesN::from_array(&env, &[0x42; 32]);
+
+        assert!(client.propose_upgrade(&admin, &wasm_hash));
+
+        let proposal = client.get_upgrade_proposal().unwrap();
+        assert_eq!(proposal.new_wasm_hash, wasm_hash);
+        assert_eq!(proposal.approvals.len(), 1);
+        assert_eq!(proposal.approvals.get(0), Some(admin));
+        assert!(!proposal.executed);
+        assert_eq!(
+            client.try_propose_upgrade(&admin, &BytesN::from_array(&env, &[0x24; 32])),
+            Err(Ok(EscrowError::AlreadyInitialized))
+        );
+    }
+}
+
+#[cfg(test)]
 mod lending_pool_delegation_tests {
     use super::*;
     use delego_interfaces::{MockLendingPool, MockLendingPoolClient};
