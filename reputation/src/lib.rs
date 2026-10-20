@@ -18,6 +18,12 @@ use soroban_sdk::{
     IntoVal, InvokeError, String, Symbol, Vec,
 };
 
+pub mod scoring;
+pub use scoring::{
+    aggregate_decayed_score, calculate_decayed_merchant_score, compute_decayed_weight,
+    FeedbackReview,
+};
+
 /// Half-life of the reputation decay curve, in ledgers (~30 days at 5s/ledger).
 pub const DECAY_HALF_LIFE_LEDGERS: u32 = 518_400;
 
