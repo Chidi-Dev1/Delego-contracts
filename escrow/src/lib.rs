@@ -329,6 +329,37 @@ pub struct ReleasePayout {
     pub treasury: Address,
 }
 
+/// Tier-based fee discount for staked merchants (issue #542).
+///
+/// `tier` identifies the merchant's reputation tier (1 = Bronze, 2 = Silver,
+/// 3 = Gold, 4 = Platinum).  `discount_bps` is the percentage reduction
+/// applied to the platform fee in basis points (e.g. 1000 = 10% off the fee).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TierFeeDiscount {
+    /// 1 = Bronze, 2 = Silver, 3 = Gold, 4 = Platinum.
+    pub tier: u32,
+    /// Discount on the platform fee in basis points (e.g. 1000 = 10%).
+    pub discount_bps: u32,
+}
+
+/// Emitted when a fee rebate is applied to a release because the seller is a
+/// staked merchant with a reputation tier discount (issue #542).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeeRebateAppliedEvent {
+    /// Escrow that was settled.
+    pub escrow_id: u64,
+    /// Merchant (seller) who received the rebate.
+    pub seller: Address,
+    /// Reputation tier that qualified the rebate.
+    pub tier: u32,
+    /// Basis points rebated off the platform fee.
+    pub discount_bps: u32,
+    /// Token amount rebated back to the seller (extra net payout).
+    pub rebate_amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowAmountLimits {
@@ -488,6 +519,8 @@ pub enum DataKey {
     /// Admin flag: when `true`, buyer-originated releases on the escrow must
     /// pass `get_release_eligibility` (issue #48).
     RequireReleaseCondition(u64),
+    /// Optional marketplace contract address for tier-based fee rebates (#542).
+    MarketplaceContract,
 }
 
 #[contracterror]
@@ -2056,6 +2089,10 @@ impl EscrowContract {
     /// The platform fee (per `FeeConfig` or the multi-treasury
     /// `FeeDistribution`) is deducted from `release_amount` and transferred to
     /// the treasury(ies); the seller receives the remainder (issue #27).
+    /// When a marketplace contract is configured, the seller's reputation tier
+    /// is queried and the platform fee is discounted accordingly — the treasury
+    /// receives only `base_fee - rebate` and the seller receives the difference
+    /// (issue #542).
     /// `released_amount` tracks the full escrow-amount released, not the net
     /// seller payout.
     fn execute_release(
@@ -2077,12 +2114,106 @@ impl EscrowContract {
 
         let token_client = soroban_sdk::token::Client::new(env, &record.token);
 
-        let payout = Self::compute_payout(env, release_amount)?;
-        Self::distribute_fee(env, &token_client, release_amount)?;
+        let base_fee = Self::compute_fee_amount(env, release_amount)?;
+
+        // --- Tier-based fee rebate (issue #542) ---
+        // Try to query the merchant's tier from the marketplace contract.
+        // On any failure (contract not set, cross-call error, zero base fee)
+        // we silently fall back to no rebate so settlement is never blocked.
+        let rebate_amount: i128 = if base_fee > 0 {
+            let marketplace_addr: Option<Address> =
+                env.storage().instance().get(&DataKey::MarketplaceContract);
+
+            if let Some(mp_addr) = marketplace_addr {
+                let args = soroban_sdk::vec![env, record.seller.to_val()];
+                let call_result = env.try_invoke_contract::<TierFeeDiscount, InvokeError>(
+                    &mp_addr,
+                    &Symbol::new(env, "get_tier_by_owner"),
+                    args,
+                );
+                match call_result {
+                    Ok(Ok(discount)) if discount.discount_bps > 0 => {
+                        let bps = discount.discount_bps as i128;
+                        let rebate = (base_fee / 10_000i128) * bps
+                            + ((base_fee % 10_000i128) * bps) / 10_000i128;
+                        if rebate > 0 {
+                            env.events().publish(
+                                (symbol_short!("escrow"), symbol_short!("rebate")),
+                                FeeRebateAppliedEvent {
+                                    escrow_id,
+                                    seller: record.seller.clone(),
+                                    tier: discount.tier,
+                                    discount_bps: discount.discount_bps,
+                                    rebate_amount: rebate,
+                                },
+                            );
+                        }
+                        rebate
+                    }
+                    _ => 0,
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // Token flow from escrow (must sum to exactly release_amount):
+        //   treasury(ies) ← effective_fee  (= base_fee − rebate_amount)
+        //   seller        ← release_amount − effective_fee
+        //
+        // When there is no rebate (rebate_amount == 0), this is identical to
+        // the standard distribute_fee + seller-net transfer path.
+        let effective_fee = base_fee - rebate_amount;
+
+        if effective_fee > 0 {
+            let shares: soroban_sdk::Vec<TreasuryShare> = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeDistribution)
+                .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+
+            if shares.is_empty() {
+                // Single-treasury path
+                let fee_config: FeeConfig = Self::get_fee_config(env.clone())?;
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &fee_config.treasury,
+                    &effective_fee,
+                );
+            } else {
+                // Multi-treasury path: distribute effective_fee proportionally
+                // to each treasury based on their original bps share.
+                // Each treasury's share = effective_fee * share.bps / total_bps
+                let total_bps: u32 = shares.iter().fold(0u32, |acc, s| acc + s.bps);
+                if total_bps > 0 {
+                    let mut distributed: i128 = 0;
+                    let last_idx = shares.len() - 1;
+                    for (i, share) in shares.iter().enumerate() {
+                        let share_amount = if i as u32 == last_idx {
+                            effective_fee - distributed
+                        } else {
+                            (effective_fee * share.bps as i128) / total_bps as i128
+                        };
+                        if share_amount > 0 {
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &share.treasury,
+                                &share_amount,
+                            );
+                            distributed += share_amount;
+                        }
+                    }
+                }
+            }
+        }
+
+        let seller_net = release_amount - effective_fee;
         token_client.transfer(
             &env.current_contract_address(),
             &record.seller,
-            &payout.seller_net,
+            &seller_net,
         );
 
         record.released_amount += release_amount;
@@ -3288,6 +3419,42 @@ impl EscrowContract {
         );
 
         Ok(true)
+    }
+
+    /// Configure the marketplace contract used for tier-based fee rebates
+    /// (issue #542). Admin-only.
+    ///
+    /// When set, every escrow release cross-calls `get_merchant_tier` on this
+    /// contract to look up the seller's reputation tier and applies the
+    /// corresponding discount to the platform fee, crediting the difference
+    /// back to the seller.  Passing `None` disables tier rebates.
+    pub fn set_marketplace_contract(
+        env: Env,
+        admin: Address,
+        marketplace: Option<Address>,
+    ) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        match marketplace {
+            Some(addr) => env
+                .storage()
+                .instance()
+                .set(&DataKey::MarketplaceContract, &addr),
+            None => env
+                .storage()
+                .instance()
+                .remove(&DataKey::MarketplaceContract),
+        }
+        Ok(true)
+    }
+
+    /// Read-only getter for the configured marketplace contract address.
+    pub fn get_marketplace_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MarketplaceContract)
     }
 
     pub fn is_admin(env: Env, address: Address) -> bool {

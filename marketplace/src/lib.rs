@@ -237,6 +237,25 @@ pub struct ExternalReputationScore {
     pub last_updated: u64,
 }
 
+/// Tier-to-fee-discount mapping for staked merchants.
+///
+/// `tier` is derived from a merchant's reputation score:
+/// - 1 (Bronze):   score 0–249
+/// - 2 (Silver):   score 250–499
+/// - 3 (Gold):     score 500–749
+/// - 4 (Platinum): score ≥ 750
+///
+/// `discount_bps` is the percentage reduction applied to the platform fee,
+/// expressed in basis points (e.g. 1000 = 10% discount).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TierFeeDiscount {
+    /// 1 = Bronze, 2 = Silver, 3 = Gold, 4 = Platinum
+    pub tier: u32,
+    /// Discount on the platform fee, in basis points (e.g. 1000 = 10%).
+    pub discount_bps: u32,
+}
+
 const MAX_COMMISSION_BPS: u32 = 10_000;
 const DEFAULT_METADATA_COOLDOWN_SECS: u64 = 86_400; // 24 hours
 const MAX_PAGE_LIMIT: u32 = 50;
@@ -760,6 +779,91 @@ impl MarketplaceContract {
         );
 
         Ok(merchant)
+    }
+
+    /// Return the `TierFeeDiscount` for a merchant identified by their owner
+    /// `Address`. This is the function called by the escrow contract during
+    /// settlement to determine the seller's fee rebate tier (issue #542).
+    ///
+    /// Looks up the first registered merchant whose `owner` field matches
+    /// `owner`, then delegates to `get_merchant_tier`. Returns the Bronze
+    /// default when no matching merchant is found.
+    pub fn get_tier_by_owner(env: Env, owner: Address) -> TierFeeDiscount {
+        let merchant_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantIds)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        for id in merchant_ids.iter() {
+            let merchant: Option<Merchant> = env.storage().persistent().get(&DataKey::Merchant(id));
+            if let Some(m) = merchant {
+                if m.owner == Some(owner.clone()) {
+                    return Self::get_merchant_tier(env.clone(), id).unwrap_or(TierFeeDiscount {
+                        tier: 1,
+                        discount_bps: 500,
+                    });
+                }
+            }
+        }
+
+        // No matching merchant — Bronze default (5% discount)
+        TierFeeDiscount {
+            tier: 1,
+            discount_bps: 500,
+        }
+    }
+
+    /// Return the `TierFeeDiscount` for a merchant based on their current
+    /// reputation score.
+    ///
+    /// Score thresholds:
+    /// - < 250 → Bronze (tier 1, 500 bps / 5% discount)
+    /// - < 500 → Silver (tier 2, 1000 bps / 10% discount)
+    /// - < 750 → Gold   (tier 3, 1500 bps / 15% discount)
+    /// - ≥ 750 → Platinum (tier 4, 2000 bps / 20% discount)
+    ///
+    /// When no reputation contract is configured or the call fails the
+    /// merchant is treated as Bronze (tier 1).
+    pub fn get_merchant_tier(env: Env, merchant_id: u64) -> Result<TierFeeDiscount, MarketplaceError> {
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
+
+        let reputation_contract = merchant.reputation.clone().or_else(|| {
+            env.storage()
+                .instance()
+                .get(&DataKey::GlobalReputationContract)
+        });
+
+        let score: u32 = if let Some(rep_addr) = reputation_contract {
+            if let Some(owner) = merchant.owner.clone() {
+                let args = soroban_sdk::vec![&env, owner.to_val()];
+                let call_result = env.try_invoke_contract::<ExternalReputationScore, InvokeError>(
+                    &rep_addr,
+                    &Symbol::new(&env, "get_reputation"),
+                    args,
+                );
+                match call_result {
+                    Ok(Ok(rep)) => rep.score,
+                    _ => 0,
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        let (tier, discount_bps) = if score >= 750 {
+            (4u32, 2000u32) // Platinum: 20%
+        } else if score >= 500 {
+            (3u32, 1500u32) // Gold:     15%
+        } else if score >= 250 {
+            (2u32, 1000u32) // Silver:   10%
+        } else {
+            (1u32, 500u32)  // Bronze:    5%
+        };
+
+        Ok(TierFeeDiscount { tier, discount_bps })
     }
 
     pub fn get_merchant_view(env: Env, merchant_id: u64) -> Result<MerchantView, MarketplaceError> {
