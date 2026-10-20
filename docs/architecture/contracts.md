@@ -1,5 +1,26 @@
 # Smart Contract Architecture
 
+## Blend escrow integration
+
+The escrow's opt-in Blend module uses the protocol ABI in
+`interfaces/src/blend.rs`. It bypasses the legacy generic lending seam because
+that seam does not model Blend's `submit` request batches or internal bToken
+positions. Legacy simulated APR yield and real Blend yield are mutually
+exclusive for an escrow.
+
+Buyer and admin jointly authorize configuration before funding. The module
+tracks principal and receipt shares per escrow even though positions are held
+at the escrow contract address. Before an outgoing principal transfer it
+redeems only that escrow's shares, checks the actual received balance delta,
+and pays only the excess over principal to the fixed recipient. Shortfalls or
+failed withdrawals revert rather than spending unrelated escrow balances.
+Partial settlement exits lending once and leaves the rest in custody.
+
+The pool is an external trust and liquidity dependency: this design prevents
+settling below recorded principal, but does not guarantee recovery or eliminate
+lending risk. See [the escrow guide](../../escrow/README.md) for API usage,
+rounding behavior, testing coverage, and current upstream verification blockers.
+
 Delego uses Soroban smart contracts to anchor trust-critical state on the Stellar blockchain, ensuring security, transparency, and programmable trust for agent-mediated commerce.
 
 ## 📋 Table of Contents
