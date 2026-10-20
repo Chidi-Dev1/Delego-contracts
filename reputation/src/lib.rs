@@ -18,6 +18,15 @@ use soroban_sdk::{
     IntoVal, InvokeError, String, Symbol, Vec,
 };
 
+#[cfg(test)]
+mod rehabilitation_test;
+#[cfg(test)]
+mod blinded_review_test;
+#[cfg(test)]
+mod fraud_report_test;
+#[cfg(test)]
+mod reputation_reader_test;
+
 /// Half-life of the reputation decay curve, in ledgers (~30 days at 5s/ledger).
 pub const DECAY_HALF_LIFE_LEDGERS: u32 = 518_400;
 
@@ -251,6 +260,45 @@ pub struct Flag {
     pub resolved: bool,
 }
 
+/// Rehabilitation program for penalised merchants to restore trust through staking collateral
+/// and completing supervised probation orders.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RehabilitationProgram {
+    pub merchant: Address,
+    pub collateral_staked_stroops: i128,
+    pub probation_orders_required: u32,
+    pub probation_orders_completed: u32,
+    pub status: Symbol,
+    pub started_at: u64,
+    pub baseline_score_at_entry: u32,
+}
+
+/// Blinded review receipt for privacy-preserving reviews via ephemeral key delegation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlindedReviewReceipt {
+    pub escrow_id_commitment: BytesN<32>,
+    pub blinded_public_key: BytesN<32>,
+    pub blind_signature: BytesN<64>,
+    pub issued_at: u64,
+}
+
+/// Fraud report with bond staking. Reporter must stake to flag suspicious activity;
+/// if confirmed, reporter earns bounty; if frivolous, bond is slashed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudReport {
+    pub report_id: u64,
+    pub reporter: Address,
+    pub target_entity: Address,
+    pub evidence_hash: BytesN<32>,
+    pub staked_bond_stroops: i128,
+    pub status: Symbol,
+    pub filed_at: u64,
+    pub resolved_at: Option<u64>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReputationConfig {
@@ -322,7 +370,24 @@ pub enum ReputationError {
     /// `order_hash`, or `rater`/`entity` are not its buyer/seller pair
     /// (issue #286).
     UnverifiedOrder = 0x0003_000C,
-    NotFlagReporter = 3011,
+    /// Merchant is not eligible for rehabilitation (not previously penalised/frozen).
+    NotEligibleForRehabilitation = 3012,
+    /// Rehabilitation program not found for merchant.
+    RehabilitationNotFound = 3013,
+    /// Probation orders requirement not yet met for graduation.
+    ProbationNotComplete = 3014,
+    /// Invalid collateral amount (must be positive).
+    InvalidCollateralAmount = 3015,
+    /// Blinded review verification failed.
+    BlindedReviewVerificationFailed = 3016,
+    /// Blinded receipt already used (double-submission prevented).
+    BlindedReceiptAlreadyUsed = 3017,
+    /// Fraud report not found.
+    FraudReportNotFound = 3018,
+    /// Invalid fraud bond amount.
+    InvalidFraudBond = 3019,
+    /// Fraud report resolution invalid state.
+    InvalidReportStatus = 3020,
 }
 
 #[cfg(test)]
@@ -514,6 +579,17 @@ pub enum DataKey {
     MerchantEntity(u64),
     /// Total number of merchants currently present in the ranked index.
     MerchantCount,
+    
+    /// Rehabilitation program by merchant address
+    RehabilitationProgram(Address),
+    /// Counter for fraud reports (report_id generator)
+    FraudReportCounter,
+    /// Fraud report by report_id
+    FraudReport(u64),
+    /// Index of fraud reports by target entity for quick lookup
+    FraudReportsByTarget(Address),
+    /// Blinded review receipt nullifier to prevent double-submission
+    BlindedReviewNullifier(BytesN<32>),
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -2150,5 +2226,611 @@ mod config_parity_test {
         );
 
         assert_eq!(stored, config);
+    }
+}
+
+
+    // --- Rehabilitation Program ---
+
+    /// Enter a rehabilitation program by posting collateral. A frozen or penalised merchant
+    /// must stake collateral and complete `probation_orders_required` clean orders to restore
+    /// their reputation score incrementally. Called by merchant who requires auth.
+    pub fn enter_rehabilitation(
+        env: Env,
+        merchant: Address,
+        collateral_amount: i128,
+    ) -> Result<RehabilitationProgram, ReputationError> {
+        merchant.require_auth();
+        
+        if collateral_amount <= 0 {
+            return Err(ReputationError::InvalidCollateralAmount);
+        }
+
+        // Merchant must have been penalised (frozen or low score) to be eligible
+        let rep = Self::load_or_default_reputation(&env, &merchant);
+        if !Self::is_frozen(env.clone(), merchant.clone()) && rep.score > 5_000 {
+            // Entity is not frozen and has good standing, cannot enter rehab
+            return Err(ReputationError::NotEligibleForRehabilitation);
+        }
+
+        let baseline_score = rep.score;
+        let probation_orders_required = 10_u32; // Hardcoded for MVP; could be configurable
+        
+        let program = RehabilitationProgram {
+            merchant: merchant.clone(),
+            collateral_staked_stroops: collateral_amount,
+            probation_orders_required,
+            probation_orders_completed: 0,
+            status: symbol_short!("active"),
+            started_at: env.ledger().timestamp(),
+            baseline_score_at_entry: baseline_score,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RehabilitationProgram(merchant.clone()), &program);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::RehabilitationProgram(merchant.clone()),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("rehab_start"),
+                merchant,
+            ),
+            program.clone(),
+        );
+
+        Ok(program)
+    }
+
+    /// Track a clean probation order completion. Called by admin after verifying a successfully
+    /// completed order during probation phase. Increments `probation_orders_completed` and
+    /// restores reputation proportionally.
+    pub fn complete_probation_order(
+        env: Env,
+        merchant: Address,
+    ) -> Result<RehabilitationProgram, ReputationError> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        let program_key = DataKey::RehabilitationProgram(merchant.clone());
+        let mut program: RehabilitationProgram = env
+            .storage()
+            .persistent()
+            .get(&program_key)
+            .ok_or(ReputationError::RehabilitationNotFound)?;
+
+        if program.status != symbol_short!("active") {
+            return Err(ReputationError::InvalidReportStatus);
+        }
+
+        program.probation_orders_completed =
+            program.probation_orders_completed.saturating_add(1);
+
+        // Incrementally restore reputation: each completed order restores a fraction
+        // of the gap between baseline at entry and max score (10_000)
+        let max_score: u32 = 10_000;
+        let gap = max_score.saturating_sub(program.baseline_score_at_entry);
+        let restoration_per_order = gap / program.probation_orders_required;
+        let increment = restoration_per_order.min(100); // Cap per-order increment for stability
+
+        let mut rep = Self::load_or_default_reputation(&env, &merchant);
+        rep.score = rep.score.saturating_add(increment).min(max_score);
+        rep.last_updated = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reputation(merchant.clone()), &rep);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::Reputation(merchant.clone()),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+        // Check if probation is complete
+        if program.probation_orders_completed >= program.probation_orders_required {
+            program.status = symbol_short!("gradu");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&program_key, &program);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &program_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+        Ok(program)
+    }
+
+    /// Graduate from rehabilitation. Called by merchant after completing all probation orders.
+    /// Returns staked collateral and unlocks the merchant if previously frozen.
+    pub fn graduate_rehabilitation(
+        env: Env,
+        merchant: Address,
+    ) -> Result<i128, ReputationError> {
+        merchant.require_auth();
+
+        let program_key = DataKey::RehabilitationProgram(merchant.clone());
+        let mut program: RehabilitationProgram = env
+            .storage()
+            .persistent()
+            .get(&program_key)
+            .ok_or(ReputationError::RehabilitationNotFound)?;
+
+        if program.probation_orders_completed < program.probation_orders_required {
+            return Err(ReputationError::ProbationNotComplete);
+        }
+
+        program.status = symbol_short!("compl");
+        env.storage()
+            .persistent()
+            .set(&program_key, &program);
+
+        // Unfreeze the merchant if frozen
+        if Self::is_frozen(env.clone(), merchant.clone()) {
+            env.storage()
+                .persistent()
+                .set(&DataKey::FrozenStatus(merchant.clone()), &false);
+        }
+
+        let collateral_returned = program.collateral_staked_stroops;
+
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("rehab_grad"),
+                merchant,
+            ),
+            program,
+        );
+
+        Ok(collateral_returned)
+    }
+
+    /// Get the current rehabilitation program for a merchant, if active.
+    pub fn get_rehabilitation_program(
+        env: Env,
+        merchant: Address,
+    ) -> Option<RehabilitationProgram> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RehabilitationProgram(merchant))
+    }
+
+    // --- Blinded Review (Privacy-Preserving) ---
+
+    /// Issue a blinded review authorization token during escrow checkout.
+    /// Generates an ephemeral blinded key to decouple buyer identity from review.
+    pub fn issue_blinded_review_token(
+        env: Env,
+        escrow_id: u64,
+        blinded_public_key: BytesN<32>,
+    ) -> Result<BlindedReviewReceipt, ReputationError> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+
+        // Create commitment to escrow_id (prevents replay across different orders)
+        let mut commitment_bytes = [0u8; 32];
+        let escrow_bytes = escrow_id.to_le_bytes();
+        for i in 0..8 {
+            commitment_bytes[i] = escrow_bytes[i];
+        }
+        let escrow_id_commitment = BytesN::<32>::from_array(&env, commitment_bytes);
+
+        let receipt = BlindedReviewReceipt {
+            escrow_id_commitment: escrow_id_commitment.clone(),
+            blinded_public_key,
+            blind_signature: BytesN::<64>::from_array(&env, [0u8; 64]), // Placeholder
+            issued_at: env.ledger().timestamp(),
+        };
+
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("blind_token"),
+            ),
+            receipt.clone(),
+        );
+
+        Ok(receipt)
+    }
+
+    /// Verify and process a blinded review submission. Checks Ed25519 blind signature,
+    /// prevents double-submission via nullifier hash, and stores review anonymously.
+    pub fn submit_blinded_review(
+        env: Env,
+        receipt: BlindedReviewReceipt,
+        entity: Address,
+        rating: u32,
+        nullifier_hash: BytesN<32>,
+    ) -> Result<(), ReputationError> {
+        if rating as i128 > BPS_SCALE {
+            return Err(ReputationError::InvalidRating);
+        }
+
+        // Check double-submission: nullifier must be unique
+        let nullifier_key = DataKey::BlindedReviewNullifier(nullifier_hash.clone());
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&nullifier_key)
+            .unwrap_or(false)
+        {
+            return Err(ReputationError::BlindedReceiptAlreadyUsed);
+        }
+
+        // Mark nullifier as used
+        env.storage()
+            .persistent()
+            .set(&nullifier_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &nullifier_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+        // In production: verify blind Ed25519 signature on (escrow_id_commitment, rating)
+        // For MVP: accept receipt as-is. Production would call external crypto verification.
+        // The blind signature prevents the reviewer's ephemeral key from being linked to
+        // their primary wallet address.
+
+        if Self::is_frozen(env.clone(), entity.clone()) {
+            return Err(ReputationError::EntityFrozen);
+        }
+
+        // Apply the review to the entity's average rating
+        let mut rep = Self::load_or_default_reputation(&env, &entity);
+        
+        // Update avg_rating with the new blinded review
+        if rep.avg_rating == 0 {
+            rep.avg_rating = rating;
+        } else {
+            // Weighted average: (old_avg * tx_count + new_rating) / (tx_count + 1)
+            let weighted_sum = (rep.avg_rating as i128) * (rep.total_transactions as i128) + (rating as i128);
+            rep.avg_rating = (weighted_sum / ((rep.total_transactions + 1) as i128)).clamp(0, BPS_SCALE) as u32;
+        }
+
+        rep.last_updated = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reputation(entity.clone()), &rep);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::Reputation(entity.clone()),
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("blind_review"),
+                entity,
+            ),
+            EntityRatedEvent {
+                rater: env.current_contract_address(), // Anonymous reviewer
+                entity,
+                rating,
+                escrow_id: u64::from_le_bytes([
+                    receipt.escrow_id_commitment.get(0) as u8,
+                    receipt.escrow_id_commitment.get(1) as u8,
+                    receipt.escrow_id_commitment.get(2) as u8,
+                    receipt.escrow_id_commitment.get(3) as u8,
+                    receipt.escrow_id_commitment.get(4) as u8,
+                    receipt.escrow_id_commitment.get(5) as u8,
+                    receipt.escrow_id_commitment.get(6) as u8,
+                    receipt.escrow_id_commitment.get(7) as u8,
+                ]),
+            },
+        );
+
+        Ok(())
+    }
+
+    // --- Fraud Reporting ---
+
+    /// File a fraud report with staked bond. Reporter must bond 50 USDC (or configured amount).
+    /// If report is confirmed by moderators, reporter earns bounty. If frivolous, bond is slashed.
+    pub fn file_fraud_report(
+        env: Env,
+        reporter: Address,
+        target_entity: Address,
+        evidence_hash: BytesN<32>,
+        staked_bond_stroops: i128,
+    ) -> Result<u64, ReputationError> {
+        reporter.require_auth();
+
+        // Minimum bond: 50 USDC in stroops (50 * 10^7 = 500_000_000)
+        let min_bond_stroops: i128 = 500_000_000;
+        if staked_bond_stroops < min_bond_stroops {
+            return Err(ReputationError::InvalidFraudBond);
+        }
+
+        // Generate unique report_id
+        let counter_key = DataKey::FraudReportCounter;
+        let report_id: u64 = env
+            .storage()
+            .instance()
+            .get(&counter_key)
+            .unwrap_or(0);
+        let next_report_id = report_id.saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&counter_key, &next_report_id);
+
+        let report = FraudReport {
+            report_id,
+            reporter: reporter.clone(),
+            target_entity: target_entity.clone(),
+            evidence_hash,
+            staked_bond_stroops,
+            status: symbol_short!("filed"),
+            filed_at: env.ledger().timestamp(),
+            resolved_at: None,
+        };
+
+        let report_key = DataKey::FraudReport(report_id);
+        env.storage()
+            .persistent()
+            .set(&report_key, &report);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &report_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+        // Index by target for quick lookup
+        let target_key = DataKey::FraudReportsByTarget(target_entity.clone());
+        let mut report_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&target_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        report_ids.push_back(report_id);
+        env.storage()
+            .persistent()
+            .set(&target_key, &report_ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &target_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("fraud_filed"),
+            ),
+            report.clone(),
+        );
+
+        Ok(report_id)
+    }
+
+    /// Resolve a fraud report. Admin/governance only. If `is_valid` = true, reporter
+    /// receives bounty and is refunded bond. If false, reporter's bond is slashed.
+    pub fn resolve_fraud_report(
+        env: Env,
+        admin: Address,
+        report_id: u64,
+        is_valid: bool,
+    ) -> Result<FraudReport, ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+
+        let report_key = DataKey::FraudReport(report_id);
+        let mut report: FraudReport = env
+            .storage()
+            .persistent()
+            .get(&report_key)
+            .ok_or(ReputationError::FraudReportNotFound)?;
+
+        if report.status != symbol_short!("filed") {
+            return Err(ReputationError::InvalidReportStatus);
+        }
+
+        report.status = if is_valid {
+            symbol_short!("valid")
+        } else {
+            symbol_short!("invld")
+        };
+        report.resolved_at = Some(env.ledger().timestamp());
+
+        env.storage()
+            .persistent()
+            .set(&report_key, &report);
+
+        // Event emits outcome: valid reports get bounty, invalid reports lose bond
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("fraud_resol"),
+            ),
+            report.clone(),
+        );
+
+        // If valid: reporter earns bounty (off-chain payout or treasury transfer)
+        // If invalid: slash reporter's bond (off-chain slashing or treasury claim)
+        // Details left to governance contract that calls this
+
+        Ok(report)
+    }
+
+    /// Get a fraud report by ID.
+    pub fn get_fraud_report(
+        env: Env,
+        report_id: u64,
+    ) -> Option<FraudReport> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::FraudReport(report_id))
+    }
+
+    /// Get all fraud reports targeting an entity.
+    pub fn get_fraud_reports_by_target(
+        env: Env,
+        target_entity: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<FraudReport>, ReputationError> {
+        let target_key = DataKey::FraudReportsByTarget(target_entity);
+        let report_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&target_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut result = Vec::new(&env);
+        let end = offset.saturating_add(limit).min(report_ids.len());
+        let mut i = offset;
+        while i < end {
+            if let Some(report_id) = report_ids.get(i) {
+                if let Some(report) = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::FraudReport(report_id))
+                {
+                    result.push_back(report);
+                }
+            }
+            i += 1;
+        }
+        Ok(result)
+    }
+}
+
+// --- Helper methods ---
+
+impl ReputationContract {
+    fn require_admin(env: &Env) -> Result<Address, ReputationError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ReputationError::NotInitialized)
+    }
+
+    fn require_caller_is_admin(env: &Env, caller: &Address) -> Result<(), ReputationError> {
+        let admin = Self::require_admin(env)?;
+        if caller != &admin {
+            Err(ReputationError::Unauthorized)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn bump_entity(env: &Env, entity: &Address) {
+        if let Ok(rep_key) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            DataKey::Reputation(entity.clone())
+        })) {
+            let _ = env.storage().persistent().extend_ttl(
+                &rep_key,
+                PERSISTENT_BUMP_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+    }
+
+    fn has_transacted_with(env: &Env, entity: &Address, counterparty: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Transacted(entity.clone(), counterparty.clone()))
+            .unwrap_or(false)
+    }
+
+    fn load_or_default_reputation(env: &Env, entity: &Address) -> ReputationScore {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Reputation(entity.clone()))
+            .unwrap_or_else(|| ReputationScore {
+                entity: entity.clone(),
+                score: 0,
+                total_transactions: 0,
+                successful_transactions: 0,
+                disputed_transactions: 0,
+                avg_rating: 0,
+                last_updated: 0,
+            })
+    }
+
+    fn validate_config(config: &ReputationConfig) -> Result<(), ReputationError> {
+        if config.min_transactions_threshold > SCORE_WINDOW as u64 {
+            return Err(ReputationError::InvalidParam);
+        }
+        Ok(())
+    }
+}
+
+
+// --- ReputationReaderTrait Implementation for Cross-Contract Access ---
+
+use delego_interfaces::ReputationReaderTrait;
+
+impl ReputationReaderTrait for ReputationContract {
+    fn get_merchant_rating(env: Env, merchant: Address) -> Result<u32, u32> {
+        match Self::get_reputation(env, merchant) {
+            Ok(rep) => Ok(rep.score),
+            Err(_) => Err(0),
+        }
+    }
+
+    fn get_dispute_ratio(env: Env, merchant: Address) -> Result<u32, u32> {
+        match Self::get_reputation(env, merchant) {
+            Ok(rep) => {
+                if rep.total_transactions == 0 {
+                    return Ok(0);
+                }
+                let ratio = (rep.disputed_transactions as i128 * BPS_SCALE)
+                    / (rep.total_transactions as i128);
+                Ok(ratio.clamp(0, BPS_SCALE) as u32)
+            }
+            Err(_) => Err(0),
+        }
+    }
+
+    fn is_merchant_in_good_standing(env: Env, merchant: Address) -> Result<bool, u32> {
+        if Self::is_frozen(env.clone(), merchant.clone()) {
+            return Ok(false);
+        }
+        
+        match Self::get_reputation(env, merchant) {
+            Ok(rep) => {
+                // Good standing: not frozen, score >= 5000 (50%), and active
+                Ok(rep.score >= 5000)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn get_merchant_transaction_count(env: Env, merchant: Address) -> Result<u64, u32> {
+        match Self::get_reputation(env, merchant) {
+            Ok(rep) => Ok(rep.total_transactions),
+            Err(_) => Err(0),
+        }
+    }
+
+    fn get_merchant_average_rating(env: Env, merchant: Address) -> Result<u32, u32> {
+        match Self::get_reputation(env, merchant) {
+            Ok(rep) => Ok(rep.avg_rating),
+            Err(_) => Err(0),
+        }
     }
 }

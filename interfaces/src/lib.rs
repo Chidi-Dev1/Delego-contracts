@@ -11,6 +11,8 @@
 
 mod lending_pool;
 mod mock_lending_pool;
+mod reputation_reader;
 
 pub use lending_pool::{LendingPoolClient, LendingPoolInterface};
 pub use mock_lending_pool::{MockLendingPool, MockLendingPoolClient};
+pub use reputation_reader::ReputationReaderTrait;

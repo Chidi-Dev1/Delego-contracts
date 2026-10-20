@@ -21,6 +21,7 @@ path = "src/build.rs"
 
 [dependencies]
 soroban-sdk = { workspace = true }
+delego-interfaces = { path = "../interfaces" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
