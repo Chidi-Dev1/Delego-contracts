@@ -10,7 +10,9 @@
 #![cfg_attr(not(test), no_std)]
 
 mod lending_pool;
+mod lifecycle;
 mod mock_lending_pool;
 
 pub use lending_pool::{LendingPoolClient, LendingPoolInterface};
+pub use lifecycle::ContractLifecycleState;
 pub use mock_lending_pool::{MockLendingPool, MockLendingPoolClient};
