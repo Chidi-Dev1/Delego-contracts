@@ -161,14 +161,7 @@ impl EscrowContract {
         guardian: Address,
     ) -> Result<(), EscrowError> {
         admin.require_auth();
-        let primary: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(EscrowError::Unauthorized)?;
-        if admin != primary {
-            return Err(EscrowError::Unauthorized);
-        }
+        Self::require_role(&env, &admin, ContractRole::Admin)?;
         if env.storage().instance().has(&AdminActionKey::Guardian) {
             return Err(EscrowError::GuardianAlreadySet);
         }
@@ -197,7 +190,12 @@ impl EscrowContract {
         action: AdminAction,
     ) -> Result<u64, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin) {
+        let authorized = match &action {
+            AdminAction::Fee(_) | AdminAction::FeeConfig(_, _) | AdminAction::FeeDistribution(_) =>
+                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
+            _ => Self::is_admin(env.clone(), admin.clone()),
+        };
+        if !authorized {
             return Err(EscrowError::Unauthorized);
         }
         if Self::get_security_guardian(env.clone()).is_none() {
@@ -283,11 +281,17 @@ impl EscrowContract {
     /// Execute the stored proposal with current admin authorization. Legacy
     /// setters use the same consume gate and cannot bypass this review period.
     pub fn execute_admin_action(env: Env, admin: Address, id: u64) -> Result<bool, EscrowError> {
-        if !Self::is_admin(env.clone(), admin.clone()) {
-            return Err(EscrowError::Unauthorized);
-        }
+        admin.require_auth();
         let proposal =
             Self::get_admin_action(env.clone(), id).ok_or(EscrowError::AdminActionNotFound)?;
+        let authorized = match &proposal.action {
+            AdminAction::Fee(_) | AdminAction::FeeConfig(_, _) | AdminAction::FeeDistribution(_) =>
+                Self::has_role(env.clone(), admin.clone(), ContractRole::FeeManager),
+            _ => Self::is_admin(env.clone(), admin.clone()),
+        };
+        if !authorized {
+            return Err(EscrowError::Unauthorized);
+        }
         if proposal.pending.is_vetoed {
             return Err(EscrowError::AdminActionVetoed);
         }
