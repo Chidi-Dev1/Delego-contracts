@@ -610,6 +610,17 @@ pub struct UpdateQuorumThresholdProposal {
     pub signers: Vec<Address>,
 }
 
+/// Pending signer-key rotation proposal for a multi-signature quorum.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub struct SignerRotationProposal {
+    pub outgoing_signer: Address,
+    pub incoming_signer: Address,
+    pub effective_epoch: u32,
+    pub approvals: Vec<Address>,
+}
+
 /// Emitted when a multi-owner permission's quorum is reconfigured in place
 /// (issue #371). Only the quorum changed; the grant was never revoked, so
 /// `limit_total`, `spent` and every nonce sequence carried over untouched.
