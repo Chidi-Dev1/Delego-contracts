@@ -2207,3 +2207,334 @@ fn test_get_delegations_by_agent_bumps_ttl() {
     });
     assert!(refreshed_ttl > 17_280);
 }
+
+// ── Keeper Bounty Heartbeat Incentive Tests ────────────────────────────────────
+
+/// Sets up an environment with an XLM mock token, funds the contract, and
+/// optionally tops up the maintenance reserve.  Returns everything needed by
+/// the keeper bounty tests.
+fn setup_with_token(
+    reserve_stroops: i128,
+) -> (
+    Env,
+    DelegationRegistryClient<'static>,
+    Address, // admin
+    Address, // owner
+    BytesN<32>, // agent_id
+    Address, // permissions_contract
+    Address, // xlm_token contract id
+) {
+    use soroban_sdk::token::{StellarAssetClient, TokenClient};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Deploy the registry.
+    let contract_id = env.register(DelegationRegistry, ());
+    let client = DelegationRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let agent_id = BytesN::from_array(&env, &[1u8; 32]);
+    let permissions_contract = Address::generate(&env);
+
+    client.initialize(&admin);
+
+    // Deploy a mock XLM token and give the registry contract a balance.
+    let xlm_token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let sac = StellarAssetClient::new(&env, &xlm_token);
+    sac.mint(&contract_id, &(reserve_stroops + 100_000_000)); // extra buffer
+
+    // Record the reserve in instance storage so the contract knows it can pay.
+    if reserve_stroops > 0 {
+        client.deposit_maintenance_reserve(&admin, &reserve_stroops);
+    }
+
+    (env, client, admin, owner, agent_id, permissions_contract, xlm_token)
+}
+
+#[test]
+fn test_get_keeper_bounty_status_not_eligible_when_ttl_is_high() {
+    let (env, client, _, owner, agent_id, permissions_contract, _) =
+        setup_with_token(100_000_000);
+
+    let label = Symbol::new(&env, "KprHigh");
+    // Create delegation with a large TTL — the storage entry will be bumped to
+    // PERSISTENT_BUMP_AMOUNT (518_400) which is > KEEPER_BOUNTY_THRESHOLD_LEDGERS.
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
+
+    let status = client.get_keeper_bounty_status(&id).unwrap();
+    assert_eq!(status.delegation_id, id);
+    assert!(!status.is_eligible_for_bounty, "should not be eligible when TTL is high");
+    assert_eq!(status.bounty_amount_stroops, KEEPER_BOUNTY_AMOUNT_STROOPS);
+}
+
+#[test]
+fn test_get_keeper_bounty_status_eligible_when_ttl_below_threshold() {
+    let (env, client, _, owner, agent_id, permissions_contract, _) =
+        setup_with_token(100_000_000);
+
+    let label = Symbol::new(&env, "KprLow");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
+
+    // Advance ledger far enough that the storage TTL drops below the threshold.
+    // After creation the TTL is PERSISTENT_BUMP_AMOUNT (518_400).
+    // We need TTL < KEEPER_BOUNTY_THRESHOLD_LEDGERS (50_000), so move forward
+    // by 518_400 - 40_000 = 478_400 ledgers.
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 478_400);
+
+    let status = client.get_keeper_bounty_status(&id).unwrap();
+    assert!(
+        status.is_eligible_for_bounty,
+        "should be eligible when TTL is below threshold"
+    );
+    assert!(status.remaining_ledgers < KEEPER_BOUNTY_THRESHOLD_LEDGERS);
+}
+
+#[test]
+fn test_bump_delegation_ttl_with_reward_pays_keeper_and_bumps_ttl() {
+    let (env, client, _, owner, agent_id, permissions_contract, xlm_token) =
+        setup_with_token(100_000_000);
+
+    use soroban_sdk::token::TokenClient;
+
+    let label = Symbol::new(&env, "KprPay");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
+
+    // Drop the TTL below the threshold.
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 478_400);
+
+    let keeper = Address::generate(&env);
+
+    // Record keeper's XLM balance before the call.
+    let token_client = TokenClient::new(&env, &xlm_token);
+    let balance_before = token_client.balance(&keeper);
+
+    let status = client
+        .bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
+        .unwrap();
+
+    // TTL was refreshed — should now be ineligible.
+    assert!(!status.is_eligible_for_bounty);
+    assert!(status.remaining_ledgers >= KEEPER_BOUNTY_THRESHOLD_LEDGERS);
+
+    // Keeper received the bounty.
+    let balance_after = token_client.balance(&keeper);
+    assert_eq!(
+        balance_after - balance_before,
+        KEEPER_BOUNTY_AMOUNT_STROOPS,
+        "keeper should have received the bounty"
+    );
+
+    // Reserve was decremented.
+    let reserve = client.get_maintenance_reserve();
+    assert_eq!(reserve, 100_000_000 - KEEPER_BOUNTY_AMOUNT_STROOPS);
+}
+
+#[test]
+fn test_bump_delegation_ttl_with_reward_fails_when_ttl_not_low() {
+    let (env, client, _, owner, agent_id, permissions_contract, xlm_token) =
+        setup_with_token(100_000_000);
+
+    let label = Symbol::new(&env, "KprNoEl");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
+
+    // Do NOT advance the ledger — storage TTL is still high.
+    let keeper = Address::generate(&env);
+
+    let err = client
+        .try_bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(DelegationError::NotEligibleForBounty as u32)
+    );
+}
+
+#[test]
+fn test_bump_delegation_ttl_with_reward_fails_when_delegation_not_active() {
+    let (env, client, _, owner, agent_id, permissions_contract, xlm_token) =
+        setup_with_token(100_000_000);
+
+    let label = Symbol::new(&env, "KprInact");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
+
+    // Revoke the delegation first.
+    client.revoke_delegation(&id);
+
+    // Drop TTL below threshold.
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 478_400);
+
+    let keeper = Address::generate(&env);
+    let err = client
+        .try_bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(DelegationError::NotActive as u32)
+    );
+}
+
+#[test]
+fn test_bump_delegation_ttl_with_reward_fails_when_reserve_empty() {
+    // Deliberately pass 0 so no reserve is deposited.
+    let (env, client, _, owner, agent_id, permissions_contract, xlm_token) =
+        setup_with_token(0);
+
+    let label = Symbol::new(&env, "KprNoRes");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
+
+    // Drop TTL below threshold.
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 478_400);
+
+    let keeper = Address::generate(&env);
+    let err = client
+        .try_bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(
+            DelegationError::InsufficientMaintenanceReserve as u32
+        )
+    );
+}
+
+#[test]
+fn test_bump_delegation_ttl_with_reward_enforces_cooldown() {
+    let (env, client, _, owner, agent_id, permissions_contract, xlm_token) =
+        setup_with_token(200_000_000); // enough for two payouts
+
+    let label = Symbol::new(&env, "KprCool");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
+
+    // First bump: drop TTL below threshold and claim.
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 478_400);
+    let keeper = Address::generate(&env);
+    client
+        .bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
+        .unwrap();
+
+    // Immediately after the bump the TTL is high again — let it drop once more
+    // but advance by less than KEEPER_BOUNTY_COOLDOWN_LEDGERS (17_280).
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 478_400);
+
+    // Should be rejected due to cooldown — not enough ledgers since last claim.
+    let err = client
+        .try_bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(DelegationError::NotEligibleForBounty as u32),
+        "second claim within cooldown window should be rejected"
+    );
+}
+
+#[test]
+fn test_bump_delegation_ttl_with_reward_allowed_after_cooldown_expires() {
+    let (env, client, _, owner, agent_id, permissions_contract, xlm_token) =
+        setup_with_token(200_000_000);
+
+    let label = Symbol::new(&env, "KprAfCool");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &3_000_000);
+
+    // First claim.
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 478_400);
+    let keeper = Address::generate(&env);
+    client
+        .bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
+        .unwrap();
+
+    // Advance past the cooldown (17_280) AND let the TTL drop again.
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 478_400 + KEEPER_BOUNTY_COOLDOWN_LEDGERS);
+
+    // Second claim should succeed.
+    let status = client
+        .bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
+        .unwrap();
+
+    assert!(!status.is_eligible_for_bounty);
+}
+
+#[test]
+fn test_deposit_maintenance_reserve_requires_admin() {
+    let (env, client, _, owner, agent_id, permissions_contract, _xlm_token) =
+        setup_with_token(0);
+
+    // owner is not the admin — deposit should be rejected.
+    let _ = agent_id;
+    let _ = permissions_contract;
+    let err = client
+        .try_deposit_maintenance_reserve(&owner, &50_000_000i128)
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(
+        err,
+        soroban_sdk::Error::from_contract_error(DelegationError::NotAuthorized as u32)
+    );
+}
+
+#[test]
+fn test_get_maintenance_reserve_starts_at_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(DelegationRegistry, ());
+    let client = DelegationRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    assert_eq!(client.get_maintenance_reserve(), 0i128);
+}
+
+#[test]
+fn test_keeper_bounty_paid_event_is_emitted() {
+    let (env, client, _, owner, agent_id, permissions_contract, xlm_token) =
+        setup_with_token(100_000_000);
+
+    let label = Symbol::new(&env, "KprEvt");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &200_000);
+
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + 478_400);
+
+    let keeper = Address::generate(&env);
+    client
+        .bump_delegation_ttl_with_reward(&id, &keeper, &xlm_token)
+        .unwrap();
+
+    // The last event emitted by the registry should be the KeeperBountyPaidEvent.
+    let events = env.events().all();
+    // Find our event by topic symbol.
+    let bounty_event = events
+        .iter()
+        .filter(|(contract, topics, _)| {
+            *contract == client.address
+                && topics.len() >= 2
+                && topics.get(1) == Some(symbol_short!("kpr_paid").into())
+        })
+        .last();
+
+    assert!(bounty_event.is_some(), "KeeperBountyPaidEvent should have been emitted");
+
+    let (_, _, data) = bounty_event.unwrap();
+    let event = KeeperBountyPaidEvent::try_from_val(&env, &data).unwrap();
+    assert_eq!(event.delegation_id, id);
+    assert_eq!(event.keeper, keeper);
+    assert_eq!(event.bounty_amount_stroops, KEEPER_BOUNTY_AMOUNT_STROOPS);
+}

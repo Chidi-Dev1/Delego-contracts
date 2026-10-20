@@ -14,6 +14,21 @@ const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
 pub const MAX_SWEEP_BATCH_SIZE: u32 = 50;
 
+// ── Keeper Bounty constants ────────────────────────────────────────────────────
+
+/// A delegation whose storage TTL will drop below this many ledgers is eligible
+/// for a keeper bounty.  50 000 ledgers ≈ 3 days at ~5 s/ledger.
+pub const KEEPER_BOUNTY_THRESHOLD_LEDGERS: u32 = 50_000;
+
+/// Fixed XLM reward paid to the keeper per successful TTL bump, denominated in
+/// stroops (1 XLM = 10 000 000 stroops).  10 000 000 stroops = 1 XLM.
+pub const KEEPER_BOUNTY_AMOUNT_STROOPS: i128 = 10_000_000;
+
+/// Minimum ledgers between two successive bounty claims for the same delegation.
+/// Prevents a keeper from claiming the bounty on every block once the delegation
+/// re-enters the eligibility window after a bump.  17 280 ledgers ≈ 1 day.
+pub const KEEPER_BOUNTY_COOLDOWN_LEDGERS: u32 = 17_280;
+
 /// Represents the lifecycle status of a delegation.
 /// Contract version information for deployment scripts and runtime compatibility checks.
 #[contracttype]
@@ -351,6 +366,42 @@ pub struct AdminTransferredEvent {
     pub timestamp: u64,
 }
 
+/// Snapshot of a delegation's keeper bounty eligibility.
+///
+/// Returned by [`get_keeper_bounty_status`](DelegationRegistry::get_keeper_bounty_status)
+/// so off-chain keepers can decide whether to submit a heartbeat transaction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeeperBountyStatus {
+    /// The delegation this status describes.
+    pub delegation_id: u64,
+    /// Ledgers remaining before the delegation's storage entry is archived.
+    /// Derived from the Soroban persistent-storage TTL, not `expires_at_ledger`.
+    pub remaining_ledgers: u32,
+    /// `true` when `remaining_ledgers` is below [`KEEPER_BOUNTY_THRESHOLD_LEDGERS`]
+    /// and the delegation is `Active` (not revoked, expired, or paused).
+    pub is_eligible_for_bounty: bool,
+    /// Fixed XLM reward paid to the keeper, in stroops.
+    pub bounty_amount_stroops: i128,
+}
+
+/// Emitted when a keeper successfully extends a delegation's TTL and claims
+/// their bounty reward.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct KeeperBountyPaidEvent {
+    /// The delegation whose TTL was extended.
+    pub delegation_id: u64,
+    /// Address of the keeper that performed the heartbeat.
+    pub keeper: Address,
+    /// Reward transferred to the keeper, in stroops.
+    pub bounty_amount_stroops: i128,
+    /// Ledger sequence at which the bump occurred.
+    pub ledger: u32,
+    /// Ledger timestamp at which the bump occurred.
+    pub timestamp: u64,
+}
+
 /// Topic 0 symbol for every event emitted by the delegation registry.
 pub const EVENT_TOPIC_CONTRACT: Symbol = symbol_short!("deleg");
 
@@ -385,6 +436,11 @@ pub enum DataKey {
     NextSubAccountId(Address),
     /// Sub-account ids associated with an owner.
     OwnerSubAccounts(Address),
+    /// Total XLM (in stroops) held in the protocol maintenance reserve for keeper bounties.
+    MaintenanceReserve,
+    /// Last ledger sequence at which a keeper bounty was paid for a delegation.
+    /// Used to enforce the per-delegation cooldown between consecutive claims.
+    KeeperLastBountyLedger(u64),
 }
 
 /// Errors for delegation registry operations.
@@ -443,6 +499,10 @@ pub enum DelegationError {
     SubAccountNotActive = 4018,
     /// The delegation does not match the sub-account.
     DelegationMismatch = 4019,
+    /// The delegation is not eligible for a keeper bounty at this ledger.
+    NotEligibleForBounty = 4020,
+    /// The protocol maintenance reserve has insufficient funds to pay the keeper bounty.
+    InsufficientMaintenanceReserve = 4021,
 }
 
 /// The delegation registry contract.
@@ -2112,12 +2172,291 @@ impl DelegationRegistry {
         matching_records
     }
 
+    // ── Keeper Bounty Heartbeat Incentive ─────────────────────────────────────
+
+    /// Deposits XLM into the protocol maintenance reserve to fund keeper bounties.
+    ///
+    /// The caller transfers `amount_stroops` of native XLM to the contract via
+    /// a standard SAC `transfer` call before invoking this function. This entry
+    /// point records the deposit in the reserve ledger so `bump_delegation_ttl_with_reward`
+    /// can validate solvency before every payout.
+    ///
+    /// The admin address must authorize this call to prevent accidental or
+    /// malicious reserve inflation without a corresponding on-chain transfer.
+    pub fn deposit_maintenance_reserve(
+        env: Env,
+        caller: Address,
+        amount_stroops: i128,
+    ) -> Result<i128, DelegationError> {
+        caller.require_auth();
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(DelegationError::NotInitialized)?;
+
+        if caller != admin {
+            return Err(DelegationError::NotAuthorized);
+        }
+
+        if amount_stroops <= 0 {
+            return Err(DelegationError::InvalidTtl); // Reuse for "invalid amount"
+        }
+
+        let current: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaintenanceReserve)
+            .unwrap_or(0i128);
+
+        let new_total = current
+            .checked_add(amount_stroops)
+            .ok_or(DelegationError::IdExhausted)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceReserve, &new_total);
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        Ok(new_total)
+    }
+
+    /// Returns the current balance of the protocol maintenance reserve, in stroops.
+    pub fn get_maintenance_reserve(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaintenanceReserve)
+            .unwrap_or(0i128)
+    }
+
+    /// Returns the keeper bounty eligibility status for a delegation.
+    ///
+    /// Off-chain keepers should call this view function to determine whether
+    /// submitting a heartbeat transaction is currently profitable.
+    ///
+    /// `remaining_ledgers` reports the live Soroban persistent-storage TTL for
+    /// the delegation record — not the application-level `expires_at_ledger` —
+    /// so the field correctly tracks archival risk independent of the
+    /// delegation's own expiry window.
+    pub fn get_keeper_bounty_status(
+        env: Env,
+        delegation_id: u64,
+    ) -> Result<KeeperBountyStatus, DelegationError> {
+        let record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        let current_ledger = env.ledger().sequence();
+
+        // A delegation that has already passed its application-level expiry
+        // or is in a terminal state must never be bumped by a keeper.
+        let is_live = record.status == DelegationStatus::Active
+            && current_ledger < record.expires_at_ledger;
+
+        let delegation_key = DataKey::Delegation(delegation_id);
+        let storage_ttl: u32 = env
+            .storage()
+            .persistent()
+            .get_ttl(&delegation_key);
+
+        // A keeper is eligible when:
+        //   1. the delegation is live (Active and not yet expired)
+        //   2. the storage TTL is approaching the archival threshold
+        //   3. the per-delegation cooldown since the last bounty has elapsed
+        let last_bounty_ledger: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::KeeperLastBountyLedger(delegation_id))
+            .unwrap_or(0u32);
+
+        let cooldown_elapsed = current_ledger
+            .saturating_sub(last_bounty_ledger)
+            >= KEEPER_BOUNTY_COOLDOWN_LEDGERS;
+
+        let is_eligible = is_live
+            && storage_ttl < KEEPER_BOUNTY_THRESHOLD_LEDGERS
+            && cooldown_elapsed;
+
+        Ok(KeeperBountyStatus {
+            delegation_id,
+            remaining_ledgers: storage_ttl,
+            is_eligible_for_bounty: is_eligible,
+            bounty_amount_stroops: KEEPER_BOUNTY_AMOUNT_STROOPS,
+        })
+    }
+
+    /// Extends the Soroban persistent-storage TTL for an active delegation and
+    /// transfers a fixed XLM bounty from the protocol maintenance reserve to the
+    /// keeper as a reward for performing the heartbeat.
+    ///
+    /// ## Eligibility rules
+    /// - The delegation must exist, be `Active`, and not yet past its
+    ///   application-level `expires_at_ledger`.
+    /// - The storage TTL of the delegation record must be below
+    ///   [`KEEPER_BOUNTY_THRESHOLD_LEDGERS`] (≈ 3 days).
+    /// - At least [`KEEPER_BOUNTY_COOLDOWN_LEDGERS`] (≈ 1 day) must have
+    ///   elapsed since the last successful bounty claim for this delegation.
+    /// - The maintenance reserve must hold at least
+    ///   [`KEEPER_BOUNTY_AMOUNT_STROOPS`].
+    ///
+    /// ## What this function does
+    /// 1. Validates all eligibility conditions, returning a typed error on any
+    ///    failure so callers can handle each case explicitly.
+    /// 2. Bumps the delegation record's storage TTL to the full
+    ///    `PERSISTENT_BUMP_AMOUNT` window (≈ 30 days).
+    /// 3. Deducts the bounty from the in-ledger maintenance reserve balance.
+    /// 4. Transfers the XLM bounty to the keeper via the native Stellar Asset
+    ///    Contract (SAC) identified by `xlm_token`.
+    /// 5. Records the payout ledger for the per-delegation cooldown.
+    /// 6. Emits a `KeeperBountyPaidEvent`.
+    ///
+    /// The keeper does **not** need to be the delegation owner; any third-party
+    /// address may call this function once eligibility is met.
+    pub fn bump_delegation_ttl_with_reward(
+        env: Env,
+        delegation_id: u64,
+        keeper: Address,
+        xlm_token: Address,
+    ) -> Result<KeeperBountyStatus, DelegationError> {
+        // The keeper must authorize the call so that nobody can redirect the
+        // bounty payment to an address they do not control.
+        keeper.require_auth();
+
+        let record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        let current_ledger = env.ledger().sequence();
+
+        // 1. The delegation must be live.
+        if record.status != DelegationStatus::Active {
+            return Err(DelegationError::NotActive);
+        }
+        if current_ledger >= record.expires_at_ledger {
+            return Err(DelegationError::Expired);
+        }
+
+        // 2. The storage TTL must be approaching the archival threshold.
+        let delegation_key = DataKey::Delegation(delegation_id);
+        let storage_ttl: u32 = env
+            .storage()
+            .persistent()
+            .get_ttl(&delegation_key);
+
+        if storage_ttl >= KEEPER_BOUNTY_THRESHOLD_LEDGERS {
+            return Err(DelegationError::NotEligibleForBounty);
+        }
+
+        // 3. Enforce per-delegation cooldown.
+        let last_bounty_ledger: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::KeeperLastBountyLedger(delegation_id))
+            .unwrap_or(0u32);
+
+        let ledgers_since_last = current_ledger.saturating_sub(last_bounty_ledger);
+        if ledgers_since_last < KEEPER_BOUNTY_COOLDOWN_LEDGERS {
+            return Err(DelegationError::NotEligibleForBounty);
+        }
+
+        // 4. Verify reserve solvency.
+        let reserve: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaintenanceReserve)
+            .unwrap_or(0i128);
+
+        if reserve < KEEPER_BOUNTY_AMOUNT_STROOPS {
+            return Err(DelegationError::InsufficientMaintenanceReserve);
+        }
+
+        // ── All checks passed — commit side-effects ────────────────────────
+
+        // 5. Extend the delegation's persistent-storage TTL.
+        env.storage().persistent().extend_ttl(
+            &delegation_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        // Also refresh the owner's delegation index.
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserDelegations(record.owner.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        // Keep the contract instance alive.
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        // 6. Deduct the bounty from the maintenance reserve.
+        let new_reserve = reserve - KEEPER_BOUNTY_AMOUNT_STROOPS;
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceReserve, &new_reserve);
+
+        // 7. Transfer XLM bounty to the keeper via the native SAC.
+        let token_client = soroban_sdk::token::Client::new(&env, &xlm_token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &keeper,
+            &KEEPER_BOUNTY_AMOUNT_STROOPS,
+        );
+
+        // 8. Record the payout ledger for cooldown enforcement.
+        env.storage().persistent().set(
+            &DataKey::KeeperLastBountyLedger(delegation_id),
+            &current_ledger,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::KeeperLastBountyLedger(delegation_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // 9. Emit event.
+        let now = env.ledger().timestamp();
+        env.events().publish(
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("kpr_paid"),
+                delegation_id,
+            ),
+            KeeperBountyPaidEvent {
+                delegation_id,
+                keeper: keeper.clone(),
+                bounty_amount_stroops: KEEPER_BOUNTY_AMOUNT_STROOPS,
+                ledger: current_ledger,
+                timestamp: now,
+            },
+        );
+
+        // Return the refreshed status (now ineligible due to cooldown reset).
+        let refreshed_ttl: u32 = env
+            .storage()
+            .persistent()
+            .get_ttl(&delegation_key);
+
+        Ok(KeeperBountyStatus {
+            delegation_id,
+            remaining_ledgers: refreshed_ttl,
+            is_eligible_for_bounty: false,
+            bounty_amount_stroops: KEEPER_BOUNTY_AMOUNT_STROOPS,
+        })
+    }
+
     /// Extends the TTL on the delegation record and its owner-index key,
     /// keeping them alive in persistent storage. Called from read paths
     /// (`get_delegation`, `get_delegations_by_owner`, `is_authorized`) so
     /// active delegations are not evicted while still semantically live.
-    fn bump_delegation(env: &Env, delegation_id: u64, owner: &Address) {
-        let delegation_key = DataKey::Delegation(delegation_id);
+    fn bump_delegation(env: &Env, delegation_id: u64, owner: &Address) {        let delegation_key = DataKey::Delegation(delegation_id);
         env.storage().persistent().extend_ttl(
             &delegation_key,
             PERSISTENT_BUMP_THRESHOLD,
@@ -2247,6 +2586,8 @@ mod error_code_uniqueness_tests {
             (DelegationError::SubAccountNotFound, 4017u32),
             (DelegationError::SubAccountNotActive, 4018u32),
             (DelegationError::DelegationMismatch, 4019u32),
+            (DelegationError::NotEligibleForBounty, 4020u32),
+            (DelegationError::InsufficientMaintenanceReserve, 4021u32),
         ];
 
         for (variant, expected) in codes {
@@ -2273,6 +2614,8 @@ mod error_code_uniqueness_tests {
             DelegationError::SubAccountNotFound as u32,
             DelegationError::SubAccountNotActive as u32,
             DelegationError::DelegationMismatch as u32,
+            DelegationError::NotEligibleForBounty as u32,
+            DelegationError::InsufficientMaintenanceReserve as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {
