@@ -14,6 +14,12 @@ const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
 pub const MAX_SWEEP_BATCH_SIZE: u32 = 50;
 
+/// Estimated stroops of storage rent reclaimed per auxiliary entry removed
+/// when a delegation is swept. The protocol reclaims rent on storage removal;
+/// contracts cannot pay it out directly, so this is an accounting estimate
+/// keeper bots can use to price their service.
+const RENT_RECLAIMED_PER_ENTRY_STROOPS: i128 = 1_000;
+
 /// Represents the lifecycle status of a delegation.
 /// Contract version information for deployment scripts and runtime compatibility checks.
 #[contracttype]
@@ -190,6 +196,18 @@ pub struct DelegationPage {
     pub total: u32,
     /// Next offset for pagination, or None if no more pages.
     pub next_offset: Option<u32>,
+}
+
+/// Result of a batch sweep of expired delegations.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SweepResult {
+    /// Number of delegations swept in this batch.
+    pub swept_records_count: u32,
+    /// Next id to resume scanning from, or None when no records remain.
+    pub next_cursor_id: Option<u64>,
+    /// Estimated stroops of storage rent reclaimed by removing auxiliary keys.
+    pub rent_reclaimed_stroops: i128,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -1621,6 +1639,158 @@ impl DelegationRegistry {
         }
 
         Ok(swept)
+    }
+
+    /// Sweeps expired delegations in an iterative batch, returning a
+    /// continuation cursor so keepers can page through the registry without
+    /// exceeding the transaction budget.
+    ///
+    /// Walks delegation ids starting at `start_id`, transitioning up to
+    /// `max_count` (capped at [`MAX_SWEEP_BATCH_SIZE`]) expired, non-terminal
+    /// delegations into `Expired` status and removing their auxiliary storage
+    /// keys (version, history, snapshots, nonce and owner index entry) to
+    /// reclaim storage rent.
+    ///
+    /// Returns a [`SweepResult`] containing the number swept, the next cursor
+    /// id to resume from (`None` once the id range is exhausted), and the
+    /// estimated rent reclaimed in stroops. Callable by anyone; no
+    /// authorization is required.
+    pub fn sweep_expired_batch(env: Env, start_id: u64, max_count: u32) -> SweepResult {
+        let max_count = max_count.min(MAX_SWEEP_BATCH_SIZE);
+        if max_count == 0 {
+            return SweepResult {
+                swept_records_count: 0,
+                next_cursor_id: None,
+                rent_reclaimed_stroops: 0,
+            };
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1);
+
+        let mut swept_count: u32 = 0;
+        let mut rent_reclaimed: i128 = 0;
+        let mut id = start_id;
+
+        while id < next_id && swept_count < max_count {
+            if let Some(mut record) = env
+                .storage()
+                .persistent()
+                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
+            {
+                let already_terminal =
+                    record.status == DelegationStatus::Expired
+                        || record.status == DelegationStatus::Revoked;
+                if !already_terminal && current_ledger >= record.expires_at_ledger {
+                    record.status = DelegationStatus::Expired;
+                    record.version = Self::increment_version(&env, id);
+                    record.updated_at = env.ledger().timestamp();
+
+                    env.storage().persistent().set(&DataKey::Delegation(id), &record);
+                    Self::store_snapshot(&env, id, &record);
+
+                    let entries_removed = Self::sweep_auxiliary_keys(&env, id);
+                    rent_reclaimed += (entries_removed as i128) * RENT_RECLAIMED_PER_ENTRY_STROOPS;
+
+                    Self::remove_from_user_delegations(&env, &record.owner, id);
+
+                    // Topics: (contract, action, entity_id) — entity_id is the delegation id.
+                    env.events().publish(
+                        (EVENT_TOPIC_CONTRACT, symbol_short!("expired"), id),
+                        DelegationExpiredEvent {
+                            delegation_id: id,
+                            owner: record.owner.clone(),
+                            agent: record.agent_id.clone(),
+                            timestamp: env.ledger().timestamp(),
+                        },
+                    );
+
+                    swept_count += 1;
+                }
+            }
+            id += 1;
+        }
+
+        // `id` is the first unexamined id once the loop exits. Resume from it
+        // when the batch cap was reached; there is nothing left to resume from
+        // when the id range is exhausted.
+        let next_cursor_id = if id >= next_id { None } else { Some(id) };
+
+        SweepResult {
+            swept_records_count: swept_count,
+            next_cursor_id,
+            rent_reclaimed_stroops: rent_reclaimed,
+        }
+    }
+
+    /// Removes the auxiliary storage keys belonging to a delegation (snapshot
+    /// entries, version history, version counter, schema marker and nonce)
+    /// and returns the number of entries removed, used to estimate reclaimed
+    /// rent.
+    fn sweep_auxiliary_keys(env: &Env, delegation_id: u64) -> u32 {
+        let mut entries_removed: u32 = 0;
+
+        let history: Vec<DelegationSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationHistory(delegation_id))
+            .unwrap_or(Vec::new(env));
+
+        for snapshot in history.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Snapshot(delegation_id, snapshot.version));
+            entries_removed += 1;
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DelegationHistory(delegation_id));
+        entries_removed += 1;
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DelegationVersion(delegation_id));
+        entries_removed += 1;
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SnapshotSchemaVersion(delegation_id));
+        entries_removed += 1;
+
+        if env.storage()
+            .persistent()
+            .has(&DataKey::DelegationNonce(delegation_id))
+        {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::DelegationNonce(delegation_id));
+            entries_removed += 1;
+        }
+
+        entries_removed
+    }
+
+    /// Removes `delegation_id` from the owner's `UserDelegations` index,
+    /// dropping the index key entirely when no ids remain.
+    fn remove_from_user_delegations(env: &Env, owner: &Address, delegation_id: u64) {
+        let key = DataKey::UserDelegations(owner.clone());
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env));
+
+        let mut kept = Vec::new(env);
+        for stored_id in ids.iter() {
+            if stored_id != delegation_id {
+                kept.push_back(stored_id);
+            }
+        }
+
+        // Always keep the index key (even when empty) so read paths that bump
+        // its TTL (e.g. `get_delegation`) never hit a missing entry.
+        env.storage().persistent().set(&key, &kept);
     }
 
     /// Returns all delegations owned by `owner` that are currently expired.

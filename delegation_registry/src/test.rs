@@ -386,6 +386,139 @@ fn test_sweep_expired_full_batch_of_50_stays_within_budget() {
 }
 
 #[test]
+fn test_sweep_expired_batch_sweeps_up_to_50() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Batch_Expire");
+    for _ in 0..60 {
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    }
+    env.ledger().set_sequence_number(300);
+
+    let result = client.sweep_expired_batch(&1u64, &50u32);
+    assert_eq!(result.swept_records_count, 50);
+    assert_eq!(result.next_cursor_id, Some(51));
+    assert!(result.rent_reclaimed_stroops > 0);
+
+    for id in 1..=60u64 {
+        let record = client.get_delegation(&id);
+        if id <= 50 {
+            assert_eq!(record.status, DelegationStatus::Expired);
+        } else {
+            assert_eq!(record.status, DelegationStatus::Active);
+        }
+    }
+}
+
+#[test]
+fn test_sweep_expired_batch_paginates_across_pages() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Batch_Page");
+    let total: u64 = 51;
+    for _ in 0..total {
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    }
+    env.ledger().set_sequence_number(300);
+
+    let mut total_swept: u32 = 0;
+    let mut pages: u32 = 0;
+    let mut cursor: Option<u64> = Some(1);
+    while let Some(start) = cursor {
+        let result = client.sweep_expired_batch(&start, &50u32);
+        pages += 1;
+        total_swept += result.swept_records_count;
+        cursor = result.next_cursor_id;
+    }
+    assert_eq!(pages, 2);
+    assert_eq!(total_swept, total as u32);
+
+    for id in 1..=total {
+        assert_eq!(client.get_delegation(&id).status, DelegationStatus::Expired);
+    }
+}
+
+#[test]
+fn test_sweep_expired_batch_skips_non_expired_and_terminal() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Batch_Mix");
+    let id_expiring =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    let id_active =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &1000);
+    let id_revoked =
+        client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    client.revoke_delegation(&id_revoked);
+
+    env.ledger().set_sequence_number(300);
+
+    let result = client.sweep_expired_batch(&1u64, &10u32);
+    assert_eq!(result.swept_records_count, 1);
+    assert_eq!(result.next_cursor_id, None);
+    assert_eq!(client.get_delegation(&id_expiring).status, DelegationStatus::Expired);
+    assert_eq!(client.get_delegation(&id_active).status, DelegationStatus::Active);
+    assert_eq!(client.get_delegation(&id_revoked).status, DelegationStatus::Revoked);
+}
+
+#[test]
+fn test_sweep_expired_batch_removes_auxiliary_keys() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Batch_Aux");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    client.pause_delegation(&id);
+
+    env.ledger().set_sequence_number(300);
+    let result = client.sweep_expired_batch(&1u64, &10u32);
+    assert_eq!(result.swept_records_count, 1);
+    assert!(result.rent_reclaimed_stroops > 0);
+
+    let history = client.get_delegation_history(&id);
+    assert_eq!(history.len(), 0);
+}
+
+#[test]
+fn test_sweep_expired_batch_is_idempotent_when_already_swept() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(100);
+    let label = Symbol::new(&env, "Batch_Idempotent");
+    let id = client.create_delegation(&owner, &agent_id, &permissions_contract, &label, &100);
+    env.ledger().set_sequence_number(300);
+
+    let first = client.sweep_expired_batch(&1u64, &10u32);
+    assert_eq!(first.swept_records_count, 1);
+    assert_eq!(client.get_delegation(&id).status, DelegationStatus::Expired);
+
+    let second = client.sweep_expired_batch(&1u64, &10u32);
+    assert_eq!(second.swept_records_count, 0);
+    assert_eq!(second.next_cursor_id, None);
+    assert_eq!(second.rent_reclaimed_stroops, 0);
+}
+
+#[test]
+fn test_sweep_expired_batch_empty_registry() {
+    let (env, client, _, _, _, _) = setup();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(300);
+
+    let result = client.sweep_expired_batch(&1u64, &50u32);
+    assert_eq!(result.swept_records_count, 0);
+    assert_eq!(result.next_cursor_id, None);
+    assert_eq!(result.rent_reclaimed_stroops, 0);
+}
+
+#[test]
 fn test_get_expired_delegations_returns_correct_list() {
     let (env, client, _, owner, agent_id, permissions_contract) = setup();
     env.mock_all_auths();
