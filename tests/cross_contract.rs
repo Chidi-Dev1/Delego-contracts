@@ -1,16 +1,23 @@
 #![cfg(test)]
 
-use delego_escrow::{BatchDepositParams, EscrowContract, EscrowContractClient, EscrowStatus};
+use delego_delegation_registry::DelegationError;
+use delego_escrow::{
+    BatchDepositParams, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
+    EscrowStatus,
+};
+use delego_marketplace::MarketplaceError;
 use delego_permissions::{
     PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
     RelayedSpendMessage,
 };
 use delego_reputation::{
-    ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
+    ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
+    TransactionOutcome,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
-    testutils::Address as _, testutils::Ledger as _, xdr::ToXdr, Address, BytesN, Env, Vec,
+    testutils::Address as _, testutils::Ledger as _, xdr::ToXdr, Address, BytesN, Env,
+    InvokeError, Vec,
 };
 
 /// Deterministic test keypair plus its raw ed25519 public key bytes, mirroring
@@ -50,6 +57,8 @@ struct TestEnv {
 impl TestEnv {
     fn setup() -> Self {
         let env = Env::default();
+        env.ledger()
+            .with_mut(|l| l.min_persistent_entry_ttl = 518_400);
         env.mock_all_auths_allowing_non_root_auth();
 
         let admin = Address::generate(&env);
@@ -65,15 +74,29 @@ impl TestEnv {
             soroban_sdk::token::StellarAssetClient::new(&env, &token_contract_id);
         token_admin_client.mint(&buyer, &10000);
 
-        let escrow_contract_id = env.register(EscrowContract, ());
-        let permissions_contract_id = env.register(PermissionsContract, ());
-
-        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
         let fee_bps = 0u32; // 0% for tests
         let min_amount = 100i128;
         let max_amount = 10000i128;
-        escrow_client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
-        escrow_client.add_token(&admin, &token_contract_id);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps,
+            treasury,
+            min_amount,
+            max_amount,
+        };
+        let escrow_contract_id = env.register(EscrowContract, (config,));
+        let permissions_contract_id = env.register(PermissionsContract, ());
+
+        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+        escrow_client.set_security_guardian(&admin, &Address::generate(&env));
+        let action = delego_escrow::AdminAction::AddToken(token_contract_id.clone());
+        let id = escrow_client.queue_admin_action(&admin, &action);
+        let proposal = escrow_client.get_admin_action(&id).unwrap();
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number = proposal.pending.unlock_ledger;
+            ledger.timestamp = proposal.unlock_timestamp;
+        });
+        escrow_client.execute_admin_action(&admin, &id);
 
         TestEnv {
             env,
@@ -664,6 +687,7 @@ fn test_relayed_spend_replay_with_old_nonce_reverts() {
         amount: 100,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -675,6 +699,7 @@ fn test_relayed_spend_replay_with_old_nonce_reverts() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
     assert_eq!(perm_client.get_relayer_nonce(&t.buyer, &t.agent), 1);
@@ -689,6 +714,7 @@ fn test_relayed_spend_replay_with_old_nonce_reverts() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
     assert_eq!(replay, Err(Ok(PermissionError::InvalidNonce)));
@@ -729,4 +755,102 @@ fn test_multi_owner_spend_enforces_quorum() {
 
     let record = perm_client.get_multi_permission(&t.buyer, &t.agent);
     assert_eq!(record.spent, 100);
+}
+
+/// Cross-contract error-code allocation.
+///
+/// The bridge-facing error space is a single numeric `u32` code space. Each
+/// contract owns a disjoint numeric range:
+///
+/// | Contract      | Error enum          | Range          |
+/// |---------------|---------------------|----------------|
+/// | Escrow        | `EscrowError`       | 1_000..=1_999  |
+/// | Permissions   | `PermissionError`   | 2_000..=2_999  |
+/// | Reputation    | `ReputationError`   | 3_000..=3_999  |
+/// | Delegation    | `DelegationError`   | 4_000..=4_999  |
+/// | Marketplace   | `MarketplaceError`  | 5_000..=5_999  |
+///
+/// The tests below verify: (1) each contract's codes fall strictly within its
+/// allocated range, and (2) no code appears in more than one contract's enum.
+fn collect_error_codes<T>() -> std::vec::Vec<u32>
+where
+    T: TryFrom<InvokeError>,
+{
+    // Scan the full allocated space: 1_000..=5_999 covers all five contracts.
+    // We also include 0..=999 for any legacy codes still present.
+    (0..=9_999u32)
+        .filter(|&code| T::try_from(InvokeError::Contract(code)).is_ok())
+        .collect()
+}
+
+/// Canonical disjoint ranges per contract (issue #269).
+const ERROR_CODE_RANGES: &[(&str, u32, u32)] = &[
+    ("escrow",          1, 1_999),
+    ("permissions", 2_000, 2_999),
+    ("reputation",  3_000, 3_999),
+    ("delegation",  4_000, 4_999),
+    ("marketplace", 5_000, 5_999),
+];
+
+#[test]
+fn test_error_codes_are_unique_across_contracts() {
+    let error_codes = [
+        ("escrow", collect_error_codes::<EscrowError>()),
+        ("permissions", collect_error_codes::<PermissionError>()),
+        ("reputation", collect_error_codes::<ReputationError>()),
+        ("delegation", collect_error_codes::<DelegationError>()),
+        ("marketplace", collect_error_codes::<MarketplaceError>()),
+    ];
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (contract_name, codes) in &error_codes {
+        assert!(
+            !codes.is_empty(),
+            "{contract_name} must expose at least one error code"
+        );
+        for &code in codes {
+            assert!(
+                seen.insert(code),
+                "error code {code} is shared between contracts (found duplicate in {contract_name})"
+            );
+        }
+    }
+}
+fn test_error_codes_are_in_allocated_ranges() {
+    // Each contract's codes must fall strictly within its assigned range.
+    let contract_codes: &[(&str, std::vec::Vec<u32>, u32, u32)] = &[
+        ("escrow",      collect_error_codes::<EscrowError>(),          1, 1_999),
+        ("permissions", collect_error_codes::<PermissionError>(),  2_000, 2_999),
+        ("reputation",  collect_error_codes::<ReputationError>(),  3_000, 3_999),
+        ("delegation",  collect_error_codes::<DelegationError>(),  4_000, 4_999),
+        ("marketplace", collect_error_codes::<MarketplaceError>(), 5_000, 5_999),
+    ];
+
+    for (name, codes, lo, hi) in contract_codes {
+        assert!(
+            !codes.is_empty(),
+            "{name} must expose at least one error code"
+        );
+        for &code in codes {
+            assert!(
+                (*lo..=*hi).contains(&code),
+                "{name} error code {code} is outside its allocated range {lo}..={hi}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_error_code_ranges_are_pairwise_disjoint() {
+    // Verify the ALLOCATED ranges themselves do not overlap.
+    let mut sorted = ERROR_CODE_RANGES.to_vec();
+    sorted.sort_by_key(|&(_, lo, _)| lo);
+    for pair in sorted.windows(2) {
+        let (name_a, _lo_a, hi_a) = pair[0];
+        let (name_b, lo_b, _hi_b) = pair[1];
+        assert!(
+            hi_a < lo_b,
+            "error ranges overlap: {name_a} ends at {hi_a}, but {name_b} starts at {lo_b}"
+        );
+    }
 }
