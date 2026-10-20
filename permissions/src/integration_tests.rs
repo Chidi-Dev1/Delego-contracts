@@ -1,14 +1,18 @@
 #![cfg(test)]
 
 use crate::{
-    PermissionError, PermissionStatus, PermissionsContract, PermissionsContractClient,
-    RelayedSpendMessage,
+    ChannelRelayedSpendMessage, ChannelSpendSignature, MerchantAllowlist,
+    MultiOwnerSpendEvent, PermissionError, PermissionStatus,
+    PermissionsContract, PermissionsContractClient, RelayedSpendMessage,
+    ScopedPermissionConfig, SpendProposalApprovedEvent,
+    MAX_PENDING_SPEND_PROPOSALS, SPEND_PROPOSAL_TTL_LEDGERS,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
+    symbol_short,
     testutils::{Address as _, Events, Ledger},
     xdr::ToXdr,
-    Address, BytesN, Env, Symbol, TryIntoVal, Vec,
+    Address, BytesN, Env, Symbol, TryFromVal, TryIntoVal, Vec,
 };
 
 /// Deterministic test keypair plus its raw ed25519 public key bytes.
@@ -16,6 +20,25 @@ fn test_keypair(env: &Env, seed: u8) -> (SigningKey, BytesN<32>) {
     let signing_key = SigningKey::from_bytes(&[seed; 32]);
     let public_key = BytesN::from_array(env, &signing_key.verifying_key().to_bytes());
     (signing_key, public_key)
+}
+
+/// Sign a `RelayedSpendMessage` against a specific versioned domain separator,
+/// mirroring the on-chain `compute_versioned_domain_separator` derivation so
+/// tests can produce signatures bound to a particular contract version.
+fn sign_relayed_spend_with_domain(
+    env: &Env,
+    signing_key: &SigningKey,
+    message: RelayedSpendMessage,
+    domain_separator: &BytesN<32>,
+) -> BytesN<64> {
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&domain_separator.clone().into());
+    payload.append(&message.to_xdr(env));
+    let len = payload.len() as usize;
+    let mut buf = [0u8; 512];
+    payload.copy_into_slice(&mut buf[..len]);
+    let signature = signing_key.sign(&buf[..len]);
+    BytesN::from_array(env, &signature.to_bytes())
 }
 
 /// Sign a `RelayedSpendMessage` with the given key, returning the raw
@@ -32,6 +55,35 @@ fn sign_relayed_spend(
     message_bytes.copy_into_slice(&mut buf[..len]);
     let signature = signing_key.sign(&buf[..len]);
     BytesN::from_array(env, &signature.to_bytes())
+}
+
+/// Sign a `ChannelRelayedSpendMessage` with the given key, returning the
+/// raw 64-byte ed25519 signature over the message's canonical XDR encoding —
+/// the exact bytes `execute_spend_via_channel` re-derives and verifies.
+fn sign_channel_spend(
+    env: &Env,
+    signing_key: &SigningKey,
+    message: ChannelRelayedSpendMessage,
+) -> BytesN<64> {
+    let message_bytes = message.to_xdr(env);
+    let len = message_bytes.len() as usize;
+    let mut buf = [0u8; 512];
+    message_bytes.copy_into_slice(&mut buf[..len]);
+    let signature = signing_key.sign(&buf[..len]);
+    BytesN::from_array(env, &signature.to_bytes())
+}
+
+/// Compute the versioned domain separator for the given contract address and
+/// semver string, matching the on-chain implementation.
+fn compute_versioned_domain_separator(
+    env: &Env,
+    contract_address: &Address,
+    semver: &Symbol,
+) -> BytesN<32> {
+    let mut payload = soroban_sdk::Bytes::new(env);
+    payload.append(&contract_address.to_xdr(env));
+    payload.append(&semver.to_xdr(env));
+    env.crypto().sha256(&payload).into()
 }
 
 struct TestEnv {
@@ -357,6 +409,61 @@ fn test_permission_events() {
 }
 
 #[test]
+fn test_decrease_allowance_timelock_defaults_to_one_day() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    assert_eq!(client.get_decrease_timelock_secs(), 86400);
+
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
+
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 86399);
+    assert_eq!(
+        client.try_execute_decrease_allowance(&t.buyer, &t.agent),
+        Err(Ok(PermissionError::TimeLockActive))
+    );
+}
+
+#[test]
+fn test_set_decrease_allowance_timelock_custom_value() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    assert_eq!(
+        client.try_set_decrease_timelock_secs(&t.admin, &0),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+    assert_eq!(
+        client.try_set_decrease_timelock_secs(&t.admin, &2592001),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+
+    client.set_decrease_timelock_secs(&t.admin, &3600);
+    assert_eq!(client.get_decrease_timelock_secs(), 3600);
+
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
+
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + 3599);
+    assert_eq!(
+        client.try_execute_decrease_allowance(&t.buyer, &t.agent),
+        Err(Ok(PermissionError::TimeLockActive))
+    );
+
+    t.env.ledger().set_timestamp(t.env.ledger().timestamp() + 1);
+    client.execute_decrease_allowance(&t.buyer, &t.agent);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 800);
+}
+
+#[test]
 fn test_decrease_allowance_timelock() {
     let t = TestEnv::setup();
     let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
@@ -421,6 +528,34 @@ fn test_decrease_allowance_timelock_blocked() {
 }
 
 #[test]
+fn test_decrease_allowance_rejects_non_positive_amounts() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+
+    for amount in [-1i128, 0i128] {
+        assert_eq!(
+            client.try_decrease_allowance(&t.buyer, &t.agent, &amount),
+            Err(Ok(PermissionError::InvalidParam))
+        );
+    }
+
+    client.decrease_allowance(&t.buyer, &t.agent, &200);
+}
+
+#[test]
+fn test_decrease_allowance_accepts_positive_amount() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &36000);
+    client.decrease_allowance(&t.buyer, &t.agent, &1);
+}
+
+#[test]
 fn test_decrease_allowance_rejects_pending_decrease() {
     let t = TestEnv::setup();
     let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
@@ -436,7 +571,7 @@ fn test_decrease_allowance_rejects_pending_decrease() {
 }
 
 #[test]
-fn test_execute_decrease_allowance_rejects_below_spent_amount() {
+fn test_decrease_allowance_rejects_below_spent_at_schedule_time() {
     let t = TestEnv::setup();
     let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
     let merchant = soroban_sdk::Address::generate(&t.env);
@@ -444,14 +579,35 @@ fn test_execute_decrease_allowance_rejects_below_spent_amount() {
 
     client.grant(&t.buyer, &t.agent, &1000, &1000, &merchants, &36000);
     client.execute_spend(&t.buyer, &t.agent, &800, &merchant);
-    client.decrease_allowance(&t.buyer, &t.agent, &300);
+
+    let decrease = client.try_decrease_allowance(&t.buyer, &t.agent, &300);
+    assert_eq!(decrease, Err(Ok(PermissionError::LimitBelowSpent)));
+
+    // No pending decrement should have been scheduled: allowance is untouched.
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 200);
+}
+
+#[test]
+fn test_execute_decrease_allowance_rejects_below_spent_at_execution_time() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let merchant = soroban_sdk::Address::generate(&t.env);
+    let merchants = Vec::<soroban_sdk::Address>::new(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &1000, &merchants, &36000);
+
+    // Valid at schedule time: 900 <= 1000 remaining.
+    client.decrease_allowance(&t.buyer, &t.agent, &900);
+
+    // Spend moves during the timelock, undercutting the scheduled decrease.
+    client.execute_spend(&t.buyer, &t.agent, &500, &merchant);
     t.env
         .ledger()
         .set_timestamp(t.env.ledger().timestamp() + 86401);
 
     assert_eq!(
         client.try_execute_decrease_allowance(&t.buyer, &t.agent),
-        Err(Ok(PermissionError::ExceedsTotalLimit))
+        Err(Ok(PermissionError::LimitBelowSpent))
     );
 }
 
@@ -488,6 +644,7 @@ fn test_execute_spend_via_relayer_succeeds() {
         amount: 40,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -499,11 +656,113 @@ fn test_execute_spend_via_relayer_succeeds() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
 
     assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 60);
     assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 1);
+}
+
+/// A second relayed spend inside the configured velocity interval is rejected
+/// with `VelocityLimitExceeded`, while a later spend after the interval has
+/// elapsed succeeds (issue #54).
+#[test]
+fn test_execute_spend_via_relayer_enforces_velocity_limit() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    // Configure a 10-ledger minimum spend interval.
+    client.set_admin(&t.admin);
+    client.set_velocity_limit(&t.admin, &10u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 9);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 1000;
+
+    // First relayed spend succeeds and records the current ledger.
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &0u32,
+        &signature,
+    );
+
+    // Second relayed spend within the interval (same ledger) is rejected.
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 1,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &t.seller,
+            &1u64,
+            &expiration_ledger,
+            &0u32,
+            &signature,
+        ),
+        Err(Ok(PermissionError::VelocityLimitExceeded))
+    );
+
+    // After the interval elapses, a relayed spend succeeds again. The rejected
+    // spend above never advanced the nonce, so it is still 1.
+    t.env.ledger().with_mut(|li| {
+        li.sequence_number += 10;
+    });
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 1,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &1u64,
+        &expiration_ledger,
+        &0u32,
+        &signature,
+    );
+    // Only the first and third relayed spends succeeded (40 total spent).
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 960);
 }
 
 #[test]
@@ -527,6 +786,7 @@ fn test_execute_spend_via_relayer_rejects_replayed_nonce() {
         amount: 20,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -538,6 +798,7 @@ fn test_execute_spend_via_relayer_rejects_replayed_nonce() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
 
@@ -551,10 +812,56 @@ fn test_execute_spend_via_relayer_rejects_replayed_nonce() {
             &t.seller,
             &0u64,
             &expiration_ledger,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::InvalidNonce))
     );
+}
+
+#[test]
+fn test_execute_spend_via_relayer_rejects_stale_epoch_after_pause_resume() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let merchants = Vec::<Address>::new(&t.env);
+    client.grant(&t.buyer, &t.agent, &100, &50, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 23);
+    client.set_relayer_key(&t.agent, &public_key);
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+
+    client.pause(&t.buyer, &t.agent);
+    client.resume(&t.buyer, &t.agent);
+
+    let epoch = client.get_execution_epoch(&t.buyer, &t.agent);
+    assert_eq!(epoch.current_epoch, 2);
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &t.seller,
+            &0u64,
+            &expiration_ledger,
+            &0u32,
+            &signature,
+        ),
+        Err(Ok(PermissionError::StaleEpoch))
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
 }
 
 #[test]
@@ -581,6 +888,7 @@ fn test_execute_spend_via_relayer_rejects_invalid_signature() {
         amount: 20,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &wrong_key, message);
 
@@ -592,6 +900,7 @@ fn test_execute_spend_via_relayer_rejects_invalid_signature() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
 }
@@ -618,6 +927,7 @@ fn test_execute_spend_via_relayer_rejects_expired_signature() {
         amount: 20,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -630,6 +940,7 @@ fn test_execute_spend_via_relayer_rejects_expired_signature() {
             &t.seller,
             &0u64,
             &expiration_ledger,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::SignatureExpired))
@@ -655,6 +966,7 @@ fn test_execute_spend_via_relayer_without_registered_key_fails() {
         amount: 20,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -667,6 +979,7 @@ fn test_execute_spend_via_relayer_without_registered_key_fails() {
             &t.seller,
             &0u64,
             &expiration_ledger,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::RelayerKeyNotSet))
@@ -694,6 +1007,7 @@ fn test_execute_spend_via_relayer_enforces_per_tx_limit() {
         amount: 999,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
 
@@ -706,6 +1020,7 @@ fn test_execute_spend_via_relayer_enforces_per_tx_limit() {
             &t.seller,
             &0u64,
             &expiration_ledger,
+            &0u32,
             &signature,
         ),
         Err(Ok(PermissionError::ExceedsPerTxLimit))
@@ -824,6 +1139,7 @@ fn test_usage_stats_include_relayed_spends() {
         amount: 250,
         nonce: 0,
         expiration_ledger,
+        epoch: 0,
     };
     let signature = sign_relayed_spend(&t.env, &signing_key, message);
     client.execute_spend_via_relayer(
@@ -834,6 +1150,7 @@ fn test_usage_stats_include_relayed_spends() {
         &t.seller,
         &0u64,
         &expiration_ledger,
+        &0u32,
         &signature,
     );
 
@@ -927,6 +1244,114 @@ fn test_transfer_permission_fails_if_old_permission_not_found() {
     );
 }
 
+// ── Issue: Strict Domain Separator Hash Invalidation Across Upgrades ──────
+
+#[test]
+fn test_versioned_domain_separator_differs_across_versions() {
+    let t = TestEnv::setup();
+    let v1 = compute_versioned_domain_separator(
+        &t.env,
+        &t.permissions_contract_id,
+        &symbol_short!("PERM_V1"),
+    );
+    let v2 = compute_versioned_domain_separator(
+        &t.env,
+        &t.permissions_contract_id,
+        &symbol_short!("PERM_V2"),
+    );
+    assert_ne!(
+        v1, v2,
+        "domain separators must differ across semver versions"
+    );
+}
+
+#[test]
+fn test_versioned_domain_separator_differs_across_addresses() {
+    let t = TestEnv::setup();
+    let other = Address::generate(&t.env);
+    let a = compute_versioned_domain_separator(
+        &t.env,
+        &t.permissions_contract_id,
+        &symbol_short!("PERM_V2"),
+    );
+    let b = compute_versioned_domain_separator(&t.env, &other, &symbol_short!("PERM_V2"));
+    assert_ne!(
+        a, b,
+        "domain separators must differ across contract addresses"
+    );
+}
+
+#[test]
+fn test_signature_bound_to_v1_fails_on_v2() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 77);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 0,
+        expiration_ledger,
+    };
+
+    // Sign against the V1 domain separator — this is what an attacker would
+    // replay after the contract is upgraded to V2.
+    let v1_domain = compute_versioned_domain_separator(
+        &t.env,
+        &t.permissions_contract_id,
+        &symbol_short!("PERM_V1"),
+    );
+    let v1_signature =
+        sign_relayed_spend_with_domain(&t.env, &signing_key, message.clone(), &v1_domain);
+
+    // The live contract uses the V2 domain separator, so the V1 signature must
+    // be rejected outright.
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &t.seller,
+            &0u64,
+            &expiration_ledger,
+            &v1_signature,
+        ),
+        Err(Ok(PermissionError::InvalidSignature))
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 1000);
+
+    // A signature produced against the V2 domain separator is accepted.
+    let v2_domain = compute_versioned_domain_separator(
+        &t.env,
+        &t.permissions_contract_id,
+        &symbol_short!("PERM_V2"),
+    );
+    let v2_signature = sign_relayed_spend_with_domain(&t.env, &signing_key, message, &v2_domain);
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &v2_signature,
+    );
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 980);
+}
+
 #[test]
 fn test_transfer_permission_fails_for_self_transfer() {
     let t = TestEnv::setup();
@@ -955,4 +1380,1368 @@ fn test_transfer_permission_fails_if_new_delegate_already_has_permission() {
         client.try_transfer_permission(&t.buyer, &t.agent, &new_agent),
         Err(Ok(PermissionError::InvalidParam))
     );
+}
+
+// ── Issue #55: Relayed spend propagates through parent-chain budget ─────────
+
+/// A relayed child spend must decrement the parent budget just like a direct
+/// spend does.  Before this fix, `execute_spend_via_relayer` only touched the
+/// child record; after it the parent's `spent` counter must also increase.
+#[test]
+fn test_relayed_child_spend_decrements_parent_budget() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+    let child_delegate = Address::generate(&t.env);
+
+    // ── Set up parent permission: buyer → agent, total 200 ──────────────────
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(
+        &t.buyer, &t.agent, &200i128, // parent total
+        &100i128, // parent per-tx
+        &merchants, &3600u32,
+    );
+
+    // ── Set up child permission: agent → child_delegate, total 100 ──────────
+    // grant_child requires parent_delegate (= agent) to auth.
+    client.grant_child(
+        &t.buyer,
+        &t.agent,
+        &child_delegate,
+        &100i128, // child total — carved out of parent's 200
+        &100i128, // child per-tx
+        &merchants,
+        &3600u32,
+    );
+
+    // Confirm initial parent remaining = 200, child remaining = 100.
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 200);
+    assert_eq!(
+        client.get_remaining_allowance(&t.agent, &child_delegate),
+        100
+    );
+
+    // ── Register an ed25519 key for the child delegate ───────────────────────
+    let (signing_key, public_key) = test_keypair(&t.env, 55);
+    client.set_relayer_key(&child_delegate, &public_key);
+
+    // ── Build and sign a relayed spend of 75 on the child permission ─────────
+    let expiration_ledger = t.env.ledger().sequence() + 200;
+    let message = RelayedSpendMessage {
+        owner: t.agent.clone(), // child's owner == parent delegate
+        delegate: child_delegate.clone(),
+        merchant: t.seller.clone(),
+        amount: 75,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.agent, // owner of child permission
+        &child_delegate,
+        &75i128,
+        &t.seller,
+        &0u64,
+        &expiration_ledger,
+        &0u32,
+        &signature,
+    );
+
+    // ── Assertions ───────────────────────────────────────────────────────────
+    // Child's remaining should drop by 75.
+    assert_eq!(
+        client.get_remaining_allowance(&t.agent, &child_delegate),
+        25,
+        "child remaining should be 100 - 75 = 25"
+    );
+
+    // Parent's remaining MUST ALSO drop by 75 (the whole point of issue #55).
+    assert_eq!(
+        client.get_remaining_allowance(&t.buyer, &t.agent),
+        125,
+        "parent remaining should be 200 - 75 = 125 (relayed spend must decrement parent)"
+    );
+}
+
+/// Verify that after the fix, both direct and relayed spends through the same
+/// child permission equally consume the shared parent budget, and the parent
+/// cap is enforced on the relayed path.
+#[test]
+fn test_relayed_spend_respects_parent_budget_cap() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+    let child_delegate = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+
+    // Parent: 100 total; child: 100 total.
+    client.grant(&t.buyer, &t.agent, &100i128, &100i128, &merchants, &3600u32);
+    client.grant_child(
+        &t.buyer,
+        &t.agent,
+        &child_delegate,
+        &100i128,
+        &100i128,
+        &merchants,
+        &3600u32,
+    );
+
+    // Spend 90 directly on the child, which should propagate to the parent.
+    client.execute_spend(&t.agent, &child_delegate, &90, &t.seller);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 10);
+    assert_eq!(
+        client.get_remaining_allowance(&t.agent, &child_delegate),
+        10
+    );
+
+    // Now attempt a relayed spend of 20, which should be blocked by the parent
+    // cap (only 10 remaining there).
+    let (signing_key, public_key) = test_keypair(&t.env, 56);
+    client.set_relayer_key(&child_delegate, &public_key);
+    let expiration_ledger = t.env.ledger().sequence() + 200;
+    let message = RelayedSpendMessage {
+        owner: t.agent.clone(),
+        delegate: child_delegate.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+
+    // The child still has 10 remaining, but even before reaching apply_spend
+    // the can_spend check on the child will block the 20 spend (child limit
+    // is also only 10).
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.agent,
+            &child_delegate,
+            &20,
+            &t.seller,
+            &0u64,
+            &expiration_ledger,
+            &0u32,
+            &signature,
+        ),
+        Err(Ok(PermissionError::ExceedsTotalLimit))
+    );
+}
+
+#[test]
+fn test_validate_chain_prevents_mutation_on_exceeds_parent_limit() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let child_delegate = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+
+    // Parent: 100 total; child: 100 total.
+    client.grant(&t.buyer, &t.agent, &100i128, &100i128, &merchants, &3600u32);
+    client.grant_child(
+        &t.buyer,
+        &t.agent,
+        &child_delegate,
+        &100i128,
+        &100i128,
+        &merchants,
+        &3600u32,
+    );
+
+    // Spend 50 directly on the parent. Parent remaining = 50.
+    client.execute_spend(&t.buyer, &t.agent, &50, &t.seller);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 50);
+
+    // Child attempts to spend 60. Child has 100 limit, so child check passes.
+    // Parent only has 50 remaining, so parent check fails.
+    assert_eq!(
+        client.try_execute_spend(&t.agent, &child_delegate, &60, &t.seller),
+        Err(Ok(PermissionError::ExceedsParentLimit))
+    );
+
+    // Child state should not be mutated (spent is 0, remaining is 100)
+    assert_eq!(
+        client.get_remaining_allowance(&t.agent, &child_delegate),
+        100
+    );
+    // Parent state should not be further mutated (spent is 50, remaining is 50)
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 50);
+}
+
+// ── Issue #296: seller-specific allowlist ─────────────────────────────────
+
+#[test]
+fn test_merchant_allowlist_blocks_non_allowlisted_merchant() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let rogue = Address::generate(&t.env);
+
+    // Unrestricted grant: without an allowlist any merchant is accepted.
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+    assert_eq!(
+        client.try_can_spend(&t.buyer, &t.agent, &10, &rogue),
+        Ok(Ok(()))
+    );
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.set_merchant_allowlist(&t.buyer, &t.agent, &true, &merchants);
+
+    assert_eq!(
+        client.get_merchant_allowlist(&t.buyer, &t.agent),
+        Some(MerchantAllowlist {
+            is_enabled: true,
+            merchants: merchants.clone(),
+        })
+    );
+    assert_eq!(
+        client.try_execute_spend(&t.buyer, &t.agent, &10, &rogue),
+        Err(Ok(PermissionError::MerchantNotAllowed))
+    );
+    client.execute_spend(&t.buyer, &t.agent, &10, &t.seller);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 990);
+
+    // Disabling the allowlist lifts the restriction.
+    client.set_merchant_allowlist(&t.buyer, &t.agent, &false, &merchants);
+    client.execute_spend(&t.buyer, &t.agent, &10, &rogue);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 980);
+}
+
+#[test]
+fn test_merchant_allowlist_enabled_but_empty_blocks_all_spends() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+    client.set_merchant_allowlist(&t.buyer, &t.agent, &true, &Vec::new(&t.env));
+
+    assert_eq!(
+        client.try_execute_spend(&t.buyer, &t.agent, &10, &t.seller),
+        Err(Ok(PermissionError::MerchantNotAllowed))
+    );
+}
+
+#[test]
+fn test_merchant_allowlist_enforced_on_relayed_spend() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+    let rogue = Address::generate(&t.env);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.set_merchant_allowlist(&t.buyer, &t.agent, &true, &merchants);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 21);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+    let signature = sign_relayed_spend(
+        &t.env,
+        &signing_key,
+        RelayedSpendMessage {
+            owner: t.buyer.clone(),
+            delegate: t.agent.clone(),
+            merchant: rogue.clone(),
+            amount: 20,
+            nonce: 0,
+            expiration_ledger,
+            epoch: 0,
+        },
+    );
+
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &rogue,
+            &0u64,
+            &expiration_ledger,
+            &0u32,
+            &signature,
+        ),
+        Err(Ok(PermissionError::MerchantNotAllowed))
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
+}
+
+#[test]
+fn test_merchant_allowlist_enforces_max_size_and_uniqueness() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    for _ in 0..crate::MAX_MERCHANTS_PER_PERMISSION {
+        merchants.push_back(Address::generate(&t.env));
+    }
+    client.set_merchant_allowlist(&t.buyer, &t.agent, &true, &merchants);
+
+    merchants.push_back(Address::generate(&t.env));
+    assert_eq!(
+        client.try_set_merchant_allowlist(&t.buyer, &t.agent, &true, &merchants),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+
+    let mut duplicates = Vec::<Address>::new(&t.env);
+    duplicates.push_back(t.seller.clone());
+    duplicates.push_back(t.seller.clone());
+    assert_eq!(
+        client.try_set_merchant_allowlist(&t.buyer, &t.agent, &true, &duplicates),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+}
+
+#[test]
+fn test_merchant_allowlist_requires_existing_permission() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    assert_eq!(
+        client.try_set_merchant_allowlist(&t.buyer, &t.agent, &true, &Vec::new(&t.env)),
+        Err(Ok(PermissionError::PermissionNotFound))
+    );
+}
+
+// ── Issue #297: relayer nonce cancellation ────────────────────────────────
+
+#[test]
+fn test_cancel_nonce_unblocks_subsequent_relayed_spends() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 22);
+    client.set_relayer_key(&t.agent, &public_key);
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+
+    let sign = |nonce: u64| {
+        sign_relayed_spend(
+            &t.env,
+            &signing_key,
+            RelayedSpendMessage {
+                owner: t.buyer.clone(),
+                delegate: t.agent.clone(),
+                merchant: t.seller.clone(),
+                amount: 20,
+                nonce,
+                expiration_ledger,
+                epoch: 0,
+            },
+        )
+    };
+    let stalled = sign(0);
+    let next = sign(1);
+
+    // Nonce 0 was dropped/censored, so nonce 1 is stuck behind it.
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &t.seller,
+            &1u64,
+            &expiration_ledger,
+            &0u32,
+            &next,
+        ),
+        Err(Ok(PermissionError::InvalidNonce))
+    );
+
+    client.cancel_nonce(&t.buyer, &t.agent, &0u64);
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 1);
+
+    // The stalled message can no longer be replayed later...
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &20,
+            &t.seller,
+            &0u64,
+            &expiration_ledger,
+            &0u32,
+            &stalled,
+        ),
+        Err(Ok(PermissionError::InvalidNonce))
+    );
+    // ...and the next one now goes through without revoking the delegation.
+    client.execute_spend_via_relayer(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &1u64,
+        &expiration_ledger,
+        &0u32,
+        &next,
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 2);
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 980);
+    assert!(client.is_active(&t.buyer, &t.agent));
+}
+
+#[test]
+fn test_cancel_nonce_can_skip_a_window_of_nonces() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+    client.cancel_nonce(&t.buyer, &t.agent, &4u64);
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 5);
+}
+
+#[test]
+fn test_cancel_nonce_rejects_consumed_nonce_and_overflow() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    client.grant(&t.buyer, &t.agent, &1000, &100, &Vec::new(&t.env), &3600u32);
+    client.cancel_nonce(&t.buyer, &t.agent, &2u64);
+
+    assert_eq!(
+        client.try_cancel_nonce(&t.buyer, &t.agent, &1u64),
+        Err(Ok(PermissionError::NonceAlreadyUsed))
+    );
+    assert_eq!(
+        client.try_cancel_nonce(&t.buyer, &t.agent, &u64::MAX),
+        Err(Ok(PermissionError::NonceAlreadyUsed))
+    );
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 3);
+}
+
+#[test]
+fn test_cancel_nonce_requires_existing_permission() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+
+    assert_eq!(
+        client.try_cancel_nonce(&t.buyer, &t.agent, &0u64),
+        Err(Ok(PermissionError::PermissionNotFound))
+    );
+}
+
+// ── Issue #369: function-scoped permissions vs. the relayer path ───────────
+
+/// The signed `RelayedSpendMessage` carries no contract entrypoint, so a
+/// function-scoped grant cannot be spent through the gasless relayer path:
+/// the signature never attests *which* function the relayer is invoking. The
+/// check fails closed rather than being skipped, so a scoped delegate's
+/// allowance cannot be drained by relaying around the scope (issue #369).
+#[test]
+fn test_scoped_grant_rejects_relayed_spend() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+
+    let mut functions = Vec::new(&t.env);
+    functions.push_back(Symbol::new(&t.env, "fund"));
+    client.grant_scoped(
+        &t.buyer,
+        &t.agent,
+        &1000,
+        &100,
+        &merchants,
+        &3600u32,
+        &ScopedPermissionConfig {
+            target_contract: t._escrow_contract_id.clone(),
+            allowed_function_symbols: functions,
+        },
+    );
+
+    let (signing_key, public_key) = test_keypair(&t.env, 11);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 100;
+    let message = RelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 40,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_relayed_spend(&t.env, &signing_key, message);
+
+    assert_eq!(
+        client.try_execute_spend_via_relayer(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &40,
+            &t.seller,
+            &0u64,
+            &expiration_ledger,
+            &0u32,
+            &signature,
+        ),
+        Err(Ok(PermissionError::UnauthorizedFunction))
+    );
+
+    // Nothing was spent and the nonce was not consumed.
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 1000);
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
+
+    // The delegate can still spend through the scoped entrypoint itself.
+    assert_eq!(
+        client.try_execute_spend_scoped(
+            &t.buyer,
+            &t.agent,
+            &40,
+            &t.seller,
+            &Some(t._escrow_contract_id.clone()),
+            &Some(Symbol::new(&t.env, "fund")),
+        ),
+        Ok(Ok(()))
+    );
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 960);
+}
+
+// ── Issue: Handle Verification Policy Threshold Increases ─────────────────
+
+/// Helper: register a merchant with the given number of verifications under
+/// the currently configured policy, returning the merchant id.
+fn register_verified_merchant(
+    t: &TestEnv,
+    client: &PermissionsContractClient,
+    verifications: u32,
+) -> u64 {
+    let merchant = Address::generate(&t.env);
+    let id = client.register_merchant(&t.admin, &merchant);
+    for _ in 0..verifications {
+        client.add_merchant_verification(&t.admin, &id);
+    }
+    id
+}
+
+/// A merchant verified under a 1-of-N policy must not remain "verified"
+/// indefinitely once governance raises the required threshold to 2. The
+/// dynamic check must report them as failing the new policy, and the
+/// revalidation entrypoint must transition them out of the verified state.
+#[test]
+fn test_policy_threshold_increase_invalidates_pre_existing_merchant() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    // Governance starts with a 1-verification policy.
+    client.set_verification_policy(&t.admin, &1u32);
+
+    // Merchant is registered and fully verified under the old policy.
+    let merchant_id = register_verified_merchant(&t, &client, 1);
+    assert!(client.is_merchant_verified(&merchant_id));
+
+    // Governance raises the required verifications to 2.
+    client.set_verification_policy(&t.admin, &2u32);
+
+    // The dynamic check must immediately reflect the new policy: the merchant
+    // only holds 1 attestation, so they no longer satisfy the requirement.
+    assert!(!client.is_merchant_verified(&merchant_id));
+
+    // Revalidation must transition the merchant out of the verified state.
+    let still_verified = client.revalidate_merchant_status(&merchant_id);
+    assert!(!still_verified);
+    assert!(!client.is_merchant_verified(&merchant_id));
+}
+
+/// A merchant that acquires the additional attestation within the grace
+/// period must be re-validated back into the verified state.
+#[test]
+fn test_policy_threshold_increase_grace_period_allows_recovery() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    client.set_verification_policy(&t.admin, &1u32);
+    let merchant_id = register_verified_merchant(&t, &client, 1);
+    assert!(client.is_merchant_verified(&merchant_id));
+
+    // Policy is raised; merchant is now under-verified but within grace.
+    client.set_verification_policy(&t.admin, &2u32);
+    assert!(!client.is_merchant_verified(&merchant_id));
+
+    // Merchant acquires the second attestation before the grace period ends.
+    client.add_merchant_verification(&t.admin, &merchant_id);
+
+    // Revalidation succeeds and the merchant is verified again.
+    assert!(client.revalidate_merchant_status(&merchant_id));
+    assert!(client.is_merchant_verified(&merchant_id));
+}
+
+/// Once the 30-day grace period elapses without the merchant acquiring the
+/// additional attestation, revalidation must permanently fail and the
+/// merchant must remain unverified.
+#[test]
+fn test_policy_threshold_increase_grace_period_expiry() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    client.set_verification_policy(&t.admin, &1u32);
+    let merchant_id = register_verified_merchant(&t, &client, 1);
+    assert!(client.is_merchant_verified(&merchant_id));
+
+    // Raise the policy and let the 30-day grace period expire.
+    client.set_verification_policy(&t.admin, &2u32);
+    let thirty_days_secs: u64 = 30 * 24 * 60 * 60;
+    t.env
+        .ledger()
+        .set_timestamp(t.env.ledger().timestamp() + thirty_days_secs + 1);
+
+    // Even if the merchant later acquires the attestation, the grace window
+    // has closed and revalidation must not silently re-verify them.
+    client.add_merchant_verification(&t.admin, &merchant_id);
+    assert!(!client.revalidate_merchant_status(&merchant_id));
+    assert!(!client.is_merchant_verified(&merchant_id));
+}
+
+/// A merchant already meeting the raised policy must be unaffected by the
+/// transition and revalidation must keep them verified.
+#[test]
+fn test_policy_threshold_increase_leaves_compliant_merchant_verified() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    client.set_verification_policy(&t.admin, &1u32);
+    let merchant_id = register_verified_merchant(&t, &client, 2);
+    assert!(client.is_merchant_verified(&merchant_id));
+
+    // Raising the policy to 2 leaves this merchant compliant.
+    client.set_verification_policy(&t.admin, &2u32);
+    assert!(client.is_merchant_verified(&merchant_id));
+    assert!(client.revalidate_merchant_status(&merchant_id));
+    assert!(client.is_merchant_verified(&merchant_id));
+}
+
+/// Revalidating an unknown merchant must surface a deterministic error
+/// rather than silently succeeding.
+#[test]
+fn test_revalidate_merchant_status_unknown_merchant_fails() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+    client.set_verification_policy(&t.admin, &1u32);
+
+    assert_eq!(
+        client.try_revalidate_merchant_status(&999u64),
+        Err(Ok(PermissionError::MerchantNotFound))
+    );
+}
+
+/// Lowering the policy threshold must not revoke merchants that were already
+/// verified; the dynamic check should simply continue to pass.
+#[test]
+fn test_policy_threshold_decrease_keeps_merchant_verified() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    client.set_admin(&t.admin);
+
+    client.set_verification_policy(&t.admin, &2u32);
+    let merchant_id = register_verified_merchant(&t, &client, 2);
+    assert!(client.is_merchant_verified(&merchant_id));
+
+    // Governance relaxes the policy back to 1.
+    client.set_verification_policy(&t.admin, &1u32);
+    assert!(client.is_merchant_verified(&merchant_id));
+    assert!(client.revalidate_merchant_status(&merchant_id));
+}
+
+// ── Issue #377: asynchronous multi-sig spend approval queue ──────────────
+
+/// Grants a 2-of-3 multi-owner grant from `t.buyer` to `t.agent` and returns the
+/// two remaining co-signers.
+fn enterprise_grant(t: &TestEnv) -> (Address, Address) {
+    enterprise_grant_with(t, 1_000, 500, 36_000)
+}
+
+/// [`enterprise_grant`] with explicit limits and lifetime.
+fn enterprise_grant_with(
+    t: &TestEnv,
+    limit_total: i128,
+    limit_per_tx: i128,
+    duration_ledgers: u32,
+) -> (Address, Address) {
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let owner_b = Address::generate(&t.env);
+    let owner_c = Address::generate(&t.env);
+
+    let mut owners = Vec::<Address>::new(&t.env);
+    owners.push_back(t.buyer.clone());
+    owners.push_back(owner_b.clone());
+    owners.push_back(owner_c.clone());
+    let merchants = Vec::<Address>::new(&t.env);
+
+    client.grant_multi_owner(
+        &t.buyer,
+        &owners,
+        &t.agent,
+        &limit_total,
+        &limit_per_tx,
+        &merchants,
+        &duration_ledgers,
+        &2u32,
+    );
+
+    (owner_b, owner_c)
+}
+
+/// Raises the mock ledger's entry TTLs so a proposal can sit in the queue for
+/// its full 24-hour window without the grant or its records being archived.
+/// Call before the contract writes anything.
+fn configure_ledger_ttl(t: &TestEnv) {
+    let ttl = SPEND_PROPOSAL_TTL_LEDGERS * 4;
+    t.env.ledger().set_min_temp_entry_ttl(ttl);
+    t.env.ledger().set_min_persistent_entry_ttl(ttl);
+    t.env.ledger().set_max_entry_ttl(ttl);
+    // The contract instance was written when `TestEnv` registered it, under the
+    // mock ledger's default 4,096-ledger TTL, and is not re-stamped on call.
+    t.env.as_contract(&t.permissions_contract_id, || {
+        t.env.storage().instance().extend_ttl(ttl, ttl);
+    });
+}
+
+/// Advance the ledger by `ledgers` sequential ledgers.
+fn advance_ledgers(t: &TestEnv, ledgers: u32) {
+    let mut sequence = t.env.ledger().sequence();
+    let mut timestamp = t.env.ledger().timestamp();
+    for _ in 0..ledgers {
+        sequence += 1;
+        timestamp += 5;
+    }
+    t.env.ledger().set_sequence_number(sequence);
+    t.env.ledger().set_timestamp(timestamp);
+}
+
+/// Every event this contract published under `topic`, oldest first.
+///
+/// Mirrors the `find_event` decoding used elsewhere in the workspace: topics
+/// are `(perm, action, ..)`, so the action is at index 1.
+fn events_under<T>(env: &Env, topic: &str) -> std::vec::Vec<T>
+where
+    T: TryFromVal<Env, soroban_sdk::Val>,
+{
+    let action: Symbol = Symbol::new(env, topic);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| topics.len() >= 2)
+        .filter_map(|(_, topics, data)| {
+            let event_topic: Symbol = topics.get(1).unwrap().try_into_val(env).unwrap();
+            if event_topic == action {
+                T::try_from_val(env, &data).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The headline case: co-signers are in different places at different times, so
+/// the delegate queues the spend in one transaction and each co-signer signs in
+/// a transaction of its own — days of ledgers apart. Nothing moves until the
+/// second signature lands, and the spend then settles on its own, inside that
+/// signature's transaction, with no separate execution step.
+#[test]
+fn test_multi_owner_spend_co_signs_asynchronously_and_settles_at_quorum() {
+    let t = TestEnv::setup();
+    configure_ledger_ttl(&t);
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, owner_c) = enterprise_grant(&t);
+
+    // The delegate queues the spend. No approval is collected yet.
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &300);
+    let queued = client.get_spend_proposal(&proposal_id);
+    assert_eq!(queued.proposal_id, proposal_id);
+    assert_eq!(queued.recipient, t.seller);
+    assert_eq!(queued.amount, 300);
+    assert_eq!(queued.threshold, 2);
+    assert_eq!(queued.primary_owner, t.buyer);
+    assert_eq!(queued.delegate, t.agent);
+    assert_eq!(queued.approvals.len(), 0);
+    assert!(!queued.is_executed);
+    assert_eq!(
+        queued.expires_at_ledger,
+        t.env.ledger().sequence() + SPEND_PROPOSAL_TTL_LEDGERS
+    );
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+
+    // First co-signer signs much later — still short of the 2-of-3 quorum, so
+    // the allowance must stay untouched.
+    advance_ledgers(&t, 6_000);
+    client.approve_spend_proposal(&proposal_id, &t.buyer);
+    let partial = client.get_spend_proposal(&proposal_id);
+    assert_eq!(partial.approvals.len(), 1);
+    assert!(partial.approvals.get(0).unwrap() == t.buyer);
+    assert!(!partial.is_executed);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+
+    // Second co-signer signs in a later transaction, just inside the 24-hour
+    // window: the queued spend settles automatically.
+    advance_ledgers(&t, 6_000);
+    client.approve_spend_proposal(&proposal_id, &owner_b);
+
+    let settled = client.get_spend_proposal(&proposal_id);
+    assert_eq!(settled.approvals.len(), 2);
+    assert!(settled.approvals.get(1).unwrap() == owner_b);
+    assert!(settled.is_executed);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 300);
+
+    // A settled spend is out of the queue and cannot be settled again.
+    assert_eq!(client.get_spend_proposals(&t.agent).len(), 0);
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &owner_c),
+        Err(Ok(PermissionError::ProposalAlreadyExecuted))
+    );
+}
+
+/// A single approval, however late, must never settle on its own: the queue is
+/// only a way to co-sign asynchronously, not a way around the quorum.
+#[test]
+fn test_multi_owner_spend_queue_requires_full_quorum() {
+    let t = TestEnv::setup();
+    configure_ledger_ttl(&t);
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, _owner_c) = enterprise_grant(&t);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+    advance_ledgers(&t, 17_000);
+    client.approve_spend_proposal(&proposal_id, &owner_b);
+
+    let proposal = client.get_spend_proposal(&proposal_id);
+    assert_eq!(proposal.approvals.len(), 1);
+    assert!(!proposal.is_executed);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+
+    // The delegate cannot supply the missing signature itself.
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &t.agent),
+        Err(Ok(PermissionError::Unauthorized))
+    );
+}
+
+/// The approval that reaches the quorum emits the same multi-owner spend event
+/// as a synchronous spend, so indexers need no separate path for queued spends.
+#[test]
+fn test_queued_spend_emits_multi_owner_spend_event_at_quorum() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, _owner_c) = enterprise_grant(&t);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &250);
+
+    // Every approval is reported, and only the quorum-reaching one is flagged
+    // as having settled the spend. Nothing moves on the first signature.
+    client.approve_spend_proposal(&proposal_id, &t.buyer);
+    let approvals = events_under::<SpendProposalApprovedEvent>(&t.env, "sappr");
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].approval_count, 1);
+    assert_eq!(approvals[0].threshold, 2);
+    assert!(approvals[0].approver == t.buyer);
+    assert!(!approvals[0].executed);
+    assert!(events_under::<MultiOwnerSpendEvent>(&t.env, "mspent").is_empty());
+
+    client.approve_spend_proposal(&proposal_id, &owner_b);
+    let approvals = events_under::<SpendProposalApprovedEvent>(&t.env, "sappr");
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].approval_count, 2);
+    assert!(approvals[0].executed);
+
+    // The spend itself is reported through the same event a synchronous
+    // multi-owner spend uses, so indexers need no separate path.
+    let spend = events_under::<MultiOwnerSpendEvent>(&t.env, "mspent");
+    assert_eq!(spend.len(), 1);
+    assert_eq!(spend[0].amount, 250);
+    assert_eq!(spend[0].merchant, t.seller);
+    assert_eq!(spend[0].remaining, 750);
+    assert_eq!(spend[0].signer_count, 2);
+}
+
+/// Co-signing must not be repeatable: the same owner cannot sign twice, and a
+/// queue left unapproved never settles.
+#[test]
+fn test_multi_owner_spend_queue_rejects_duplicate_signature() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    enterprise_grant(&t);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+    client.approve_spend_proposal(&proposal_id, &t.buyer);
+
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &t.buyer),
+        Err(Ok(PermissionError::ProposalAlreadyApproved))
+    );
+    assert_eq!(client.get_spend_proposal(&proposal_id).approvals.len(), 1);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+}
+
+/// The 24-hour window is a hard deadline: a co-signer that arrives after it
+/// cannot revive the proposal, and nothing is debited.
+#[test]
+fn test_multi_owner_spend_proposal_expires_after_window() {
+    let t = TestEnv::setup();
+    configure_ledger_ttl(&t);
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, _owner_c) = enterprise_grant(&t);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+    advance_ledgers(&t, SPEND_PROPOSAL_TTL_LEDGERS);
+
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &t.buyer),
+        Err(Ok(PermissionError::ProposalExpired))
+    );
+
+    // An expired proposal stops occupying a queue slot: queueing again works.
+    let next_id = client.propose_spend(&t.agent, &t.seller, &100);
+    assert_ne!(next_id, proposal_id);
+    assert_eq!(client.get_spend_proposals(&t.agent).len(), 1);
+    assert_eq!(client.get_spend_proposal(&next_id).proposal_id, next_id);
+    let _ = owner_b;
+}
+
+/// Only registered owners of the grant may co-sign; an outsider with a valid
+/// signature is rejected and cannot move the allowance.
+#[test]
+fn test_multi_owner_spend_proposal_rejects_non_owner() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    enterprise_grant(&t);
+    let outsider = Address::generate(&t.env);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &outsider),
+        Err(Ok(PermissionError::Unauthorized))
+    );
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+}
+
+/// The grant is re-validated at settlement time, so a proposal queued against a
+/// grant that has since lapsed can never spend through it — a day in the queue
+/// must not widen the grant's lifetime.
+#[test]
+fn test_queued_spend_cannot_settle_after_grant_expires() {
+    let t = TestEnv::setup();
+    configure_ledger_ttl(&t);
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    // The grant outlives neither the co-signing window nor the queue wait.
+    let (owner_b, _owner_c) = enterprise_grant_with(&t, 1_000, 500, 3_600);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+    client.approve_spend_proposal(&proposal_id, &t.buyer);
+
+    // Still inside the proposal's window, but the grant is long gone.
+    advance_ledgers(&t, 4_000);
+    assert!(t.env.ledger().sequence() < SPEND_PROPOSAL_TTL_LEDGERS);
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &owner_b),
+        Err(Ok(PermissionError::Expired))
+    );
+    // The failed approval left no trace: the second owner never co-signed.
+    let proposal = client.get_spend_proposal(&proposal_id);
+    assert_eq!(proposal.approvals.len(), 1);
+    assert!(!proposal.is_executed);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+}
+
+/// A queued spend is bound by the grant's allowance when it is co-signed, not
+/// only when it is queued: other spends landing in the meantime consume the
+/// allowance first, and the queue must not overdraw the grant to reach quorum.
+#[test]
+fn test_queued_spend_respects_allowance_at_settlement() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, _owner_c) = enterprise_grant_with(&t, 1_000, 1_000, 36_000);
+
+    // Queued while the full 1000 allowance is available.
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &400);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+
+    // A synchronous multi-owner spend of 700 lands first, leaving 300.
+    let mut signers = Vec::<Address>::new(&t.env);
+    signers.push_back(t.buyer.clone());
+    signers.push_back(owner_b.clone());
+    client.execute_spend_multi(&t.buyer, &t.agent, &signers, &700, &t.seller);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 700);
+
+    // The queued spend no longer fits, so co-signing refuses it outright — no
+    // approval is recorded and the grant is left as the other spend left it.
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &t.buyer),
+        Err(Ok(PermissionError::ExceedsTotalLimit))
+    );
+    let proposal = client.get_spend_proposal(&proposal_id);
+    assert_eq!(proposal.approvals.len(), 0);
+    assert!(!proposal.is_executed);
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 700);
+
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &owner_b),
+        Err(Ok(PermissionError::ExceedsTotalLimit))
+    );
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 700);
+}
+
+/// A delegate can withdraw a queued spend it no longer needs, and a co-signer
+/// can veto one the delegate queued in error.
+#[test]
+fn test_multi_owner_spend_proposal_can_be_cancelled() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let (owner_b, _owner_c) = enterprise_grant(&t);
+    let outsider = Address::generate(&t.env);
+
+    let proposal_id = client.propose_spend(&t.agent, &t.seller, &100);
+
+    // Neither an outsider nor the delegate's counterparty may cancel.
+    assert_eq!(
+        client.try_cancel_spend_proposal(&proposal_id, &outsider),
+        Err(Ok(PermissionError::Unauthorized))
+    );
+
+    // A co-signer vetoes it.
+    client.cancel_spend_proposal(&proposal_id, &owner_b);
+    assert_eq!(
+        client.try_get_spend_proposal(&proposal_id),
+        Err(Ok(PermissionError::ProposalNotFound))
+    );
+    assert_eq!(
+        client.try_approve_spend_proposal(&proposal_id, &t.buyer),
+        Err(Ok(PermissionError::ProposalNotFound))
+    );
+    assert_eq!(client.get_multi_permission(&t.buyer, &t.agent).spent, 0);
+
+    // The delegate may withdraw its own proposal too.
+    let second_id = client.propose_spend(&t.agent, &t.seller, &100);
+    client.cancel_spend_proposal(&second_id, &t.agent);
+    assert_eq!(client.get_spend_proposals(&t.agent).len(), 0);
+}
+
+/// The queue is bounded per delegate so a delegate cannot park an unbounded
+/// backlog; once a slot frees up, queueing works again.
+#[test]
+fn test_multi_owner_spend_queue_is_bounded() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    enterprise_grant(&t);
+
+    for _ in 0..MAX_PENDING_SPEND_PROPOSALS {
+        client.propose_spend(&t.agent, &t.seller, &10);
+    }
+    assert_eq!(
+        client.get_spend_proposals(&t.agent).len(),
+        MAX_PENDING_SPEND_PROPOSALS
+    );
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &10),
+        Err(Ok(PermissionError::TooManyPendingProposals))
+    );
+
+    client.cancel_spend_proposal(&1, &t.agent);
+    client.propose_spend(&t.agent, &t.seller, &10);
+}
+
+/// The queue only exists for enterprise (multi-owner) grants, and it enforces
+/// the grant's policy up front: whitelist, limits and a positive amount.
+#[test]
+fn test_propose_spend_validates_grant_policy() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let outsider = Address::generate(&t.env);
+
+    // No multi-owner grant at all.
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &10),
+        Err(Ok(PermissionError::NoMultiOwnerGrant))
+    );
+
+    enterprise_grant(&t);
+
+    // Non-positive amounts are refused.
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &0),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &-1),
+        Err(Ok(PermissionError::InvalidParam))
+    );
+
+    // Over the per-transaction and total limits.
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &501),
+        Err(Ok(PermissionError::ExceedsPerTxLimit))
+    );
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &t.seller, &1001),
+        Err(Ok(PermissionError::ExceedsPerTxLimit))
+    );
+
+    // Not every address is spendable under a whitelisted grant: a second grant
+    // restricted to `t.seller` makes the delegate's grants ambiguous, so the
+    // policy is checked on an unambiguous setup.
+    assert_eq!(
+        client.try_propose_spend(&t.agent, &outsider, &100),
+        Ok(Ok(1))
+    );
+/// 10 concurrent transactions executing across different channels (issue #367).
+/// Each channel has an independent nonce, so spends on channel A do not block
+/// or interfere with channel B. Nonce replay protection holds independently
+/// per channel.
+#[test]
+fn test_execute_spend_via_channel_parallel_channels() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &10000, &1000, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 42);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 1000;
+
+    // Execute 10 spends across 10 different channels (0..9), each with nonce 0.
+    // All should succeed because each channel has its own independent nonce.
+    for channel_id in 0u32..10 {
+        let message = ChannelRelayedSpendMessage {
+            owner: t.buyer.clone(),
+            delegate: t.agent.clone(),
+            merchant: t.seller.clone(),
+            amount: 10,
+            channel_id,
+            nonce: 0,
+            expiration_ledger,
+            epoch: 0,
+        };
+        let signature = sign_channel_spend(&t.env, &signing_key, message);
+        let channel_sig = ChannelSpendSignature {
+            channel_id,
+            nonce: 0,
+            signature,
+        };
+
+        client.execute_spend_via_channel(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &10,
+            &t.seller,
+            &channel_sig,
+            &expiration_ledger,
+            &0u32,
+        );
+    }
+
+    // All 10 spends succeeded (100 total spent)
+    assert_eq!(client.get_remaining_allowance(&t.buyer, &t.agent), 9900);
+
+    // Each channel's nonce advanced independently to 1
+    for channel_id in 0u32..10 {
+        assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &channel_id), 1);
+    }
+
+    // Relayed (single-lane) nonce is untouched
+    assert_eq!(client.get_relayer_nonce(&t.buyer, &t.agent), 0);
+}
+
+/// Replay protection: reusing a channel signature fails (issue #367).
+#[test]
+fn test_execute_spend_via_channel_rejects_replayed_nonce() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 43);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 1000;
+
+    // First spend on channel 5 succeeds
+    let message = ChannelRelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 50,
+        channel_id: 5,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let signature = sign_channel_spend(&t.env, &signing_key, message);
+    let channel_sig = ChannelSpendSignature {
+        channel_id: 5,
+        nonce: 0,
+        signature,
+    };
+
+    client.execute_spend_via_channel(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &50,
+        &t.seller,
+        &channel_sig,
+        &expiration_ledger,
+        &0u32,
+    );
+
+    // Replay the exact same signature (same channel, same nonce) fails
+    assert_eq!(
+        client.try_execute_spend_via_channel(
+            &relayer,
+            &t.buyer,
+            &t.agent,
+            &50,
+            &t.seller,
+            &channel_sig,
+            &expiration_ledger,
+            &0u32,
+        ),
+        Err(Ok(PermissionError::InvalidNonce))
+    );
+
+    // Channel 5 nonce is now 1
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &5), 1);
+    // Other channels unaffected
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &0), 0);
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &6), 0);
+}
+
+/// Cross-channel independence: spend on channel A doesn't affect channel B's nonce (issue #367).
+#[test]
+fn test_execute_spend_via_channel_independent_lanes() {
+    let t = TestEnv::setup();
+    let client = PermissionsContractClient::new(&t.env, &t.permissions_contract_id);
+    let relayer = Address::generate(&t.env);
+
+    let mut merchants = Vec::<Address>::new(&t.env);
+    merchants.push_back(t.seller.clone());
+    client.grant(&t.buyer, &t.agent, &1000, &100, &merchants, &3600u32);
+
+    let (signing_key, public_key) = test_keypair(&t.env, 44);
+    client.set_relayer_key(&t.agent, &public_key);
+
+    let expiration_ledger = t.env.ledger().sequence() + 1000;
+
+    // Spend on channel 0
+    let msg0 = ChannelRelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 10,
+        channel_id: 0,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let sig0 = sign_channel_spend(&t.env, &signing_key, msg0);
+    client.execute_spend_via_channel(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &10,
+        &t.seller,
+        &ChannelSpendSignature {
+            channel_id: 0,
+            nonce: 0,
+            signature: sig0,
+        },
+        &expiration_ledger,
+        &0u32,
+    );
+
+    // Spend on channel 1 (should succeed independently)
+    let msg1 = ChannelRelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 20,
+        channel_id: 1,
+        nonce: 0,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let sig1 = sign_channel_spend(&t.env, &signing_key, msg1);
+    client.execute_spend_via_channel(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &20,
+        &t.seller,
+        &ChannelSpendSignature {
+            channel_id: 1,
+            nonce: 0,
+            signature: sig1,
+        },
+        &expiration_ledger,
+        &0u32,
+    );
+
+    // Channel 0 nonce advanced, channel 1 nonce advanced, but they're independent
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &0), 1);
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &1), 1);
+
+    // Second spend on channel 0 uses nonce 1
+    let msg0b = ChannelRelayedSpendMessage {
+        owner: t.buyer.clone(),
+        delegate: t.agent.clone(),
+        merchant: t.seller.clone(),
+        amount: 10,
+        channel_id: 0,
+        nonce: 1,
+        expiration_ledger,
+        epoch: 0,
+    };
+    let sig0b = sign_channel_spend(&t.env, &signing_key, msg0b);
+    client.execute_spend_via_channel(
+        &relayer,
+        &t.buyer,
+        &t.agent,
+        &10,
+        &t.seller,
+        &ChannelSpendSignature {
+            channel_id: 0,
+            nonce: 1,
+            signature: sig0b,
+        },
+        &expiration_ledger,
+        &0u32,
+    );
+
+    // Channel 0 nonce now 2, channel 1 still 1
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &0), 2);
+    assert_eq!(client.get_channel_nonce(&t.buyer, &t.agent, &1), 1);
 }

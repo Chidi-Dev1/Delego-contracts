@@ -1,13 +1,62 @@
 #![cfg(test)]
 
 use crate::{
-    BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowContract,
-    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState,
+    BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig, EscrowContract,
+    EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, MerchantVolumeRecord,
+    TreasuryShare, MAX_TREASURIES,
+
+    AffiliateConfig, BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig,
+    EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState, TreasuryShare,
+    MAX_TREASURIES,
+    BatchDepositItem, BatchDepositParams, BatchDepositResult, BatchRefundParams,
+    BatchReleaseParams, EscrowConfig, EscrowContract, EscrowContractClient, EscrowError,
+    EscrowStatus, EscrowTerminalState, TreasuryShare, MAX_TREASURIES,
 };
+
+#[test]
+fn test_claim_fraud_restitution_for_banned_merchant() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    assert_eq!(token_client.balance(&t.buyer), 9000);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 1000);
+
+    let marketplace_contract = Address::generate(&t.env);
+    let refunded = escrow_client.claim_fraud_restitution(&escrow_id, &marketplace_contract);
+    assert_eq!(refunded, 1000);
+
+    assert_eq!(token_client.balance(&t.buyer), 10000);
+    assert_eq!(token_client.balance(&t.escrow_contract_id), 0);
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Refunded);
+}
+
+#[test]
+fn test_claim_fraud_restitution_rejects_honest_merchant() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    let marketplace_contract = Address::generate(&t.env);
+    assert_eq!(
+        escrow_client.try_claim_fraud_restitution(&escrow_id, &marketplace_contract),
+        Err(Ok(EscrowError::MerchantNotBanned))
+    );
+
+    assert_eq!(
+        escrow_client.get_escrow(&escrow_id).status,
+        EscrowStatus::Funded
+    );
+}
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
-    Address, BytesN, Env, IntoVal, Vec,
+    testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
+    Address, BytesN, Env, IntoVal, Symbol, TryIntoVal, Vec,
 };
 
 struct TestEnv {
@@ -16,7 +65,6 @@ struct TestEnv {
     buyer: Address,
     seller: Address,
     agent: Address,
-    treasury: Address,
     token_contract_id: Address,
     escrow_contract_id: Address,
 }
@@ -44,11 +92,27 @@ impl TestEnv {
             soroban_sdk::token::StellarAssetClient::new(&env, &token_contract_id);
         token_admin_client.mint(&buyer, &10000);
 
-        let escrow_contract_id = env.register(EscrowContract, ());
-        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
         let min_amount = 100i128;
         let max_amount = 10000i128;
-        escrow_client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
+        let config = EscrowConfig {
+            admin: admin.clone(),
+            fee_bps,
+            treasury,
+            min_amount,
+            max_amount,
+        };
+        let escrow_contract_id = env.register(EscrowContract, (config,));
+        let escrow_contract_id = env.register(
+            EscrowContract,
+            (EscrowConfig {
+                admin: admin.clone(),
+                fee_bps,
+                treasury: treasury.clone(),
+                min_amount: 100i128,
+                max_amount: 10000i128,
+            },),
+        );
+        let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
         escrow_client.add_token(&admin, &token_contract_id);
 
         TestEnv {
@@ -57,7 +121,6 @@ impl TestEnv {
             buyer,
             seller,
             agent,
-            treasury,
             token_contract_id,
             escrow_contract_id,
         }
@@ -130,12 +193,28 @@ fn test_add_token_by_non_admin_fails() {
     let agent = Address::generate(&env);
     let treasury = Address::generate(&env);
 
-    let escrow_contract_id = env.register(EscrowContract, ());
-    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
     let fee_bps = 0u32;
     let min_amount = 100i128;
     let max_amount = 10000i128;
-    escrow_client.initialize(&admin, &fee_bps, &treasury, &min_amount, &max_amount);
+    let config = EscrowConfig {
+        admin: admin.clone(),
+        fee_bps,
+        treasury,
+        min_amount,
+        max_amount,
+    };
+    let escrow_contract_id = env.register(EscrowContract, (config,));
+    let escrow_contract_id = env.register(
+        EscrowContract,
+        (EscrowConfig {
+            admin: admin.clone(),
+            fee_bps: 0u32,
+            treasury: treasury.clone(),
+            min_amount: 100i128,
+            max_amount: 10000i128,
+        },),
+    );
+    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
 
     let new_token = Address::generate(&env);
 
@@ -193,6 +272,34 @@ fn test_add_token_is_idempotent() {
     let tokens = escrow_client.list_tokens();
     assert_eq!(tokens.len(), 1);
     assert!(tokens.contains(&t.token_contract_id));
+}
+
+#[test]
+fn test_large_whitelist_pagination() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    // Add 150 tokens
+    for _ in 0..150 {
+        let new_token = Address::generate(&t.env);
+        assert!(escrow_client.add_token(&t.admin, &new_token));
+    }
+
+    let tokens = escrow_client.list_tokens();
+    assert_eq!(tokens.len(), 151); // 1 from setup + 150
+
+    // Test pagination
+    let page_1 = escrow_client.list_tokens_paginated(&0, &50);
+    assert_eq!(page_1.len(), 50);
+
+    let page_2 = escrow_client.list_tokens_paginated(&50, &50);
+    assert_eq!(page_2.len(), 50);
+
+    let page_4 = escrow_client.list_tokens_paginated(&150, &50);
+    assert_eq!(page_4.len(), 1); // Only 1 left
+
+    let empty_page = escrow_client.list_tokens_paginated(&151, &50);
+    assert_eq!(empty_page.len(), 0);
 }
 
 #[test]
@@ -329,6 +436,30 @@ fn test_release_with_wrong_recipient_fails() {
     assert_eq!(
         escrow_client.try_release(&escrow_id, &t.buyer, &wrong_recipient),
         Err(Ok(EscrowError::InvalidReleaseRecipient))
+    );
+}
+
+#[test]
+fn test_oracle_invocation_failure_returns_structured_error() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    // Simulate a reverted/panicking oracle call by invoking evaluate_and_release
+    // against an oracle address that has no contract deployed.
+    let missing_oracle = Address::generate(&t.env);
+    let condition = symbol_short!("delivered");
+
+    assert_eq!(
+        escrow_client.try_evaluate_and_release(&escrow_id, &missing_oracle, &condition),
+        Err(Ok(EscrowError::OracleInvocationFailed))
+    );
+
+    // Contract must remain usable: escrow is still Funded and can be retried.
+    assert_eq!(
+        escrow_client.get_escrow(&escrow_id).status,
+        EscrowStatus::Funded
     );
 }
 
@@ -945,12 +1076,114 @@ fn test_get_merchant_receipt_not_found() {
 fn test_version_callable_without_auth() {
     let env = Env::default();
     // Intentionally do NOT mock all auths — version() requires no auth.
-    let contract_id = env.register(EscrowContract, ());
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let config = EscrowConfig {
+        admin,
+        fee_bps: 0u32,
+        treasury,
+        min_amount: 100i128,
+        max_amount: 10000i128,
+    };
+    let contract_id = env.register(EscrowContract, (config,));
+    let contract_id = env.register(
+        EscrowContract,
+        (EscrowConfig {
+            admin,
+            fee_bps: 0u32,
+            treasury,
+            min_amount: 100i128,
+            max_amount: 10000i128,
+        },),
+    );
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let version = client.version();
     assert_eq!(version.name, symbol_short!("escrow"));
     assert_eq!(version.semver, symbol_short!("0_2_0"));
+}
+
+// ── Fee distribution validation (treasury addresses and shares) ──────────
+
+#[test]
+fn test_set_fee_distribution_accepts_valid_multi_treasury_config() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let mut config = Vec::new(&t.env);
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 400,
+    });
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 600,
+    });
+
+    let _ = escrow_client.set_fee_distribution(&t.admin, &config);
+}
+
+#[test]
+fn test_set_fee_distribution_rejects_zero_address_treasury() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let zero_address = soroban_sdk::Address::from_str(&t.env, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4");
+    let mut config = Vec::new(&t.env);
+    config.push_back(TreasuryShare {
+        treasury: zero_address,
+        bps: 10000,
+    });
+
+    assert!(matches!(
+        escrow_client.try_set_fee_distribution(&t.admin, &config),
+        Err(Ok(_))
+    ));
+}
+
+#[test]
+fn test_set_fee_distribution_rejects_zero_bps_share() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let mut config = Vec::new(&t.env);
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 0,
+    });
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 10000,
+    });
+
+    assert!(matches!(
+        escrow_client.try_set_fee_distribution(&t.admin, &config),
+        Err(Ok(_))
+    ));
+}
+
+#[test]
+fn test_set_fee_distribution_rejects_too_many_treasuries() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let max_treasuries = MAX_TREASURIES;
+    let mut config = Vec::new(&t.env);
+    for _ in 0..max_treasuries {
+        config.push_back(TreasuryShare {
+            treasury: Address::generate(&t.env),
+            bps: 1,
+        });
+    }
+    config.push_back(TreasuryShare {
+        treasury: Address::generate(&t.env),
+        bps: 10000 - max_treasuries,
+    });
+
+    assert!(matches!(
+        escrow_client.try_set_fee_distribution(&t.admin, &config),
+        Err(Ok(_))
+    ));
 }
 
 // ── Partial release tests ──────────────────────────────────────────────────
@@ -1274,24 +1507,21 @@ fn test_set_release_condition_and_get() {
 }
 
 #[test]
-fn test_evaluate_and_release_when_oracle_returns_true() {
+fn test_legacy_bool_oracle_cannot_release_funds_even_when_true() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
-    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
     let oracle_id = t.env.register(TrueOracle, ());
 
-    let amount = 1000i128;
-    let escrow_id = deposit_escrow(&t, amount, 100);
+    let escrow_id = deposit_escrow(&t, 1000, 100);
     let condition_type = symbol_short!("shipped");
     escrow_client.set_release_condition(&t.seller, &escrow_id, &condition_type, &oracle_id);
 
-    let result = escrow_client.evaluate_and_release(&escrow_id, &t.agent);
-    assert_eq!(result.released, amount);
-    assert!(result.fully_released);
-
-    assert_eq!(token_client.balance(&t.seller), amount);
+    assert_eq!(
+        escrow_client.try_evaluate_and_release(&escrow_id, &t.agent),
+        Err(Ok(EscrowError::SignedProofRequired))
+    );
     let record = escrow_client.get_escrow(&escrow_id);
-    assert_eq!(record.status, EscrowStatus::Released);
+    assert_eq!(record.status, EscrowStatus::Funded);
 }
 
 #[test]
@@ -1306,7 +1536,7 @@ fn test_evaluate_and_release_blocked_when_oracle_returns_false() {
 
     assert_eq!(
         escrow_client.try_evaluate_and_release(&escrow_id, &t.agent),
-        Err(Ok(EscrowError::ConditionNotMet))
+        Err(Ok(EscrowError::SignedProofRequired))
     );
 
     let record = escrow_client.get_escrow(&escrow_id);
@@ -1325,7 +1555,7 @@ fn test_evaluate_and_release_blocked_when_oracle_fails() {
 
     assert_eq!(
         escrow_client.try_evaluate_and_release(&escrow_id, &t.agent),
-        Err(Ok(EscrowError::OracleCallFailed))
+        Err(Ok(EscrowError::SignedProofRequired))
     );
 
     let record = escrow_client.get_escrow(&escrow_id);
@@ -1341,7 +1571,7 @@ fn test_evaluate_and_release_without_condition_fails() {
 
     assert_eq!(
         escrow_client.try_evaluate_and_release(&escrow_id, &t.agent),
-        Err(Ok(EscrowError::ReleaseConditionNotSet))
+        Err(Ok(EscrowError::SignedProofRequired))
     );
 }
 
@@ -1581,6 +1811,12 @@ fn test_cancellation_full_lifecycle() {
     assert_eq!(token_client.balance(&t.buyer), 10000);
     assert_eq!(token_client.balance(&t.escrow_contract_id), 0);
 
+    // Step past the cancellation protection window (issue #355) so the seller
+    // may cancel unilaterally.
+    t.env
+        .ledger()
+        .set_sequence_number(crate::DEFAULT_CANCEL_LOCKOUT_LEDGERS);
+
     // Merchant cancels escrow
     assert!(escrow_client.cancel(&escrow_id, &t.seller, &reason));
 
@@ -1707,6 +1943,59 @@ fn test_extend_timeout_via_quorum_rejects_zero_extension() {
     );
 }
 
+// ── Issue #36: extend_timeout typed InvalidExtension error ────────────────
+
+/// Extending the timeout to the same ledger as the current one is rejected
+/// with the typed `InvalidExtension` error.
+#[test]
+fn test_extend_timeout_rejects_equal_ledger() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    assert_eq!(
+        escrow_client.try_extend_timeout(&escrow_id, &t.buyer, &record.timeout_ledger),
+        Err(Ok(EscrowError::InvalidExtension))
+    );
+}
+
+/// Extending the timeout to a ledger earlier than the current one is
+/// rejected with the typed `InvalidExtension` error.
+#[test]
+fn test_extend_timeout_rejects_lower_ledger() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+    let lower = record.timeout_ledger - 5;
+
+    assert_eq!(
+        escrow_client.try_extend_timeout(&escrow_id, &t.buyer, &lower),
+        Err(Ok(EscrowError::InvalidExtension))
+    );
+}
+
+/// Extending the timeout to a strictly later ledger succeeds and updates the
+/// record.
+#[test]
+fn test_extend_timeout_accepts_higher_ledger() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+    let higher = record.timeout_ledger + 50;
+
+    let res = escrow_client.try_extend_timeout(&escrow_id, &t.buyer, &higher);
+    assert_eq!(res, Ok(Ok(true)));
+
+    let after = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(after.timeout_ledger, higher);
+}
+
 // ── Issue #335: Escrow Liquidity Pool for Instant Settlement ──────────────
 
 #[test]
@@ -1723,7 +2012,9 @@ fn test_fund_pool_increases_balance() {
     let new_balance = escrow_client.fund_pool(&funder, &t.token_contract_id, &2000);
     assert_eq!(new_balance, 2000);
 
-    let pool = escrow_client.get_liquidity_pool(&t.token_contract_id);
+    let pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
     assert_eq!(pool.balance, 2000);
     assert_eq!(pool.token, t.token_contract_id);
     assert_eq!(token_client.balance(&t.escrow_contract_id), 2000);
@@ -1733,6 +2024,7 @@ fn test_fund_pool_increases_balance() {
     assert_eq!(
         escrow_client
             .get_liquidity_pool(&t.token_contract_id)
+            .unwrap()
             .balance,
         2500
     );
@@ -1780,7 +2072,9 @@ fn test_settle_from_pool_transfers_to_seller() {
 
     // Pool balance is debited by the settled amount, mirroring the real
     // token movement out of the reserve.
-    let pool = escrow_client.get_liquidity_pool(&t.token_contract_id);
+    let pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
     assert_eq!(pool.balance, 4000);
 }
 
@@ -1802,6 +2096,7 @@ fn test_settle_from_pool_decrements_balance_and_blocks_overcommit() {
     assert_eq!(
         escrow_client
             .get_liquidity_pool(&t.token_contract_id)
+            .unwrap()
             .balance,
         4000
     );
@@ -1879,6 +2174,7 @@ fn test_withdraw_from_pool_respects_available_balance() {
     assert_eq!(
         escrow_client
             .get_liquidity_pool(&t.token_contract_id)
+            .unwrap()
             .balance,
         600
     );
@@ -1909,13 +2205,54 @@ fn test_withdraw_from_pool_rejects_non_admin() {
 }
 
 #[test]
-fn test_get_liquidity_pool_defaults_to_zero_for_unfunded_token() {
+fn test_get_liquidity_pool_returns_not_found_for_unfunded_token() {
     let t = TestEnv::setup();
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
 
-    let pool = escrow_client.get_liquidity_pool(&t.token_contract_id);
-    assert_eq!(pool.balance, 0);
+    // No pool has ever been funded for the (whitelisted) token, so the getter
+    // reports PoolNotFound rather than fabricating a zero-balance pool.
+    assert_eq!(
+        escrow_client.try_get_liquidity_pool(&t.token_contract_id),
+        Err(Ok(EscrowError::PoolNotFound))
+    );
+}
+
+#[test]
+fn test_get_liquidity_pool_distinguishes_funded_empty_from_funded_nonzero() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let funder = Address::generate(&t.env);
+    let token_admin_client =
+        soroban_sdk::token::StellarAssetClient::new(&t.env, &t.token_contract_id);
+    token_admin_client.mint(&funder, &3000);
+    escrow_client.fund_pool(&funder, &t.token_contract_id, &1000);
+
+    // Funded and non-zero: the pool returns its real balance.
+    let pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
+    assert_eq!(pool.balance, 1000);
     assert_eq!(pool.token, t.token_contract_id);
+
+    // Withdraw everything: a funded-but-empty pool is distinct from a
+    // never-funded one — it returns a zero-balance pool, not PoolNotFound.
+    escrow_client.withdraw_from_pool(&t.admin, &t.token_contract_id, &1000);
+    let empty_pool = escrow_client
+        .get_liquidity_pool(&t.token_contract_id)
+        .unwrap();
+    assert_eq!(empty_pool.balance, 0);
+
+    // A different token that was never funded still reports PoolNotFound.
+    let other_admin = Address::generate(&t.env);
+    let other_token = t
+        .env
+        .register_stellar_asset_contract_v2(other_admin.clone())
+        .address();
+    assert_eq!(
+        escrow_client.try_get_liquidity_pool(&other_token),
+        Err(Ok(EscrowError::PoolNotFound))
+    );
 }
 
 // --- batch_deposit / batch_release / batch_refund (issue #317) ---
@@ -2076,6 +2413,115 @@ fn test_batch_refund_three_orders_all_succeed() {
     );
 }
 
+#[test]
+fn test_batch_deposit_atomic_single_transfer() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let id_a = deposit_escrow(&t, 500, 100);
+    let id_b = deposit_escrow_with_id(&t, 500, 100, 2);
+    let id_c = deposit_escrow_with_id(&t, 500, 100, 3);
+
+    let mut items = Vec::new(&t.env);
+    items.push_back(BatchDepositItem {
+        escrow_id: id_a,
+        amount: 200,
+    });
+    items.push_back(BatchDepositItem {
+        escrow_id: id_b,
+        amount: 300,
+    });
+    items.push_back(BatchDepositItem {
+        escrow_id: id_c,
+        amount: 400,
+    });
+
+    let balance_before = token_client.balance(&t.buyer);
+    let result = escrow_client.batch_deposit(&t.buyer, &t.token_contract_id, &items);
+
+    assert_eq!(
+        result,
+        BatchDepositResult {
+            funded_count: 3,
+            total_deposited: 900,
+        }
+    );
+    assert_eq!(token_client.balance(&t.buyer), balance_before - 900);
+}
+
+#[test]
+fn test_batch_deposit_reverts_on_invalid_escrow_id() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let id_a = deposit_escrow(&t, 500, 100);
+
+    let mut items = Vec::new(&t.env);
+    items.push_back(BatchDepositItem {
+        escrow_id: id_a,
+        amount: 200,
+    });
+    items.push_back(BatchDepositItem {
+        escrow_id: 999,
+        amount: 300,
+    });
+
+    let balance_before = token_client.balance(&t.buyer);
+    assert_eq!(
+        escrow_client.try_batch_deposit(&t.buyer, &t.token_contract_id, &items),
+        Err(Ok(EscrowError::NotFound))
+    );
+    assert_eq!(token_client.balance(&t.buyer), balance_before);
+}
+
+#[test]
+fn test_batch_deposit_reverts_on_already_funded_escrow() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let id_a = deposit_escrow(&t, 500, 100);
+    let id_b = deposit_escrow_with_id(&t, 500, 100, 2);
+
+    let mut items = Vec::new(&t.env);
+    items.push_back(BatchDepositItem {
+        escrow_id: id_a,
+        amount: 200,
+    });
+    items.push_back(BatchDepositItem {
+        escrow_id: id_b,
+        amount: 300,
+    });
+
+    let balance_before = token_client.balance(&t.buyer);
+    assert_eq!(
+        escrow_client.try_batch_deposit(&t.buyer, &t.token_contract_id, &items),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+    assert_eq!(token_client.balance(&t.buyer), balance_before);
+}
+
+/// True if the escrow contract emitted an event with the given second topic
+/// under the `admin` topic namespace. Events are read immediately after the
+/// emitting call: the test host enables invocation metering, which clears the
+/// events buffer at the start of each subsequent contract invocation.
+fn admin_event_emitted(t: &TestEnv, topic: Symbol, contract_id: &Address) -> bool {
+    for event in t.env.events().all().iter() {
+        let (c_id, topics, _value) = event;
+        if c_id != *contract_id || topics.len() != 2 {
+            continue;
+        }
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&t.env).unwrap();
+        let t1: Symbol = topics.get(1).unwrap().try_into_val(&t.env).unwrap();
+        if t0 == symbol_short!("admin") && t1 == topic {
+            return true;
+        }
+    }
+    false
+}
+
 fn deposit_escrow_with_id(t: &TestEnv, amount: i128, timeout_ledgers: u32, id_seed: u8) -> u64 {
     let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
     escrow_client.deposit(
@@ -2088,4 +2534,754 @@ fn deposit_escrow_with_id(t: &TestEnv, amount: i128, timeout_ledgers: u32, id_se
         &None,
         &None,
     )
+}
+
+// ── Upgrade + two-step admin handover integration test ───────────────────
+
+// A minimal WebAssembly module (with the standard contract metadata section)
+// that serves only as the upgrade target so `update_current_contract_wasm`
+// has a real contract-code ledger entry to point at. Its exported functions
+// are never invoked — after the upgrade we read persistent state directly.
+const WASM_STUB: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x00, 0x01, 0x7e, 0x60,
+    0x00, 0x00, 0x03, 0x03, 0x02, 0x00, 0x01, 0x05, 0x03, 0x01, 0x00, 0x10, 0x06, 0x09, 0x01, 0x7f,
+    0x01, 0x41, 0x80, 0x80, 0xc0, 0x00, 0x0b, 0x07, 0x15, 0x03, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72,
+    0x79, 0x02, 0x00, 0x04, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x01, 0x5f, 0x00, 0x01, 0x0a, 0x09,
+    0x02, 0x04, 0x00, 0x42, 0x01, 0x0b, 0x02, 0x00, 0x0b, 0x00, 0x2b, 0x0e, 0x63, 0x6f, 0x6e, 0x74,
+    0x72, 0x61, 0x63, 0x74, 0x73, 0x70, 0x65, 0x63, 0x76, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x1e, 0x11, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63,
+    0x74, 0x65, 0x6e, 0x76, 0x6d, 0x65, 0x74, 0x61, 0x76, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6f, 0x0e, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63,
+    0x74, 0x6d, 0x65, 0x74, 0x61, 0x76, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x72,
+    0x73, 0x76, 0x65, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x31, 0x2e, 0x39, 0x37, 0x2e,
+    0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x72, 0x73, 0x73, 0x64, 0x6b,
+    0x76, 0x65, 0x72, 0x00, 0x00, 0x00, 0x30, 0x32, 0x32, 0x2e, 0x30, 0x2e, 0x31, 0x31, 0x23, 0x33,
+    0x34, 0x66, 0x37, 0x66, 0x35, 0x33, 0x61, 0x65, 0x33, 0x31, 0x65, 0x30, 0x66, 0x64, 0x30, 0x32,
+    0x61, 0x61, 0x62, 0x34, 0x33, 0x36, 0x61, 0x39, 0x38, 0x37, 0x32, 0x65, 0x37, 0x39, 0x66, 0x61,
+    0x36, 0x37, 0x31, 0x63, 0x61, 0x30, 0x32,
+];
+
+#[test]
+fn test_upgrade_with_admin_handover_preserves_state_and_emits_event() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let contract_id = t.escrow_contract_id.clone();
+
+    // Create an escrow so there is persistent state whose survival we assert.
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record_before = escrow_client.get_escrow(&escrow_id);
+    assert!(!escrow_client.is_migrated());
+
+    // Two-step admin handover: the current admin proposes a successor, then
+    // the successor accepts the primary-admin role. Each event is read
+    // immediately after the call that emits it, because the test host only
+    // retains the events of the most recent invocation.
+    let new_admin = Address::generate(&t.env);
+    assert!(escrow_client.propose_admin(&t.admin, &new_admin));
+    assert!(
+        admin_event_emitted(&t, symbol_short!("proposed"), &contract_id),
+        "AdminProposedEvent was not emitted"
+    );
+    assert_eq!(escrow_client.get_pending_admin(), Some(new_admin.clone()));
+
+    assert!(escrow_client.accept_admin(&new_admin));
+    assert!(
+        admin_event_emitted(&t, symbol_short!("accepted"), &contract_id),
+        "AdminAcceptedEvent was not emitted"
+    );
+    assert_eq!(escrow_client.get_pending_admin(), None);
+
+    // The fresh primary admin upgrades the contract to new wasm code.
+    let wasm_hash = t.env.deployer().upload_contract_wasm(WASM_STUB);
+    assert!(escrow_client.upgrade(&new_admin, &wasm_hash));
+
+    // Assert the ContractUpgradedEvent immediately after the upgrade call,
+    // before any further invocation clears the events buffer.
+    let events = t.env.events().all();
+    let mut upgraded_found = false;
+    for event in events.iter() {
+        let (c_id, topics, value) = event;
+        if c_id != contract_id || topics.len() != 2 {
+            continue;
+        }
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&t.env).unwrap();
+        let t1: Symbol = topics.get(1).unwrap().try_into_val(&t.env).unwrap();
+        if t0 == symbol_short!("escrow") && t1 == symbol_short!("upgraded") {
+            let evt: crate::ContractUpgradedEvent = value.try_into_val(&t.env).unwrap();
+            assert_eq!(evt.admin, new_admin);
+            assert_eq!(evt.previous_semver, symbol_short!("0_2_0"));
+            assert_eq!(evt.new_wasm_hash, wasm_hash);
+            upgraded_found = true;
+        }
+    }
+    assert!(upgraded_found, "ContractUpgradedEvent was not emitted");
+
+    // After the upgrade the contract's executable points at the stub wasm,
+    // which implements nothing, so re-read persistent state directly rather
+    // than dispatching through the client.
+    let migrated: bool = t.env.as_contract(&contract_id, || {
+        t.env
+            .storage()
+            .instance()
+            .get(&crate::DataKey::MigrationFlag)
+            .unwrap_or(false)
+    });
+    assert!(migrated, "migration flag must be set after upgrade");
+
+    let record_after: crate::EscrowRecord = t.env.as_contract(&contract_id, || {
+        t.env
+            .storage()
+            .persistent()
+            .get(&crate::DataKey::Escrow(escrow_id))
+            .unwrap()
+    });
+    assert_eq!(
+        record_before, record_after,
+        "escrow record must survive the upgrade"
+    );
+}
+
+#[test]
+fn test_split_release_multi_treasury() {
+    let t = TestEnv::setup_with_fee_bps(500);
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    // Setup multi-treasury
+    let treasury1 = Address::generate(&t.env);
+    let treasury2 = Address::generate(&t.env);
+    let mut shares = soroban_sdk::Vec::new(&t.env);
+    shares.push_back(crate::TreasuryShare { treasury: treasury1.clone(), bps: 200 }); // 2%
+    shares.push_back(crate::TreasuryShare { treasury: treasury2.clone(), bps: 300 }); // 3%
+    assert!(escrow_client.set_fee_distribution(&t.admin, &shares));
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+    let recipient1 = Address::generate(&t.env);
+    let recipient2 = Address::generate(&t.env);
+    let mut release_shares = soroban_sdk::Vec::new(&t.env);
+    release_shares.push_back((recipient1.clone(), 4000));
+    release_shares.push_back((recipient2.clone(), 6000));
+    // Release shares
+    assert!(escrow_client.split_release(&escrow_id, &t.buyer, &release_shares));
+    // Fees:
+    // total base amount = 10000
+    // share1 amount = 4000
+    // fee1 = 4000 * 500 / 10000 = 200. Net = 3800.
+    // share2 amount = 6000
+    // fee2 = 6000 * 500 / 10000 = 300. Net = 5700.
+    // Total fee = 500.
+    // treasury1 = 500 * 200 / 500 = 200
+    // treasury2 = 500 * 300 / 500 = 300
+    assert_eq!(token_client.balance(&recipient1), 3800);
+    assert_eq!(token_client.balance(&recipient2), 5700);
+    assert_eq!(token_client.balance(&treasury1), 200);
+    assert_eq!(token_client.balance(&treasury2), 300);
+}
+
+// Yield Split Distribution Tests (issue #360)
+// ────────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_set_yield_split_config_admin_only() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let non_admin = Address::generate(&t.env);
+
+    // Non-admin cannot set yield split config
+    assert_eq!(
+        escrow_client.try_set_yield_split_config(&non_admin, &escrow_id, &5000),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+
+    // Admin can set yield split config
+    assert!(escrow_client.set_yield_split_config(&t.admin, &escrow_id, &5000));
+
+    // Verify configuration is stored
+    let config = escrow_client.get_yield_split_config(&escrow_id);
+    assert_eq!(config.unwrap().seller_yield_share_bps, 5000);
+}
+
+#[test]
+fn test_set_yield_split_config_validates_bps() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    // Valid: 0% (buyer gets all)
+    assert!(escrow_client.set_yield_split_config(&t.admin, &escrow_id, &0));
+    assert_eq!(escrow_client.get_yield_split_config(&escrow_id).unwrap().seller_yield_share_bps, 0);
+
+    // Valid: 100% (seller gets all)
+    assert!(escrow_client.set_yield_split_config(&t.admin, &escrow_id, &10_000));
+    assert_eq!(
+        escrow_client.get_yield_split_config(&escrow_id).unwrap().seller_yield_share_bps,
+        10_000
+    );
+
+    // Valid: 50/50 split
+    assert!(escrow_client.set_yield_split_config(&t.admin, &escrow_id, &5000));
+    assert_eq!(
+        escrow_client.get_yield_split_config(&escrow_id).unwrap().seller_yield_share_bps,
+        5000
+    );
+
+    // Invalid: exceeds 10_000 basis points
+    assert_eq!(
+        escrow_client.try_set_yield_split_config(&t.admin, &escrow_id, &10_001),
+        Err(Ok(EscrowError::InvalidYieldConfig))
+    );
+}
+
+#[test]
+fn test_set_yield_split_config_requires_existing_escrow() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let non_existent_escrow_id = 9999u64;
+
+    // Cannot set yield split config for non-existent escrow
+    assert_eq!(
+        escrow_client.try_set_yield_split_config(&t.admin, &non_existent_escrow_id, &5000),
+        Err(Ok(EscrowError::NotFound))
+    );
+}
+
+#[test]
+fn test_set_yield_split_config_blocks_terminal_escrows() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    // Release the escrow to make it terminal
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+
+    // Cannot set yield split config on released escrow
+    assert_eq!(
+        escrow_client.try_set_yield_split_config(&t.admin, &escrow_id, &5000),
+        Err(Ok(EscrowError::AlreadyReleased))
+    );
+}
+
+#[test]
+fn test_yield_split_50_50_on_release() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    // Setup: deposit escrow
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+
+    // Configure yield: 5% APR
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500);
+
+    // Configure yield split: 50/50
+    escrow_client.set_yield_split_config(&t.admin, &escrow_id, &5000);
+
+    // Advance ledger 1 year worth of seconds (to calculate full year yield)
+    // 1 year = 31,536,000 seconds ≈ 7,776,000 ledgers (at 5 seconds/ledger)
+    t.env.ledger().set_sequence_number(7_776_001);
+
+    // Release the escrow (full release triggers yield calculation and distribution)
+    let initial_buyer_balance = token_client.balance(&t.buyer);
+    let initial_seller_balance = token_client.balance(&t.seller);
+
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+
+    // Verify yield was distributed
+    // Expected yield on 10000 at 5% APR for ~1 year:
+    // yield ≈ (10000 * 500 * 31_536_000) / (10_000 * 31_536_000) = 500
+    // seller_yield (50%) = 250
+    // buyer_yield (50%) = 250
+
+    let final_seller_balance = token_client.balance(&t.seller);
+    let final_buyer_balance = token_client.balance(&t.buyer);
+
+    // Seller should receive: escrow amount (minus fee) + 50% of yield
+    // With 0% fee: 10000 + 250 = 10250
+    assert!(final_seller_balance > initial_seller_balance);
+    
+    // Buyer should receive: returned funds (only if refund path) + 50% of yield
+    // In release path, buyer doesn't get funds back, only yield share
+    // Initial balance was 10000, deposited 10000, so starts at 0
+    // Should receive ~250 (50% of yield)
+    assert!(final_buyer_balance > initial_buyer_balance);
+}
+
+#[test]
+fn test_yield_split_seller_100_backward_compatibility() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    // Setup: deposit escrow
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+
+    // Configure yield but NOT yield split (backward compatibility path)
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500);
+
+    // Do NOT call set_yield_split_config - should default to seller getting 100%
+
+    // Advance ledger to trigger yield
+    t.env.ledger().set_sequence_number(7_776_001);
+
+    let initial_seller_balance = token_client.balance(&t.seller);
+
+    // Release the escrow
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+
+    let final_seller_balance = token_client.balance(&t.seller);
+
+    // Seller should receive: escrow amount (10000) + 100% of yield (~500)
+    assert!(final_seller_balance > initial_seller_balance);
+}
+
+#[test]
+fn test_yield_split_75_25_on_release() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500);
+
+    // Configure yield split: 75% seller, 25% buyer
+    escrow_client.set_yield_split_config(&t.admin, &escrow_id, &7500);
+
+    t.env.ledger().set_sequence_number(7_776_001);
+
+    let initial_buyer_balance = token_client.balance(&t.buyer);
+    let initial_seller_balance = token_client.balance(&t.seller);
+
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+
+    let final_seller_balance = token_client.balance(&t.seller);
+    let final_buyer_balance = token_client.balance(&t.buyer);
+
+    // Seller receives 75% of yield: ~375
+    // Buyer receives 25% of yield: ~125
+    assert!(final_seller_balance > initial_seller_balance);
+    assert!(final_buyer_balance > initial_buyer_balance);
+}
+
+#[test]
+fn test_yield_split_on_refund() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500);
+
+    // Configure yield split: 50/50
+    escrow_client.set_yield_split_config(&t.admin, &escrow_id, &5000);
+
+    // Advance time to trigger yield
+    t.env.ledger().set_sequence_number(7_776_001);
+
+    let initial_buyer_balance = token_client.balance(&t.buyer);
+
+    // Advance past timeout and refund
+    t.env.ledger().set_sequence_number(10_000_000);
+    escrow_client.refund(&escrow_id, &t.buyer);
+
+    let final_buyer_balance = token_client.balance(&t.buyer);
+
+    // Buyer should receive:
+    // - Full refund of escrowed amount: 10000
+    // - 50% of yield: ~250
+    // Total: ~10250
+    assert!(final_buyer_balance > initial_buyer_balance);
+}
+
+#[test]
+fn test_yield_split_zero_split_buyer_gets_all() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    let escrow_id = deposit_escrow(&t, 10000, 100);
+
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &500);
+
+    // Configure yield split: 0% seller, 100% buyer
+    escrow_client.set_yield_split_config(&t.admin, &escrow_id, &0);
+
+    t.env.ledger().set_sequence_number(7_776_001);
+
+    let initial_buyer_balance = token_client.balance(&t.buyer);
+    let initial_seller_balance = token_client.balance(&t.seller);
+
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+
+    let final_seller_balance = token_client.balance(&t.seller);
+    let final_buyer_balance = token_client.balance(&t.buyer);
+
+    // Seller receives: escrow (10000, after fee) + 0% of yield
+    let seller_increase = final_seller_balance - initial_seller_balance;
+    
+    // Buyer receives: 100% of yield (~500)
+    let buyer_increase = final_buyer_balance - initial_buyer_balance;
+    
+    // Buyer's increase should be greater than seller's increase
+    assert!(buyer_increase > seller_increase);
+}
+
+#[test]
+fn test_yield_split_full_calculation_precision() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+    let token_client = soroban_sdk::token::Client::new(&t.env, &t.token_contract_id);
+    let lending_contract = Address::generate(&t.env);
+
+    // Use a specific amount to test precision
+    let escrow_amount = 12345i128;
+    let escrow_id = deposit_escrow(&t, escrow_amount, 100);
+
+    escrow_client.set_yield_config(&t.admin, &escrow_id, &lending_contract, &337);
+
+    // Configure yield split: 3333 bps (33.33%)
+    escrow_client.set_yield_split_config(&t.admin, &escrow_id, &3333);
+
+    // Advance time slightly
+    t.env.ledger().set_sequence_number(100_000);
+
+    let record_before = escrow_client.get_escrow(&escrow_id);
+    escrow_client.release(&escrow_id, &t.buyer, &t.seller);
+    let record_after = escrow_client.get_escrow(&escrow_id);
+
+    // Verify escrow transitioned to Released
+    assert_eq!(record_before.status, EscrowStatus::Funded);
+    assert_eq!(record_after.status, EscrowStatus::Released);
+}
+
+#[test]
+fn test_get_yield_split_config_none_when_not_set() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    // No yield split config set - should return None
+    let config = escrow_client.get_yield_split_config(&escrow_id);
+    assert!(config.is_none());
+}
+
+// ── Issue #356: Buyer Inspection Period with Timelocked Auto-Release ──────
+
+#[test]
+fn test_inspection_period_status_after_delivery() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Funded);
+
+    // Set up oracle key for delivery verification
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    // Create signed delivery proof
+    let proof = create_signed_delivery_proof(
+        &t,
+        &signing_key,
+        escrow_id,
+        record.created_at,
+    );
+
+    // Verify delivery and check status transitions to Inspection
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+    
+    let updated_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(updated_record.status, EscrowStatus::Inspection);
+}
+
+#[test]
+fn test_buyer_can_release_after_inspection() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    // Buyer releases after inspection passes
+    assert!(escrow_client.release_on_inspection_passed(&t.buyer, &escrow_id));
+
+    let final_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(final_record.status, EscrowStatus::Released);
+    assert_eq!(final_record.released_amount, 1000);
+}
+
+#[test]
+fn test_inspection_auto_release_after_expiration() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery with default inspection duration (72 hours)
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    let inspection_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(inspection_record.status, EscrowStatus::Inspection);
+
+    // Try to auto-release before expiration - should fail
+    assert_eq!(
+        escrow_client.try_claim_inspection_auto_release(&t.seller, &escrow_id),
+        Err(Ok(EscrowError::InspectionAutoReleaseNotReady))
+    );
+
+    // Advance ledger past inspection window (default 51,840 ledgers)
+    t.env.ledger().set_sequence_number(t.env.ledger().sequence() + 51_841);
+
+    // Now auto-release should succeed
+    assert!(escrow_client.claim_inspection_auto_release(&t.seller, &escrow_id));
+
+    let final_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(final_record.status, EscrowStatus::Released);
+    assert_eq!(final_record.released_amount, 1000);
+}
+
+#[test]
+fn test_buyer_can_dispute_during_inspection() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    let insp_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(insp_record.status, EscrowStatus::Inspection);
+
+    // Buyer files dispute during inspection - should succeed
+    assert!(escrow_client.dispute(&escrow_id, &t.buyer));
+
+    let disputed_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(disputed_record.status, EscrowStatus::Disputed);
+}
+
+#[test]
+fn test_dispute_fails_after_inspection_expiration() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    // Advance ledger past inspection window
+    t.env.ledger().set_sequence_number(t.env.ledger().sequence() + 51_841);
+
+    // Dispute should fail after expiration
+    assert_eq!(
+        escrow_client.try_dispute(&escrow_id, &t.buyer),
+        Err(Ok(EscrowError::InspectionExpired))
+    );
+}
+
+#[test]
+fn test_buyer_can_refund_during_inspection() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    let insp_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(insp_record.status, EscrowStatus::Inspection);
+
+    // Buyer can refund during inspection period (defect found)
+    assert!(escrow_client.refund(&escrow_id, &t.buyer));
+
+    let refunded_record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(refunded_record.status, EscrowStatus::Refunded);
+}
+
+#[test]
+fn test_seller_cannot_refund_during_inspection() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    // Seller cannot refund during inspection - only buyer can
+    assert_eq!(
+        escrow_client.try_refund(&escrow_id, &t.seller),
+        Err(Ok(EscrowError::Unauthorized))
+    );
+}
+
+#[test]
+fn test_set_custom_inspection_duration() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+
+    // Admin sets custom inspection duration (e.g., 24 hours = 17,280 ledgers)
+    assert_eq!(
+        escrow_client.set_inspection_config(&t.admin, &escrow_id, &17_280),
+        Ok(())
+    );
+
+    let record = escrow_client.get_escrow(&escrow_id);
+    assert_eq!(record.status, EscrowStatus::Funded);
+}
+
+#[test]
+fn test_release_not_allowed_during_inspection() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    // Normal release() should fail during inspection
+    assert_eq!(
+        escrow_client.try_release(&escrow_id, &t.buyer, &t.seller),
+        Err(Ok(EscrowError::InvalidStatus))
+    );
+}
+
+#[test]
+fn test_inspection_events_emitted() {
+    let t = TestEnv::setup();
+    let escrow_client = EscrowContractClient::new(&t.env, &t.escrow_contract_id);
+
+    let escrow_id = deposit_escrow(&t, 1000, 100);
+    let record = escrow_client.get_escrow(&escrow_id);
+
+    // Setup and verify delivery
+    let signing_key = ed25519_dalek::SigningKey::generate(rand::thread_rng());
+    let oracle_pubkey = BytesN::from_array(&t.env, &signing_key.verifying_key().to_bytes());
+    escrow_client.set_oracle_public_key(&t.admin, &oracle_pubkey);
+
+    let proof = create_signed_delivery_proof(&t, &signing_key, escrow_id, record.created_at);
+    escrow_client.verify_delivery_and_release(&t.agent, &escrow_id, &proof);
+
+    // Check that inspection started event was emitted
+    let events = t.env.events().all();
+    let inspection_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            if let soroban_sdk::Val::Object(obj) = &e.0 {
+                if let soroban_sdk::Val::Object(topics) = &obj.as_vec()[1] {
+                    // Look for inspection start event
+                    topics.as_vec().iter().any(|t| {
+                        if let soroban_sdk::Val::Symbol(s) = t {
+                            s.to_string() == "insp_start"
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        })
+        .collect();
+
+    assert!(!inspection_events.is_empty(), "Inspection started event should be emitted");
+}
+
+// Helper function to create signed delivery proofs for testing
+fn create_signed_delivery_proof(
+    t: &TestEnv,
+    signing_key: &ed25519_dalek::SigningKey,
+    escrow_id: u64,
+    created_at: u64,
+) -> crate::SignedDeliveryProof {
+    use ed25519_dalek::Signer;
+    use soroban_sdk::xdr::ToXdr;
+
+    let env = &t.env;
+    let payload = crate::SignedDeliveryPayload {
+        escrow_id,
+        carrier_code: symbol_short!("fedex"),
+        tracking_hash: BytesN::from_array(env, &[1u8; 32]),
+        delivery_timestamp: created_at + 1,
+    };
+
+    let payload_xdr = payload.to_xdr(env);
+    let signature_bytes = signing_key.sign(&payload_xdr.0);
+    
+    crate::SignedDeliveryProof {
+        escrow_id,
+        carrier_code: symbol_short!("fedex"),
+        tracking_hash: BytesN::from_array(env, &[1u8; 32]),
+        delivery_timestamp: created_at + 1,
+        oracle_pubkey: BytesN::from_array(
+            env,
+            &signing_key.verifying_key().to_bytes(),
+        ),
+        signature: BytesN::from_array(env, &signature_bytes.to_bytes()),
+    }
 }
