@@ -351,6 +351,30 @@ pub struct AdminTransferredEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when an operation is attempted with an expired session.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionExpiredEvent {
+    /// Expiry ledger bound of the session.
+    pub expiry_ledger: u32,
+    /// Current ledger sequence when validation failed.
+    pub current_ledger: u32,
+    /// Wall-clock ledger timestamp when validation was attempted.
+    pub timestamp: u64,
+}
+
+/// Ephemeral session bounds defining validity ledgers and spending capacity.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EphemeralSessionBounds {
+    /// Earliest valid ledger sequence (inclusive).
+    pub start_ledger: u32,
+    /// Latest valid ledger sequence (inclusive).
+    pub expiry_ledger: u32,
+    /// Maximum spending limit allowed during the session.
+    pub max_spending_limit: i128,
+}
+
 /// Topic 0 symbol for every event emitted by the delegation registry.
 pub const EVENT_TOPIC_CONTRACT: Symbol = symbol_short!("deleg");
 
@@ -443,6 +467,8 @@ pub enum DelegationError {
     SubAccountNotActive = 4018,
     /// The delegation does not match the sub-account.
     DelegationMismatch = 4019,
+    /// The session has expired or is not yet valid.
+    SessionExpired = 4020,
 }
 
 /// The delegation registry contract.
@@ -2216,6 +2242,59 @@ impl DelegationRegistry {
             PERSISTENT_BUMP_AMOUNT,
         );
     }
+
+    /// Validates an ephemeral session strictly against the current ledger sequence,
+    /// enforcing `start_ledger <= current_ledger && current_ledger <= expiry_ledger`.
+    ///
+    /// If `current_ledger > bounds.expiry_ledger`, emits a [`SessionExpiredEvent`]
+    /// before returning `Err(DelegationError::SessionExpired)`.
+    /// If `current_ledger < bounds.start_ledger`, returns `Err(DelegationError::NotActive)`
+    /// without emitting an expiration event.
+    pub fn validate_session(
+        env: Env,
+        bounds: EphemeralSessionBounds,
+    ) -> Result<bool, DelegationError> {
+        let current_ledger = env.ledger().sequence();
+        if current_ledger > bounds.expiry_ledger {
+            env.events().publish(
+                (EVENT_TOPIC_CONTRACT, symbol_short!("sess_exp")),
+                SessionExpiredEvent {
+                    expiry_ledger: bounds.expiry_ledger,
+                    current_ledger,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            return Err(DelegationError::SessionExpired);
+        }
+
+        if current_ledger < bounds.start_ledger {
+            return Err(DelegationError::NotActive);
+        }
+
+        Ok(true)
+    }
+
+    /// Dual check that strictly enforces Soroban ledger bounds for authorization
+    /// while validating against an estimated or expected wall-clock timestamp fallback
+    /// for UI-friendly display and user warnings.
+    ///
+    /// The ledger sequence check is definitive and immutable:
+    /// - If `current_ledger > bounds.expiry_ledger`, emits [`SessionExpiredEvent`] and fails.
+    /// - If `current_ledger < bounds.start_ledger`, fails with [`DelegationError::NotActive`].
+    ///
+    /// Returns `(is_valid, is_timestamp_valid)`. If the ledger bounds pass, `is_valid` is `true`.
+    /// `is_timestamp_valid` indicates whether `expected_timestamp >= env.ledger().timestamp()`
+    /// (or unexpired in wall-clock terms), allowing UI layers to detect skew or flag display warnings.
+    pub fn validate_session_dual(
+        env: Env,
+        bounds: EphemeralSessionBounds,
+        expected_timestamp: u64,
+    ) -> Result<(bool, bool), DelegationError> {
+        Self::validate_session(env.clone(), bounds)?;
+        let current_time = env.ledger().timestamp();
+        let is_timestamp_valid = expected_timestamp >= current_time;
+        Ok((true, is_timestamp_valid))
+    }
 }
 
 #[cfg(test)]
@@ -2247,6 +2326,7 @@ mod error_code_uniqueness_tests {
             (DelegationError::SubAccountNotFound, 4017u32),
             (DelegationError::SubAccountNotActive, 4018u32),
             (DelegationError::DelegationMismatch, 4019u32),
+            (DelegationError::SessionExpired, 4020u32),
         ];
 
         for (variant, expected) in codes {
@@ -2273,6 +2353,7 @@ mod error_code_uniqueness_tests {
             DelegationError::SubAccountNotFound as u32,
             DelegationError::SubAccountNotActive as u32,
             DelegationError::DelegationMismatch as u32,
+            DelegationError::SessionExpired as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {
