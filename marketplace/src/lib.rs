@@ -1417,3 +1417,54 @@ impl MarketplaceContract {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod error_code_uniqueness_tests {
+    use super::*;
+
+    fn marketplace_error_codes() -> [u32; 16] {
+        [
+            MarketplaceError::AlreadyInitialized as u32,
+            MarketplaceError::NotInitialized as u32,
+            MarketplaceError::Unauthorized as u32,
+            MarketplaceError::MerchantNotFound as u32,
+            MarketplaceError::AlreadyVerified as u32,
+            MarketplaceError::InvalidCommissionBps as u32,
+            MarketplaceError::DuplicateMerchantName as u32,
+            MarketplaceError::MerchantFrozen as u32,
+            MarketplaceError::MerchantClosed as u32,
+            MarketplaceError::VerifierAlreadyExists as u32,
+            MarketplaceError::VerifierNotFound as u32,
+            MarketplaceError::InsufficientVerifications as u32,
+            MarketplaceError::MetadataLockActive as u32,
+            MarketplaceError::InvalidCategory as u32,
+            MarketplaceError::InvalidParam as u32,
+            MarketplaceError::NoPendingAdmin as u32,
+        ]
+    }
+
+    #[test]
+    fn error_codes_are_unique() {
+        let codes = marketplace_error_codes();
+        // O(n²) uniqueness check — no std::collections needed in no_std crate.
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(
+                    codes[i],
+                    codes[j],
+                    "Duplicate MarketplaceError discriminant {} at indices {} and {}",
+                    codes[i],
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn error_codes_are_nonzero() {
+        for code in marketplace_error_codes() {
+            assert_ne!(code, 0, "MarketplaceError discriminant must not be zero");
+        }
+    }
+}
