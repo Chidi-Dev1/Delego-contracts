@@ -95,14 +95,55 @@ pub struct DiscoveryPage {
     pub next_cursor: Option<u64>,
 }
 
+/// Verification tier of a merchant, derived from its verification state and
+/// lifecycle status.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+#[repr(u32)]
+pub enum MerchantTier {
+    /// Not verified (or no longer in good standing).
+    Unverified = 0,
+    /// Verified and in good standing.
+    Verified = 1,
+    /// Verified and suspended (temporarily out of good standing).
+    Suspended = 2,
+    /// Permanently closed or banned.
+    Terminated = 3,
+}
+
+/// Consolidated operational snapshot of a merchant, returned by a single
+/// read call so external dApps do not need to stitch together several RPCs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub struct MerchantOperationalView {
-    pub id: u64,
-    pub name: String,
     pub status: MerchantStatus,
+    pub tier: MerchantTier,
     pub verified: bool,
-    pub effective: bool,
+    pub effective_fee_bps: u32,
+    pub bond_balance: i128,
+    pub dispute_count: u32,
+}
+
+/// Routing configuration for marketplace commission disbursements.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct TreasurySplitConfig {
+    pub dao_treasury: Address,
+    pub dao_bps: u32,
+    pub arbiter_pool: Address,
+    pub arbiter_bps: u32,
+    pub insurance_pool: Address,
+    pub insurance_bps: u32,
+}
+
+/// Liquidation reserve locked against a high-value order until maturity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct LiquidationReserve {
+    pub merchant: Address,
+    pub order_id: u64,
+    pub reserve_amount: i128,
+    pub unlock_ledger: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -367,6 +408,16 @@ pub struct MerchantAppealResolvedEvent {
     InvalidMaintenanceWindow = 4028,
     /// Stock reservation failed due to concurrent modifications.
     StockReservationFailed = 4029,
+    /// Treasury split configuration has not been set.
+    TreasurySplitNotConfigured = 4030,
+    /// Treasury split basis points do not sum to exactly 10,000.
+    InvalidTreasurySplit = 4031,
+    /// Liquidation reserve not found for the given order.
+    ReserveNotFound = 4032,
+    /// Liquidation reserve is still locked until its maturity ledger.
+    ReserveLocked = 4033,
+    /// Liquidation reserve has already been withdrawn or liquidated.
+    ReserveAlreadyReleased = 4034,
 }
 
 // --- Events ---
@@ -2600,6 +2651,273 @@ impl MarketplaceContract {
     pub fn get_commission(env: Env, merchant_id: u64) -> Result<u32, MarketplaceError> {
         let merchant = Self::get_merchant(env, merchant_id)?;
         Ok(merchant.commission_rate_bps)
+    }
+
+    // --- Operational view (issue #561) ---
+
+    /// Returns a consolidated operational snapshot of `merchant_id` in a
+    /// single read call: lifecycle status, verification tier, effective fee
+    /// rate, active bond balance and dispute count.
+    ///
+    /// Returns [`MarketplaceError::MerchantNotFound`] for unregistered ids.
+    pub fn get_merchant_operational_view(
+        env: Env,
+        merchant_id: u64,
+    ) -> Result<MerchantOperationalView, MarketplaceError> {
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
+
+        let tier = match merchant.status {
+            MerchantStatus::Closed | MerchantStatus::Banned => MerchantTier::Terminated,
+            MerchantStatus::Suspended => MerchantTier::Suspended,
+            _ if merchant.verified => MerchantTier::Verified,
+            _ => MerchantTier::Unverified,
+        };
+
+        let effective_fee_bps = merchant.commission_rate_bps.min(MAX_COMMISSION_BPS);
+
+        let bond_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantBond(merchant_id))
+            .unwrap_or(0i128);
+
+        let dispute_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantDisputeCount(merchant_id))
+            .unwrap_or(0u32);
+
+        Ok(MerchantOperationalView {
+            status: merchant.status,
+            tier,
+            verified: merchant.verified,
+            effective_fee_bps,
+            bond_balance,
+            dispute_count,
+        })
+    }
+
+    // --- Treasury split routing (issue #562) ---
+
+    /// Stores the treasury split configuration. Admin only.
+    pub fn set_treasury_split_config(
+        env: Env,
+        admin: Address,
+        config: TreasurySplitConfig,
+    ) -> Result<(), MarketplaceError> {
+        admin.require_auth();
+        if admin != Self::get_admin(env.clone())? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        if config
+            .dao_bps
+            .checked_add(config.arbiter_bps)
+            .and_then(|v| v.checked_add(config.insurance_bps))
+            != Some(10_000)
+        {
+            return Err(MarketplaceError::InvalidTreasurySplit);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TreasurySplit, &config);
+        Ok(())
+    }
+
+    /// Returns the configured treasury split, if any.
+    pub fn get_treasury_split_config(env: Env) -> Option<TreasurySplitConfig> {
+        env.storage().instance().get(&DataKey::TreasurySplit)
+    }
+
+    /// Routes `amount` of `token` held by the contract across the configured
+    /// DAO / arbiter / insurance pools. The rounding remainder is assigned to
+    /// the insurance pool so no tokens are left behind.
+    pub fn route_fee_disbursements(
+        env: Env,
+        token: Address,
+        amount: i128,
+    ) -> Result<(), MarketplaceError> {
+        if amount <= 0 {
+            return Err(MarketplaceError::InvalidParam);
+        }
+        let config: TreasurySplitConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::TreasurySplit)
+            .ok_or(MarketplaceError::TreasurySplitNotConfigured)?;
+
+        if config
+            .dao_bps
+            .checked_add(config.arbiter_bps)
+            .and_then(|v| v.checked_add(config.insurance_bps))
+            != Some(10_000)
+        {
+            return Err(MarketplaceError::InvalidTreasurySplit);
+        }
+
+        let dao_share = amount
+            .checked_mul(config.dao_bps as i128)
+            .ok_or(MarketplaceError::InvalidParam)?
+            / 10_000;
+        let arbiter_share = amount
+            .checked_mul(config.arbiter_bps as i128)
+            .ok_or(MarketplaceError::InvalidParam)?
+            / 10_000;
+        // Remainder (including rounding dust) goes to the insurance pool.
+        let insurance_share = amount - dao_share - arbiter_share;
+
+        let client = soroban_sdk::token::Client::new(&env, &token);
+        let from = env.current_contract_address();
+        if dao_share > 0 {
+            client.transfer(&from, &config.dao_treasury, &dao_share);
+        }
+        if arbiter_share > 0 {
+            client.transfer(&from, &config.arbiter_pool, &arbiter_share);
+        }
+        if insurance_share > 0 {
+            client.transfer(&from, &config.insurance_pool, &insurance_share);
+        }
+
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("fee_route")),
+            (token, amount, dao_share, arbiter_share, insurance_share),
+        );
+
+        Ok(())
+    }
+
+    // --- Liquidation reserve (issue #563) ---
+
+    /// Locks a 10% liquidation reserve for a high-value settlement.
+    ///
+    /// `settlement_amount` is the gross amount owed to the merchant; the
+    /// reserve is deducted from it and held by the contract until
+    /// `unlock_ledger`. Returns the reserve amount (0 when the order is below
+    /// [`HIGH_VALUE_THRESHOLD`]).
+    pub fn lock_reserve(
+        env: Env,
+        merchant: Address,
+        order_id: u64,
+        settlement_amount: i128,
+    ) -> Result<i128, MarketplaceError> {
+        if settlement_amount <= 0 {
+            return Err(MarketplaceError::InvalidParam);
+        }
+        if settlement_amount < HIGH_VALUE_THRESHOLD {
+            return Ok(0);
+        }
+        let reserve_amount = settlement_amount
+            .checked_mul(RESERVE_BPS as i128)
+            .ok_or(MarketplaceError::InvalidParam)?
+            / 10_000;
+        if reserve_amount <= 0 {
+            return Ok(0);
+        }
+        let unlock_ledger = env.ledger().sequence() + RESERVE_LOCK_LEDGERS;
+        let reserve = LiquidationReserve {
+            merchant: merchant.clone(),
+            order_id,
+            reserve_amount,
+            unlock_ledger,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::LiquidationReserve(order_id), &reserve);
+        env.storage().persistent().extend_ttl(
+            &DataKey::LiquidationReserve(order_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("res_lock"), order_id),
+            (merchant, reserve_amount, unlock_ledger),
+        );
+
+        Ok(reserve_amount)
+    }
+
+    /// Returns the liquidation reserve for `order_id`, if any.
+    pub fn get_liquidation_reserve(env: Env, order_id: u64) -> Option<LiquidationReserve> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LiquidationReserve(order_id))
+    }
+
+    /// Releases a matured reserve back to the merchant. Rejected before
+    /// `unlock_ledger`.
+    pub fn withdraw_reserve(
+        env: Env,
+        merchant: Address,
+        order_id: u64,
+        token: Address,
+    ) -> Result<i128, MarketplaceError> {
+        merchant.require_auth();
+        let reserve: LiquidationReserve = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidationReserve(order_id))
+            .ok_or(MarketplaceError::ReserveNotFound)?;
+        if reserve.merchant != merchant {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        if env.ledger().sequence() < reserve.unlock_ledger {
+            return Err(MarketplaceError::ReserveLocked);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::LiquidationReserve(order_id));
+
+        let client = soroban_sdk::token::Client::new(&env, &token);
+        client.transfer(
+            &env.current_contract_address(),
+            &merchant,
+            &reserve.reserve_amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("res_wd"), order_id),
+            (merchant, reserve.reserve_amount),
+        );
+
+        Ok(reserve.reserve_amount)
+    }
+
+    /// Arbiter-only: liquidates a reserve to refund the buyer in a dispute.
+    pub fn liquidate_reserve(
+        env: Env,
+        arbiter: Address,
+        order_id: u64,
+        buyer: Address,
+        token: Address,
+    ) -> Result<i128, MarketplaceError> {
+        arbiter.require_auth();
+        if !Self::is_admin_or_risk_oracle(&env, &arbiter)? {
+            return Err(MarketplaceError::Unauthorized);
+        }
+        let reserve: LiquidationReserve = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidationReserve(order_id))
+            .ok_or(MarketplaceError::ReserveNotFound)?;
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::LiquidationReserve(order_id));
+
+        let client = soroban_sdk::token::Client::new(&env, &token);
+        client.transfer(
+            &env.current_contract_address(),
+            &buyer,
+            &reserve.reserve_amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("mkplc"), symbol_short!("res_liq"), order_id),
+            (buyer, reserve.reserve_amount),
+        );
+
+        Ok(reserve.reserve_amount)
     }
 
     // --- Moderation / Security ---
@@ -5246,7 +5564,7 @@ mod merchant_operational_view_tests {
     }
 
     #[test]
-    fn operational_view_effective_matrix() {
+    fn operational_view_tier_matrix() {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
@@ -5254,28 +5572,79 @@ mod merchant_operational_view_tests {
         let client = MarketplaceContractClient::new(&env, &contract_id);
 
         let cases = [
-            (MerchantStatus::Registered, false, false),
-            (MerchantStatus::Registered, true, false),
-            (MerchantStatus::Verified, false, false),
-            (MerchantStatus::Verified, true, true),
-            (MerchantStatus::Suspended, false, false),
-            (MerchantStatus::Suspended, true, false),
-            (MerchantStatus::Closed, false, false),
-            (MerchantStatus::Closed, true, false),
+            (MerchantStatus::Registered, false, MerchantTier::Unverified),
+            (MerchantStatus::Registered, true, MerchantTier::Verified),
+            (MerchantStatus::Verified, false, MerchantTier::Unverified),
+            (MerchantStatus::Verified, true, MerchantTier::Verified),
+            (MerchantStatus::Suspended, false, MerchantTier::Suspended),
+            (MerchantStatus::Suspended, true, MerchantTier::Suspended),
+            (MerchantStatus::Closed, false, MerchantTier::Terminated),
+            (MerchantStatus::Closed, true, MerchantTier::Terminated),
+            (MerchantStatus::Banned, true, MerchantTier::Terminated),
         ];
 
-        for (i, (status, verified, effective)) in cases.iter().enumerate() {
+        for (i, (status, verified, tier)) in cases.iter().enumerate() {
             let id = i as u64 + 1;
             seed_merchant(&env, &contract_id, id, *status, *verified);
             let view = client.get_merchant_operational_view(&id);
             assert_eq!(view.status, *status);
             assert_eq!(view.verified, *verified);
-            assert_eq!(view.effective, *effective);
+            assert_eq!(view.tier, *tier);
+            assert_eq!(view.bond_balance, 0);
+            assert_eq!(view.dispute_count, 0);
         }
     }
 
     #[test]
-    fn suspend_keeps_verified_flag_but_not_effective() {
+    fn operational_view_unregistered_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let res = client.try_get_merchant_operational_view(&999);
+        assert_eq!(res, Err(Ok(MarketplaceError::MerchantNotFound)));
+    }
+
+    #[test]
+    fn operational_view_reports_fee_and_bond() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let params = RegisterParams {
+            name: String::from_str(&env, "Fee Merchant"),
+            description: String::from_str(&env, "desc"),
+            category: Symbol::new(&env, "general"),
+            image_url: String::from_str(&env, "https://example.com/img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 0,
+        };
+        let id = client.register_merchant(&owner, &params);
+        client.set_merchant_commission(&id, &admin, &250);
+
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantBond(id), &1_000i128);
+            env.storage()
+                .persistent()
+                .set(&DataKey::MerchantDisputeCount(id), &3u32);
+        });
+
+        let view = client.get_merchant_operational_view(&id);
+        assert_eq!(view.effective_fee_bps, 250);
+        assert_eq!(view.bond_balance, 1_000);
+        assert_eq!(view.dispute_count, 3);
+    }
+
+    #[test]
+    fn suspend_keeps_verified_flag_but_not_tier() {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
@@ -5306,6 +5675,6 @@ mod merchant_operational_view_tests {
         let view = client.get_merchant_operational_view(&id);
         assert_eq!(view.status, MerchantStatus::Suspended);
         assert!(view.verified);
-        assert!(!view.effective);
+        assert_eq!(view.tier, MerchantTier::Suspended);
     }
 }

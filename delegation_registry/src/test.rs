@@ -2207,3 +2207,139 @@ fn test_get_delegations_by_agent_bumps_ttl() {
     });
     assert!(refreshed_ttl > 17_280);
 }
+
+// ── Issue #574: V1 → V2 delegation storage migration ─────────────────────────
+
+/// Seeds a legacy V1 delegation record directly into storage, bypassing the
+/// contract entry points, so the lazy migration path is exercised on read.
+fn seed_v1_record(
+    env: &Env,
+    client: &DelegationRegistryClient<'static>,
+    owner: &Address,
+    agent_id: &BytesN<32>,
+    permissions_contract: &Address,
+    label: &Symbol,
+    ttl: u32,
+) -> u64 {
+    let id = 1u64;
+    let record = DelegationRecord {
+        id,
+        owner: owner.clone(),
+        agent_id: agent_id.clone(),
+        permissions_contract: permissions_contract.clone(),
+        status: DelegationStatus::Active,
+        label: label.clone(),
+        created_at: env.ledger().timestamp(),
+        updated_at: env.ledger().timestamp(),
+        expires_at_ledger: env.ledger().sequence() + ttl,
+        version: 1,
+        permissions: PermissionBitmask::all(),
+    };
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationV1(owner.clone()), &record);
+        env.storage().instance().set(&DataKey::NextId, &(id + 1));
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserDelegations(owner.clone()), &vec![env, id]);
+    });
+
+    id
+}
+
+#[test]
+fn test_v1_record_read_migrates_to_v2_without_panic() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "V1_Legacy");
+    let id = seed_v1_record(
+        &env,
+        &client,
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label,
+        &1000,
+    );
+
+    // Reading a V1 record must succeed seamlessly.
+    let record = client.get_delegation(&id);
+    assert_eq!(record.id, id);
+    assert_eq!(record.owner, owner);
+    assert_eq!(record.agent_id, agent_id);
+    assert_eq!(record.label, label);
+    assert_eq!(record.status, DelegationStatus::Active);
+    assert!(client.is_authorized(&id, &agent_id));
+
+    // The read must have lazily upgraded storage to the V2 schema.
+    env.as_contract(&client.address, || {
+        let v2: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationV2(owner.clone(), label.clone()))
+            .unwrap();
+        assert_eq!(v2.id, id);
+        assert_eq!(v2.status, DelegationStatus::Active);
+
+        // The V1 key must be gone.
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::DelegationV1(owner.clone())));
+
+        // The schema version must be recorded.
+        let schema_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap();
+        assert_eq!(schema_version, 2);
+    });
+}
+
+#[test]
+fn test_v1_record_write_upgrades_to_v2_preserving_active_state() {
+    let (env, client, _, owner, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+
+    let label = Symbol::new(&env, "V1_Write_Upgrade");
+    let id = seed_v1_record(
+        &env,
+        &client,
+        &owner,
+        &agent_id,
+        &permissions_contract,
+        &label,
+        &1000,
+    );
+
+    // A write to the legacy record must migrate it to V2.
+    client.pause_delegation(&id);
+
+    let record = client.get_delegation(&id);
+    assert_eq!(record.status, DelegationStatus::Paused);
+    assert_eq!(record.owner, owner);
+    assert_eq!(record.agent_id, agent_id);
+
+    env.as_contract(&client.address, || {
+        let v2: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationV2(owner.clone(), label.clone()))
+            .unwrap();
+        assert_eq!(v2.status, DelegationStatus::Paused);
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::DelegationV1(owner.clone())));
+        let schema_version: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap();
+        assert_eq!(schema_version, 2);
+    });
+}
