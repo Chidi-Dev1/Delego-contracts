@@ -87,7 +87,7 @@ pub struct ContractVersion {
 }
 
 #[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ReputationError {
     /// Reserved for API/ABI compatibility with issue #18's error contract.
@@ -95,25 +95,27 @@ pub enum ReputationError {
     /// `__constructor` (see [`ReputationContract::__constructor`]), which
     /// the host guarantees can run at most once, atomically with
     /// deployment — there is no second call for this to guard against.
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    Unauthorized = 3,
-    EntityNotFound = 4,
+    AlreadyInitialized = 0x0003_0001,
+    NotInitialized     = 0x0003_0002,
+    Unauthorized       = 0x0003_0003,
+    EntityNotFound     = 0x0003_0004,
     /// Same escrow_id already rated.
-    DuplicateRating = 5,
+    DuplicateRating    = 0x0003_0005,
     /// Rating out of range.
-    InvalidRating = 6,
-    EntityFrozen = 7,
+    InvalidRating      = 0x0003_0006,
+    EntityFrozen       = 0x0003_0007,
     /// Same reporter already flagged.
-    AlreadyFlagged = 8,
-    InvalidParam = 9,
+    AlreadyFlagged     = 0x0003_0008,
+    InvalidParam       = 0x0003_0009,
     /// resolve_flag called for a reporter whose flag is already resolved
     /// (or never existed) — distinguishes the "no active flag" case from
     /// the generic entity-not-found case.
-    NoActiveFlag = 10,
+    NoActiveFlag       = 0x0003_000A,
     /// resolve_flag called with a reporter that has no flag on this entity
     /// (someone else's flag cannot be resolved through this reporter).
-    NotFlagReporter = 11,
+    NotFlagReporter    = 0x0003_000B,
+    /// Transaction proof could not be verified against the escrow contract.
+    UnverifiedOrder    = 0x0003_000C,
 }
 
 #[contracttype]
