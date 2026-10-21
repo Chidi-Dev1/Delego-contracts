@@ -1,18 +1,17 @@
 use crate::{
-    AdminAcceptedEvent, AdminProposedEvent, CategoryChange, CategoryEntry, DataKey,
-    MarketplaceContract, MarketplaceContractClient, MarketplaceError, Merchant,
-    MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
-    MerchantRegisteredEvent, MerchantStats, MerchantStatus, MerchantValidationError,
-    RegisterParams, VerificationPolicy, Verifier, VerifierPage,
-    MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN, MAX_NAME_LEN, MAX_VERIFIERS,
-    normalize_symbol,
+    normalize_symbol, AdminAcceptedEvent, AdminProposedEvent, CategoryChange, CategoryEntry,
+    DataKey, MarketplaceContract, MarketplaceContractClient, MarketplaceError, Merchant,
+    MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView, MerchantRegisteredEvent,
+    MerchantStats, MerchantStatus, MerchantValidationError, RegisterParams, VerificationPolicy,
+    Verifier, VerifierPage, MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN, MAX_NAME_LEN,
+    MAX_VERIFIERS,
 };
 use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, TransactionOutcome,
 };
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Events as _, Ledger as _, storage::Persistent as _},
+    testutils::{storage::Persistent as _, Address as _, Events as _, Ledger as _},
     Address, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val,
 };
 
@@ -93,14 +92,18 @@ fn test_register_merchant_happy_path() {
         required_verifications: 1,
     };
 
-    let merchant_id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, &merchant_addr, &params);
+    let merchant_id =
+        crate::testutil::register_merchant_with_deposit(&f.env, &f.client, &merchant_addr, &params);
     assert_eq!(merchant_id, 1);
 
     let merchant = f.client.get_merchant(&merchant_id);
     assert_eq!(merchant.id, 1);
     assert_eq!(merchant.owner, Some(merchant_addr.clone()));
     assert_eq!(merchant.name, String::from_str(&f.env, "Acme Store"));
-    assert_eq!(merchant.description, String::from_str(&f.env, "High quality tools"));
+    assert_eq!(
+        merchant.description,
+        String::from_str(&f.env, "High quality tools")
+    );
     assert_eq!(merchant.category, symbol_short!("tools"));
     assert_eq!(merchant.commission_rate_bps, 0);
     assert!(!merchant.verified);
@@ -118,7 +121,9 @@ fn test_merchant_operational_view_combinations() {
 
     // Registered + unverified
     let owner1 = Address::generate(&f.env);
-    let id1 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id1 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner1,
         &RegisterParams {
             name: String::from_str(&f.env, "Registered Unverified"),
@@ -148,7 +153,9 @@ fn test_merchant_operational_view_combinations() {
             registered_at: 1,
         },
     );
-    let id2 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id2 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner2,
         &RegisterParams {
             name: String::from_str(&f.env, "Verified Active"),
@@ -175,7 +182,9 @@ fn test_merchant_operational_view_combinations() {
 
     // Suspended + unverified
     let owner3 = Address::generate(&f.env);
-    let id3 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id3 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner3,
         &RegisterParams {
             name: String::from_str(&f.env, "Suspended Unverified"),
@@ -195,7 +204,9 @@ fn test_merchant_operational_view_combinations() {
 
     // Closed + verified
     let owner4 = Address::generate(&f.env);
-    let id4 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id4 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner4,
         &RegisterParams {
             name: String::from_str(&f.env, "Closed Verified"),
@@ -208,7 +219,8 @@ fn test_merchant_operational_view_combinations() {
         },
     );
     f.client.verify_merchant(&id4, &verifier);
-    f.client.close_merchant(&f.admin, &id4, &symbol_short!("miscond"));
+    f.client
+        .close_merchant(&f.admin, &id4, &symbol_short!("miscond"));
     let view = f.client.get_merchant_operational_view(&id4);
     assert_eq!(view.status, MerchantStatus::Closed);
     assert!(view.verified);
@@ -216,7 +228,9 @@ fn test_merchant_operational_view_combinations() {
 
     // Closed + unverified
     let owner5 = Address::generate(&f.env);
-    let id5 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id5 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner5,
         &RegisterParams {
             name: String::from_str(&f.env, "Closed Unverified"),
@@ -228,7 +242,8 @@ fn test_merchant_operational_view_combinations() {
             required_verifications: 1,
         },
     );
-    f.client.close_merchant(&f.admin, &id5, &symbol_short!("miscond"));
+    f.client
+        .close_merchant(&f.admin, &id5, &symbol_short!("miscond"));
     let view = f.client.get_merchant_operational_view(&id5);
     assert_eq!(view.status, MerchantStatus::Closed);
     assert!(!view.verified);
@@ -250,7 +265,8 @@ fn test_register_merchant_event_schema() {
         required_verifications: 1,
     };
 
-    let merchant_id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, &merchant_addr, &params);
+    let merchant_id =
+        crate::testutil::register_merchant_with_deposit(&f.env, &f.client, &merchant_addr, &params);
     assert_eq!(merchant_id, 1);
 
     // Verify the event payload carries `owner` explicitly (not `merchant`).
@@ -286,7 +302,8 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         required_verifications: 1,
     };
 
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, &merchant1, &params1);
+    let id =
+        crate::testutil::register_merchant_with_deposit(&f.env, &f.client, &merchant1, &params1);
     assert_eq!(id, 1);
 
     // Duplicate name
@@ -300,7 +317,9 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         required_verifications: 1,
     };
 
-    let err = crate::testutil::try_register_merchant_with_deposit(&f.env, &f.client, &merchant2, &params2);
+    let err = crate::testutil::try_register_merchant_with_deposit(
+        &f.env, &f.client, &merchant2, &params2,
+    );
     assert_eq!(
         err.unwrap_err().unwrap(),
         MarketplaceError::DuplicateMerchantName
@@ -317,7 +336,12 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         required_verifications: 1,
     };
 
-    let err_empty = crate::testutil::try_register_merchant_with_deposit(&f.env, &f.client, &merchant2, &params_empty);
+    let err_empty = crate::testutil::try_register_merchant_with_deposit(
+        &f.env,
+        &f.client,
+        &merchant2,
+        &params_empty,
+    );
     assert_eq!(
         err_empty.unwrap_err().unwrap(),
         MarketplaceError::InvalidParam
@@ -334,7 +358,12 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         required_verifications: 1,
     };
 
-    let err_ws_name = crate::testutil::try_register_merchant_with_deposit(&f.env, &f.client, &merchant2, &params_ws_name);
+    let err_ws_name = crate::testutil::try_register_merchant_with_deposit(
+        &f.env,
+        &f.client,
+        &merchant2,
+        &params_ws_name,
+    );
     assert_eq!(
         err_ws_name.unwrap_err().unwrap(),
         MarketplaceError::InvalidParam
@@ -351,7 +380,12 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         required_verifications: 1,
     };
 
-    let err_empty_desc = crate::testutil::try_register_merchant_with_deposit(&f.env, &f.client, &merchant2, &params_empty_desc);
+    let err_empty_desc = crate::testutil::try_register_merchant_with_deposit(
+        &f.env,
+        &f.client,
+        &merchant2,
+        &params_empty_desc,
+    );
     assert_eq!(
         err_empty_desc.unwrap_err().unwrap(),
         MarketplaceError::InvalidParam
@@ -368,7 +402,12 @@ fn test_register_merchant_duplicate_name_and_invalid_param() {
         required_verifications: 1,
     };
 
-    let err_ws_desc = crate::testutil::try_register_merchant_with_deposit(&f.env, &f.client, &merchant2, &params_ws_desc);
+    let err_ws_desc = crate::testutil::try_register_merchant_with_deposit(
+        &f.env,
+        &f.client,
+        &merchant2,
+        &params_ws_desc,
+    );
     assert_eq!(
         err_ws_desc.unwrap_err().unwrap(),
         MarketplaceError::InvalidParam
@@ -381,7 +420,9 @@ fn test_update_merchant_profile() {
     let owner = Address::generate(&f.env);
     let stranger = Address::generate(&f.env);
 
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "Store A"),
@@ -491,7 +532,9 @@ fn test_update_metadata_cooldown_and_admin_override() {
 
     f.env.ledger().set_timestamp(10_000);
 
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "Store Meta"),
@@ -548,7 +591,9 @@ fn test_update_metadata_change_detection_noop() {
     f.env.ledger().set_timestamp(10_000);
 
     let initial_metadata = Some(String::from_str(&f.env, "ipfs://original"));
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "NoOp Store"),
@@ -587,7 +632,9 @@ fn test_update_metadata_change_detection_with_change() {
     f.env.ledger().set_timestamp(10_000);
 
     let initial_metadata = Some(String::from_str(&f.env, "ipfs://v1"));
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "Change Store"),
@@ -626,7 +673,9 @@ fn test_update_metadata_noop_with_none_values() {
     f.env.ledger().set_timestamp(10_000);
 
     // Register merchant with no metadata
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "NoMeta Store"),
@@ -662,7 +711,9 @@ fn test_update_metadata_change_from_none_to_value() {
     f.env.ledger().set_timestamp(10_000);
 
     // Register merchant with no metadata
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "AddMeta Store"),
@@ -699,7 +750,9 @@ fn test_update_metadata_change_from_value_to_none() {
 
     // Register merchant with metadata
     let initial_metadata = Some(String::from_str(&f.env, "ipfs://remove-me"));
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "RemoveMeta Store"),
@@ -858,23 +911,38 @@ fn test_get_verifiers_page_pagination() {
     let page1: VerifierPage = f.client.get_verifiers_page(&0, &2);
     assert_eq!(page1.total, 5);
     assert_eq!(page1.items.len(), 2);
-    assert_eq!(page1.items.get(0).unwrap().address, expected.get(0).unwrap());
-    assert_eq!(page1.items.get(1).unwrap().address, expected.get(1).unwrap());
+    assert_eq!(
+        page1.items.get(0).unwrap().address,
+        expected.get(0).unwrap()
+    );
+    assert_eq!(
+        page1.items.get(1).unwrap().address,
+        expected.get(1).unwrap()
+    );
     assert_eq!(page1.next_offset, Some(2));
 
     // Middle page.
     let page2: VerifierPage = f.client.get_verifiers_page(&2, &2);
     assert_eq!(page2.total, 5);
     assert_eq!(page2.items.len(), 2);
-    assert_eq!(page2.items.get(0).unwrap().address, expected.get(2).unwrap());
-    assert_eq!(page2.items.get(1).unwrap().address, expected.get(3).unwrap());
+    assert_eq!(
+        page2.items.get(0).unwrap().address,
+        expected.get(2).unwrap()
+    );
+    assert_eq!(
+        page2.items.get(1).unwrap().address,
+        expected.get(3).unwrap()
+    );
     assert_eq!(page2.next_offset, Some(4));
 
     // Final (partial) page: no further pages.
     let page3: VerifierPage = f.client.get_verifiers_page(&4, &2);
     assert_eq!(page3.total, 5);
     assert_eq!(page3.items.len(), 1);
-    assert_eq!(page3.items.get(0).unwrap().address, expected.get(4).unwrap());
+    assert_eq!(
+        page3.items.get(0).unwrap().address,
+        expected.get(4).unwrap()
+    );
     assert_eq!(page3.next_offset, None);
 
     // A page larger than the set is clamped.
@@ -930,7 +998,9 @@ fn test_multi_verifier_verification_and_revocation() {
     );
 
     // Register with 2 required verifications
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "Certified Store"),
@@ -995,7 +1065,9 @@ fn test_verify_merchant_verified_count_overflow() {
         },
     );
 
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "Overflow Store"),
@@ -1028,7 +1100,9 @@ fn test_commission_rate_configuration() {
     let owner = Address::generate(&f.env);
     let stranger = Address::generate(&f.env);
 
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "Commission Store"),
@@ -1070,7 +1144,9 @@ fn test_merchant_stats_lifecycle() {
     let owner1 = Address::generate(&f.env);
     let owner2 = Address::generate(&f.env);
 
-    let id1 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id1 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner1,
         &RegisterParams {
             name: String::from_str(&f.env, "Alpha Store"),
@@ -1082,7 +1158,9 @@ fn test_merchant_stats_lifecycle() {
             required_verifications: 1,
         },
     );
-    let id2 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id2 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner2,
         &RegisterParams {
             name: String::from_str(&f.env, "Beta Store"),
@@ -1127,7 +1205,8 @@ fn test_merchant_stats_lifecycle() {
         }
     );
 
-    f.client.close_merchant(&f.admin, &id2, &symbol_short!("miscond"));
+    f.client
+        .close_merchant(&f.admin, &id2, &symbol_short!("miscond"));
     assert_eq!(
         f.client.get_merchant_stats(),
         MerchantStats {
@@ -1154,7 +1233,9 @@ fn test_suspension_closing_and_mutation_locking() {
         },
     );
 
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "Safe Store"),
@@ -1214,7 +1295,8 @@ fn test_suspension_closing_and_mutation_locking() {
     assert_eq!(f.client.get_commission(&id), 150);
 
     // Admin closes merchant permanently
-    f.client.close_merchant(&f.admin, &id, &symbol_short!("bad_cond"));
+    f.client
+        .close_merchant(&f.admin, &id, &symbol_short!("bad_cond"));
     f.client
         .close_merchant(&f.admin, &id, &symbol_short!("miscond"));
     let closed = f.client.get_merchant(&id);
@@ -1246,7 +1328,9 @@ fn test_risk_oracle_freezes_trading_and_bans_are_permanent() {
     let f = TestFixture::setup();
     let owner = Address::generate(&f.env);
     let risk_oracle = Address::generate(&f.env);
-    let merchant_id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let merchant_id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "Risk Store"),
@@ -1263,7 +1347,8 @@ fn test_risk_oracle_freezes_trading_and_bans_are_permanent() {
 
     assert!(f.client.is_merchant_trading(&owner));
     assert_eq!(
-        f.client.try_suspend_merchant(&Address::generate(&f.env), &merchant_id),
+        f.client
+            .try_suspend_merchant(&Address::generate(&f.env), &merchant_id),
         Err(Ok(MarketplaceError::Unauthorized))
     );
 
@@ -1302,9 +1387,19 @@ fn test_merchant_owner_can_register_only_one_open_profile() {
         metadata_uri: None,
         required_verifications: 1,
     };
-    crate::testutil::register_merchant_with_deposit(&f.env, &f.client, &owner, &params("Store One"));
+    crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
+        &owner,
+        &params("Store One"),
+    );
     assert_eq!(
-        crate::testutil::try_register_merchant_with_deposit(&f.env, &f.client, &owner, &params("Store Two")),
+        crate::testutil::try_register_merchant_with_deposit(
+            &f.env,
+            &f.client,
+            &owner,
+            &params("Store Two")
+        ),
         Err(Ok(MarketplaceError::DuplicateMerchantOwner))
     );
 }
@@ -1313,15 +1408,20 @@ fn test_merchant_owner_can_register_only_one_open_profile() {
 fn test_paginated_discovery_cost_stays_within_thresholds() {
     let f = TestFixture::setup();
     let owner = Address::generate(&f.env);
-    crate::testutil::register_merchant_with_deposit(&f.env, &f.client, &owner, &RegisterParams {
-        name: String::from_str(&f.env, "Cost Store"),
-        description: String::from_str(&f.env, "Desc"),
-        category: symbol_short!("tech"),
-        image_url: String::from_str(&f.env, "url"),
-        metadata: None,
-        metadata_uri: None,
-        required_verifications: 1,
-    });
+    crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Cost Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("tech"),
+            image_url: String::from_str(&f.env, "url"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
     let _ = f.client.get_merchants(&0, &10);
     assert_discovery_cost_within_thresholds(&f.env);
 }
@@ -1346,7 +1446,9 @@ fn test_paginated_discovery() {
         name_bytes[5] = b'0' + i as u8;
         let name = String::from_str(&f.env, core::str::from_utf8(&name_bytes[..6]).unwrap());
 
-        crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+        crate::testutil::register_merchant_with_deposit(
+            &f.env,
+            &f.client,
             &owner,
             &RegisterParams {
                 name,
@@ -1419,7 +1521,9 @@ fn test_status_filtered_discovery() {
     let owner4 = Address::generate(&f.env);
 
     // Register 4 merchants
-    let id1 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id1 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner1,
         &RegisterParams {
             name: String::from_str(&f.env, "Store 1"),
@@ -1432,7 +1536,9 @@ fn test_status_filtered_discovery() {
         },
     );
 
-    let id2 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id2 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner2,
         &RegisterParams {
             name: String::from_str(&f.env, "Store 2"),
@@ -1445,7 +1551,9 @@ fn test_status_filtered_discovery() {
         },
     );
 
-    let id3 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id3 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner3,
         &RegisterParams {
             name: String::from_str(&f.env, "Store 3"),
@@ -1458,7 +1566,9 @@ fn test_status_filtered_discovery() {
         },
     );
 
-    let id4 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id4 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner4,
         &RegisterParams {
             name: String::from_str(&f.env, "Store 4"),
@@ -1487,8 +1597,11 @@ fn test_status_filtered_discovery() {
     let registered = f
         .client
         .get_merchants_by_status(&MerchantStatus::Registered, &0, &10);
-    f.client.close_merchant(&f.admin, &id3, &symbol_short!("test"));
-    let registered = f.client.get_merchants_by_status(&MerchantStatus::Registered, &0, &10);
+    f.client
+        .close_merchant(&f.admin, &id3, &symbol_short!("test"));
+    let registered = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Registered, &0, &10);
     assert_eq!(registered.items.len(), 2);
     assert_eq!(registered.total, 2);
     assert_eq!(registered.next_offset, None);
@@ -1519,11 +1632,24 @@ fn test_status_filtered_discovery() {
     let closed = f
         .client
         .get_merchants_by_status(&MerchantStatus::Closed, &0, &10);
-    assert_eq!(registered.items.get(0).unwrap().status, MerchantStatus::Registered);
-    assert_eq!(registered.items.get(1).unwrap().status, MerchantStatus::Registered);
-    let suspended = f.client.get_merchants_by_status(&MerchantStatus::Suspended, &0, &10);
-    assert_eq!(suspended.items.get(0).unwrap().status, MerchantStatus::Suspended);
-    let closed = f.client.get_merchants_by_status(&MerchantStatus::Closed, &0, &10);
+    assert_eq!(
+        registered.items.get(0).unwrap().status,
+        MerchantStatus::Registered
+    );
+    assert_eq!(
+        registered.items.get(1).unwrap().status,
+        MerchantStatus::Registered
+    );
+    let suspended = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Suspended, &0, &10);
+    assert_eq!(
+        suspended.items.get(0).unwrap().status,
+        MerchantStatus::Suspended
+    );
+    let closed = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Closed, &0, &10);
     assert_eq!(closed.items.len(), 1);
     assert_eq!(closed.total, 1);
     assert_eq!(closed.items.get(0).unwrap().id, id3);
@@ -1533,7 +1659,9 @@ fn test_status_filtered_discovery() {
     let verified = f
         .client
         .get_merchants_by_status(&MerchantStatus::Verified, &0, &10);
-    let verified = f.client.get_merchants_by_status(&MerchantStatus::Verified, &0, &10);
+    let verified = f
+        .client
+        .get_merchants_by_status(&MerchantStatus::Verified, &0, &10);
     assert_eq!(verified.items.len(), 0);
     assert_eq!(verified.total, 0);
     assert_eq!(verified.next_offset, None);
@@ -1544,7 +1672,9 @@ fn test_merchant_state_ttl_survives_repeated_reads() {
     let f = TestFixture::setup();
     let owner = Address::generate(&f.env);
 
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner,
         &RegisterParams {
             name: String::from_str(&f.env, "TTL Survival Store"),
@@ -1566,7 +1696,9 @@ fn test_merchant_state_ttl_survives_repeated_reads() {
     });
 
     // Advance sequence number so persistent TTLs decay below threshold
-    f.env.ledger().set_sequence_number(f.env.ledger().sequence() + 508_400);
+    f.env
+        .ledger()
+        .set_sequence_number(f.env.ledger().sequence() + 508_400);
 
     let before: [u32; 6] = env.as_contract(&contract_id, || {
         let keys = [
@@ -1622,7 +1754,9 @@ fn test_status_filtered_discovery_by_category() {
     let owner4 = Address::generate(&f.env);
 
     // Register 4 merchants in tech category
-    let id1 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id1 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner1,
         &RegisterParams {
             name: String::from_str(&f.env, "Tech Store 1"),
@@ -1635,7 +1769,9 @@ fn test_status_filtered_discovery_by_category() {
         },
     );
 
-    let id2 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id2 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner2,
         &RegisterParams {
             name: String::from_str(&f.env, "Tech Store 2"),
@@ -1648,7 +1784,9 @@ fn test_status_filtered_discovery_by_category() {
         },
     );
 
-    let id3 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id3 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner3,
         &RegisterParams {
             name: String::from_str(&f.env, "Tech Store 3"),
@@ -1661,7 +1799,9 @@ fn test_status_filtered_discovery_by_category() {
         },
     );
 
-    let id4 = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id4 = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &owner4,
         &RegisterParams {
             name: String::from_str(&f.env, "Tech Store 4"),
@@ -1678,7 +1818,8 @@ fn test_status_filtered_discovery_by_category() {
     f.client.suspend_merchant(&f.admin, &id2);
     f.client
         .close_merchant(&f.admin, &id3, &symbol_short!("test"));
-    f.client.close_merchant(&f.admin, &id3, &symbol_short!("test"));
+    f.client
+        .close_merchant(&f.admin, &id3, &symbol_short!("test"));
 
     // Get tech merchants by Registered status (should be id1 and id4)
     let registered = f.client.get_merchants_by_category_status(
@@ -1739,7 +1880,9 @@ fn test_discovery_page_cursor_fields() {
         name_bytes[5] = b'0' + (i % 10) as u8;
         let name = String::from_str(&f.env, core::str::from_utf8(&name_bytes[..6]).unwrap());
 
-        crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+        crate::testutil::register_merchant_with_deposit(
+            &f.env,
+            &f.client,
             &owner,
             &RegisterParams {
                 name,
@@ -1762,7 +1905,11 @@ fn test_discovery_page_cursor_fields() {
         Some(3),
         "First page should have next_offset = 3"
     );
-    assert_eq!(page1.next_offset, Some(3), "First page should have next_offset = 3");
+    assert_eq!(
+        page1.next_offset,
+        Some(3),
+        "First page should have next_offset = 3"
+    );
 
     let page2 = f.client.get_merchants(&page1.next_offset.unwrap(), &3);
     assert_eq!(page2.total, 10);
@@ -1772,7 +1919,11 @@ fn test_discovery_page_cursor_fields() {
         Some(6),
         "Second page should have next_offset = 6"
     );
-    assert_eq!(page2.next_offset, Some(6), "Second page should have next_offset = 6");
+    assert_eq!(
+        page2.next_offset,
+        Some(6),
+        "Second page should have next_offset = 6"
+    );
 
     let page3 = f.client.get_merchants(&page2.next_offset.unwrap(), &3);
     assert_eq!(page3.total, 10);
@@ -1782,7 +1933,11 @@ fn test_discovery_page_cursor_fields() {
         Some(9),
         "Third page should have next_offset = 9"
     );
-    assert_eq!(page3.next_offset, Some(9), "Third page should have next_offset = 9");
+    assert_eq!(
+        page3.next_offset,
+        Some(9),
+        "Third page should have next_offset = 9"
+    );
 
     let page4 = f.client.get_merchants(&page3.next_offset.unwrap(), &3);
     assert_eq!(page4.total, 10);
@@ -1791,7 +1946,10 @@ fn test_discovery_page_cursor_fields() {
         page4.next_offset, None,
         "Last page should have None for next_offset"
     );
-    assert_eq!(page4.next_offset, None, "Last page should have None for next_offset");
+    assert_eq!(
+        page4.next_offset, None,
+        "Last page should have None for next_offset"
+    );
 }
 
 #[test]
@@ -1970,10 +2128,7 @@ fn test_propose_admin_overwrite_pending_admin() {
 
     // First candidate can no longer accept -> Unauthorized
     let acc_1 = f.client.try_accept_admin(&new_admin_1);
-    assert_eq!(
-        acc_1.unwrap_err().unwrap(),
-        MarketplaceError::Unauthorized
-    );
+    assert_eq!(acc_1.unwrap_err().unwrap(), MarketplaceError::Unauthorized);
 
     // Second candidate accepts successfully
     f.client.accept_admin(&new_admin_2);
@@ -2010,7 +2165,9 @@ fn test_reputation_score_injection_with_contract() {
         &TransactionOutcome::Released,
     );
 
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &seller,
         &RegisterParams {
             name: String::from_str(&f.env, "Reputable Seller"),
@@ -2061,7 +2218,9 @@ fn test_reputation_resolution_states() {
     let f = TestFixture::setup();
     let seller = Address::generate(&f.env);
 
-    let id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &seller,
         &RegisterParams {
             name: String::from_str(&f.env, "Resolution Tester"),
@@ -2076,7 +2235,10 @@ fn test_reputation_resolution_states() {
 
     // State 1: NotConfigured
     let view_det_not_conf = f.client.get_merchant_view_detailed(&id);
-    assert_eq!(view_det_not_conf.reputation, crate::ReputationResolution::NotConfigured);
+    assert_eq!(
+        view_det_not_conf.reputation,
+        crate::ReputationResolution::NotConfigured
+    );
     assert_eq!(view_det_not_conf.view.reputation_score, None);
 
     // Setup working reputation contract
@@ -2104,7 +2266,8 @@ fn test_reputation_resolution_states() {
     );
 
     // State 2: Available
-    f.client.set_merchant_reputation(&f.admin, &id, &Some(rep_id.clone()));
+    f.client
+        .set_merchant_reputation(&f.admin, &id, &Some(rep_id.clone()));
     let view_det_avail = f.client.get_merchant_view_detailed(&id);
     let rep_score = rep_client.get_reputation(&seller);
     assert_eq!(
@@ -2112,7 +2275,7 @@ fn test_reputation_resolution_states() {
         crate::ReputationResolution::Available(rep_score.score, rep_score.last_updated)
     );
     assert_eq!(view_det_avail.view.reputation_score, Some(rep_score.score));
-    
+
     // Ensure get_merchant_view still works
     let view_avail = f.client.get_merchant_view(&id);
     assert_eq!(view_avail.reputation_score, Some(rep_score.score));
@@ -2120,11 +2283,15 @@ fn test_reputation_resolution_states() {
     // State 3: CallFailed
     // Set an invalid contract address
     let bogus_addr = Address::generate(&f.env);
-    f.client.set_merchant_reputation(&f.admin, &id, &Some(bogus_addr));
+    f.client
+        .set_merchant_reputation(&f.admin, &id, &Some(bogus_addr));
     let view_det_failed = f.client.get_merchant_view_detailed(&id);
-    assert_eq!(view_det_failed.reputation, crate::ReputationResolution::CallFailed);
+    assert_eq!(
+        view_det_failed.reputation,
+        crate::ReputationResolution::CallFailed
+    );
     assert_eq!(view_det_failed.view.reputation_score, None);
-    
+
     // Ensure get_merchant_view still falls back to None on fail
     let view_failed = f.client.get_merchant_view(&id);
     assert_eq!(view_failed.reputation_score, None);
@@ -2159,7 +2326,9 @@ fn test_flight_merchant_lifecycle_and_discovery() {
     );
 
     // Merchant registers requiring 2 verifications
-    let merchant_id = crate::testutil::register_merchant_with_deposit(&f.env, &f.client, 
+    let merchant_id = crate::testutil::register_merchant_with_deposit(
+        &f.env,
+        &f.client,
         &merchant_addr,
         &RegisterParams {
             name: String::from_str(&f.env, "Stellar Artisans"),
@@ -2212,11 +2381,11 @@ fn test_flight_merchant_lifecycle_and_discovery() {
 fn test_version_matches_cargo_toml() {
     let env = Env::default();
     env.mock_all_auths();
-    
+
     let admin = Address::generate(&env);
     let contract_id = env.register(crate::MarketplaceContract, (admin,));
     let client = crate::MarketplaceContractClient::new(&env, &contract_id);
-    
+
     let v = client.version();
     let expected = env!("CARGO_PKG_VERSION").replace('.', "_");
     assert_eq!(v.semver, soroban_sdk::Symbol::new(&env, &expected));
