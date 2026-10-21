@@ -16,6 +16,9 @@ use soroban_sdk::{
     String, Symbol, Vec,
 };
 
+pub mod oracle;
+pub use oracle::*;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 #[repr(u32)]
@@ -367,6 +370,8 @@ pub struct MerchantAppealResolvedEvent {
     InvalidMaintenanceWindow = 4028,
     /// Stock reservation failed due to concurrent modifications.
     StockReservationFailed = 4029,
+    /// Price timestamp is older than the allowed staleness threshold or from the future.
+    StaleOraclePrice = 5030,
 }
 
 // --- Events ---
