@@ -212,15 +212,15 @@ pub enum PermissionError {
     /// Admin-gated call made before `set_admin` has ever been called
     NotInitialized = 2500,
     /// Allowance sweep targeted a delegation that is still live
-    DelegationNotExpired = 2418,
+    DelegationNotExpired = 2427,
     /// A child permission grant would exceed `MAX_HIERARCHY_DEPTH`
-    MaxHierarchyDepthExceeded = 2419,
+    MaxHierarchyDepthExceeded = 2428,
     /// Merchant's verification is below the currently required policy
     /// threshold and the grace period has elapsed.
-    VerificationBelowPolicy = 2420,
+    VerificationBelowPolicy = 2429,
     /// Merchant's verification is below the currently required policy
     /// threshold but still within the grace period.
-    VerificationGracePeriod = 2415,
+    VerificationGracePeriod = 2430,
     /// No queued spend proposal exists for the supplied proposal id (issue #377)
     ProposalNotFound = 2418,
     /// The queued spend proposal already settled and cannot be acted on again
@@ -238,7 +238,9 @@ pub enum PermissionError {
     TooManyPendingProposals = 2424,
     /// Ephemeral session keys cannot use relayer-based spend entrypoints.
     EphemeralRelayerUnsupported = 2425,
-    VerificationGracePeriod = 2421,
+    /// The relayer address has been frozen by an admin; all delegated spends
+    /// submitted by this relayer are blocked until the freeze is lifted.
+    RelayerFrozen = 2426,
 }
 
 /// Epoch period for allowance reset logic.
@@ -314,11 +316,12 @@ mod error_code_tests {
         PermissionError::AmbiguousMultiOwnerGrant as u32,
         PermissionError::TooManyPendingProposals as u32,
         PermissionError::EphemeralRelayerUnsupported as u32,
+        PermissionError::RelayerFrozen as u32,
     ];
 
     #[test]
     fn permission_error_codes_are_unique_and_in_reserved_range() {
-        assert_eq!(PERMISSION_ERROR_CODES.len(), 38);
+        assert_eq!(PERMISSION_ERROR_CODES.len(), 39);
 
         let permission_range = ERROR_CODE_RANGES
             .iter()
@@ -1144,6 +1147,15 @@ pub struct AdminAcceptedEvent {
     pub new_admin: Address,
 }
 
+/// Emitted when an admin freezes a relayer address, immediately blocking all
+/// delegated spend entry points submitted by that relayer.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RelayerFrozenEvent {
+    pub admin: Address,
+    pub relayer: Address,
+}
+
 /// A single entry in the on-chain audit log for a (owner, delegate) pair.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1428,6 +1440,9 @@ pub enum DataKey {
     /// Instance-level grace period (seconds) granted to pre-existing
     /// merchants when the required verification count increases.
     VerificationGracePeriodSecs,
+    /// Admin-frozen relayer flag. When present and `true`, all delegated
+    /// spend entry points submitted by this relayer are blocked.
+    FrozenRelayer(Address),
 }
 
 /// Computes `current + ttl` as an absolute expiry ledger.
@@ -4107,6 +4122,11 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
     ) -> Result<(), PermissionError> {
         relayer.require_auth();
 
+        // Emergency freeze check: block all spends from frozen relayer addresses.
+        if Self::is_relayer_frozen(env.clone(), relayer.clone()) {
+            return Err(PermissionError::RelayerFrozen);
+        }
+
         Self::reject_ephemeral_relayer_spend(&env, &owner, &delegate)?;
 
         if env.ledger().sequence() >= expiration_ledger {
@@ -4227,6 +4247,11 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
         epoch: u32,
     ) -> Result<(), PermissionError> {
         relayer.require_auth();
+
+        // Emergency freeze check: block all spends from frozen relayer addresses.
+        if Self::is_relayer_frozen(env.clone(), relayer.clone()) {
+            return Err(PermissionError::RelayerFrozen);
+        }
 
         Self::reject_ephemeral_relayer_spend(&env, &owner, &delegate)?;
 
@@ -5716,6 +5741,52 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
         );
 
         Ok(())
+    }
+
+    /// Immediately suspend all delegated spend entry points for `relayer`.
+    ///
+    /// Once frozen, any call to [`Self::execute_spend_via_relayer`],
+    /// [`Self::execute_spend_via_channel`], or [`Self::execute_spend_multi`]
+    /// that names `relayer` as the submitting relayer will fail with
+    /// [`PermissionError::RelayerFrozen`] until the entry is manually removed
+    /// from storage.
+    ///
+    /// Only the contract admin may call this.
+    ///
+    /// Returns `true` when the relayer was newly frozen (idempotent: returns
+    /// `true` even if it was already frozen, so callers can confirm the freeze
+    /// without a separate query).
+    pub fn freeze_relayer(
+        env: Env,
+        admin: Address,
+        relayer: Address,
+    ) -> Result<bool, PermissionError> {
+        Self::require_admin(&env, &admin)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FrozenRelayer(relayer.clone()), &true);
+
+        env.events().publish(
+            (symbol_short!("perm"), symbol_short!("rlyr_frz")),
+            RelayerFrozenEvent {
+                admin,
+                relayer,
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Returns `true` when `relayer` has been frozen by an admin.
+    ///
+    /// This is a pure read that costs no write resources; use it from off-chain
+    /// tooling or as a pre-flight check before submitting a relayed spend.
+    pub fn is_relayer_frozen(env: Env, relayer: Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::FrozenRelayer(relayer))
+            .unwrap_or(false)
     }
 
     /// Pause new grant creation. Admin-only.
