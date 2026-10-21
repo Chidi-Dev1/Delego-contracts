@@ -4,7 +4,7 @@
 //! lifecycle. These invariants are used for property-based testing and provide
 //! mathematical guarantees about contract behavior.
 
-use crate::{EscrowRecord, EscrowStatus};
+use crate::{EscrowFulfillmentPhase, EscrowRecord, EscrowStatus};
 
 /// Invariant 1: Conservation of Value
 ///
@@ -75,6 +75,25 @@ pub fn verify_terminal_state_irrevocability(record: &EscrowRecord) -> bool {
             }
         }
         _ => true, // Non-terminal states pass (no constraint)
+    }
+}
+
+/// Invariant 9: Fulfillment Phase Consistency
+///
+/// Plain English:
+///   A funded escrow awaiting merchant acceptance must remain in
+///   FundedAwaitingAcceptance until the merchant accepts or the buyer
+///   claims an unaccepted refund after the acceptance timeout.
+pub fn verify_fulfillment_phase_consistency(record: &EscrowRecord) -> bool {
+    match record.status {
+        EscrowStatus::Funded => matches!(
+            record.fulfillment_phase,
+            EscrowFulfillmentPhase::FundedAwaitingAcceptance
+                | EscrowFulfillmentPhase::AcceptedInPreparation
+                | EscrowFulfillmentPhase::Shipped
+                | EscrowFulfillmentPhase::Delivered
+        ),
+        _ => true,
     }
 }
 
@@ -255,6 +274,7 @@ pub fn verify_all_invariants(record: &EscrowRecord) -> bool {
         && verify_non_negative_balances(record)
         && verify_available_balance_non_negative(record)
         && verify_status_distribution_consistency(record)
+        && verify_fulfillment_phase_consistency(record)
 }
 
 /// Verify invariants hold across a state transition.
@@ -293,6 +313,7 @@ mod tests {
             created_at: 1000,
             updated_at: 1000,
             timeout_ledger: 2000,
+            fulfillment_phase: EscrowFulfillmentPhase::FundedAwaitingAcceptance,
         }
     }
 
@@ -436,5 +457,28 @@ mod tests {
 
         // Invalid: negative amount
         assert!(!verify_partial_operation_bounds(&escrow, -100));
+    }
+
+    #[test]
+    fn test_fulfillment_phase_consistency() {
+        let env = Env::default();
+
+        let awaiting = mock_escrow(&env, 1000, 0, 0, EscrowStatus::Funded);
+        assert!(verify_fulfillment_phase_consistency(&awaiting));
+
+        let mut accepted = mock_escrow(&env, 1000, 0, 0, EscrowStatus::Funded);
+        accepted.fulfillment_phase = EscrowFulfillmentPhase::AcceptedInPreparation;
+        assert!(verify_fulfillment_phase_consistency(&accepted));
+
+        let refunded = mock_escrow(&env, 1000, 0, 1000, EscrowStatus::Refunded);
+        assert!(verify_fulfillment_phase_consistency(&refunded));
+    }
+
+    #[test]
+    fn test_fulfillment_phase_in_all_invariants() {
+        let env = Env::default();
+
+        let awaiting = mock_escrow(&env, 1000, 0, 0, EscrowStatus::Funded);
+        assert!(verify_all_invariants(&awaiting));
     }
 }

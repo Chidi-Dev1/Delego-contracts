@@ -2,6 +2,7 @@
 
 use crate::{
     CorporateQuorumConfig, BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig,
+    AffiliateConfig, BatchDepositParams, BatchRefundParams, BatchReleaseParams, EscrowConfig,
     EscrowContract, EscrowContractClient, EscrowError, EscrowStatus, EscrowTerminalState,
     MerchantVolumeRecord, TreasuryShare, MAX_TREASURIES,
     BatchDepositItem, BatchDepositParams, BatchDepositResult, BatchRefundParams,
