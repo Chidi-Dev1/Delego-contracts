@@ -25,6 +25,7 @@
 //! | `escrow` | `vote` | `u64` escrow_id | `DisputeVotedEvent` |
 //! | `escrow` | `resolved` | `u64` escrow_id | `EscrowResolvedEvent` |
 //! | `escrow` | `tmo_ext` | `u64` escrow_id | `TimeoutExtendedEvent` / `EscrowTimeoutExtendedEvent` |
+//! | `escrow` | `tlock_ext` | `u64` escrow_id | `TimelockExtendedEvent` |
 //! | `escrow` | `bounty` | `u64` escrow_id | `KeeperBountyPaidEvent` |
 //! | `escrow` | `fee_sched` | — | `ConfigChangeScheduledEvent` |
 //! | `escrow` | `dispsplit` | `u64` escrow_id | `DisputeResolvedEvent` |
@@ -240,6 +241,28 @@ pub struct InspectionPeriodConfig {
     pub delivery_confirmed_ledger: u32,
     /// Ledger sequence at which funds will auto-release if no dispute is filed.
     pub auto_release_ledger: u32,
+}
+
+/// Mutual consent timelock extension agreement for extending the inspection
+/// period auto-release deadline (issue #485).
+///
+/// When international shipments encounter customs delays, both parties can
+/// agree to extend the auto-release ledger by mutual on-chain consent.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockExtensionAgreement {
+    /// The escrow ID this agreement applies to.
+    pub escrow_id: u64,
+    /// Additional ledgers to add to the auto_release_ledger.
+    pub additional_ledgers: u32,
+    /// Whether the buyer has approved the extension.
+    pub buyer_approved: bool,
+    /// Whether the merchant (seller) has approved the extension.
+    pub merchant_approved: bool,
+    /// Ledger sequence at which the agreement was proposed.
+    pub proposed_at_ledger: u32,
+}
+
 /// Order acceptance and cancel-protection state for a single escrow
 /// (issue #355).
 ///
@@ -1460,6 +1483,17 @@ pub struct EscrowInspectionAutoReleasedEvent {
     pub released_by: Address,
 }
 
+/// Emitted when the inspection period auto-release deadline is extended by
+/// mutual consent of both parties (issue #485).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TimelockExtendedEvent {
+    pub escrow_id: u64,
+    pub previous_auto_release_ledger: u32,
+    pub new_auto_release_ledger: u32,
+    pub extension_ledgers: u32,
+}
+
 /// Emitted when a scheduled config change becomes effective.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -1777,6 +1811,9 @@ pub enum DataKey {
     MerkleRoot(u64),
     /// Buyer inspection period configuration for an escrow (issue #356).
     InspectionPeriodConfig(u64),
+    /// Mutual consent timelock extension agreement for extending the inspection
+    /// period auto-release deadline (issue #485).
+    TimelockExtensionAgreement(u64),
     /// Emergency rescue proposal for a stranded escrow (issue #365).
     EmergencyRescueProposal(u64),
     /// Admin-approved metadata schema → hash of its definition document.
@@ -2215,6 +2252,18 @@ pub enum EscrowError {
     TimeoutExtensionNonceUsed = 448,
     /// Voucher signatures did not identify both escrow participants.
     InvalidTimeoutExtensionVoucher = 449,
+    /// Timelock extension agreement not found for this escrow.
+    TimelockExtensionNotFound = 450,
+    /// Timelock extension already proposed for this escrow.
+    TimelockExtensionAlreadyProposed = 451,
+    /// Timelock extension additional ledgers must be greater than zero.
+    InvalidTimelockExtension = 452,
+    /// Caller is not a party to the timelock extension agreement.
+    NotTimelockExtensionParty = 453,
+    /// Timelock extension already approved by this party.
+    TimelockExtensionAlreadyApproved = 454,
+    /// Timelock extension not yet approved by both parties.
+    TimelockExtensionPendingApproval = 455,
 }
 
 /// Runs `f` under a re-entrancy lock and returns its result unchanged.
@@ -8894,6 +8943,183 @@ impl EscrowContract {
             .set(&DataKey::InspectionPeriodConfig(escrow_id), &inspection_cfg);
 
         Ok(())
+    }
+
+    /// Propose a timelock extension for the inspection period auto-release deadline.
+    ///
+    /// Either the buyer or the merchant (seller) can propose an extension by specifying
+    /// the number of additional ledgers. The counterparty must then approve via
+    /// `approve_timelock_extension`. Once both parties approve, the `auto_release_ledger`
+    /// in the `InspectionPeriodConfig` is extended by the specified amount.
+    ///
+    /// This is useful when international shipments encounter customs delays and both
+    /// parties agree to extend the dispute grace period.
+    pub fn propose_timelock_extension(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+        additional_ledgers: u32,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+
+        if additional_ledgers == 0 {
+            return Err(EscrowError::InvalidTimelockExtension);
+        }
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        // Only allow proposing extension when escrow is in Inspection status
+        if record.status != EscrowStatus::Inspection {
+            return Err(EscrowError::NotInInspection);
+        }
+
+        // Verify caller is either buyer or seller
+        if caller != record.buyer && caller != record.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        // Check if inspection config exists
+        let inspection_config: InspectionPeriodConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InspectionPeriodConfig(escrow_id))
+            .ok_or(EscrowError::InspectionConfigNotSet)?;
+
+        // Check if there's already an active proposal
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TimelockExtensionAgreement(escrow_id))
+        {
+            return Err(EscrowError::TimelockExtensionAlreadyProposed);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        let agreement = TimelockExtensionAgreement {
+            escrow_id,
+            additional_ledgers,
+            buyer_approved: caller == record.buyer,
+            merchant_approved: caller == record.seller,
+            proposed_at_ledger: current_ledger,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::TimelockExtensionAgreement(escrow_id), &agreement);
+
+        Ok(true)
+    }
+
+    /// Approve a proposed timelock extension for the inspection period.
+    ///
+    /// The counterparty (buyer or seller, whoever didn't propose) calls this to
+    /// approve the extension. Once both parties have approved, the
+    /// `auto_release_ledger` in the `InspectionPeriodConfig` is extended by the
+    /// agreed `additional_ledgers`, and a `TimelockExtendedEvent` is emitted.
+    pub fn approve_timelock_extension(
+        env: Env,
+        escrow_id: u64,
+        caller: Address,
+    ) -> Result<bool, EscrowError> {
+        caller.require_auth();
+
+        let key = DataKey::Escrow(escrow_id);
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        // Verify caller is either buyer or seller
+        if caller != record.buyer && caller != record.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        // Get the existing agreement
+        let mut agreement: TimelockExtensionAgreement = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TimelockExtensionAgreement(escrow_id))
+            .ok_or(EscrowError::TimelockExtensionNotFound)?;
+
+        // Check if caller already approved
+        let is_buyer = caller == record.buyer;
+        let is_seller = caller == record.seller;
+
+        if is_buyer && agreement.buyer_approved {
+            return Err(EscrowError::TimelockExtensionAlreadyApproved);
+        }
+        if is_seller && agreement.merchant_approved {
+            return Err(EscrowError::TimelockExtensionAlreadyApproved);
+        }
+
+        // Update approval status
+        if is_buyer {
+            agreement.buyer_approved = true;
+        } else if is_seller {
+            agreement.merchant_approved = true;
+        }
+
+        // Check if both parties have approved
+        if agreement.buyer_approved && agreement.merchant_approved {
+            // Both parties approved - extend the auto_release_ledger
+            let mut inspection_config: InspectionPeriodConfig = env
+                .storage()
+                .persistent()
+                .get(&DataKey::InspectionPeriodConfig(escrow_id))
+                .ok_or(EscrowError::InspectionConfigNotSet)?;
+
+            let previous_auto_release_ledger = inspection_config.auto_release_ledger;
+            let new_auto_release_ledger = previous_auto_release_ledger
+                .saturating_add(agreement.additional_ledgers);
+
+            inspection_config.auto_release_ledger = new_auto_release_ledger;
+            inspection_config.inspection_duration_ledgers =
+                inspection_config.inspection_duration_ledgers.saturating_add(agreement.additional_ledgers);
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::InspectionPeriodConfig(escrow_id), &inspection_config);
+
+            // Remove the agreement as it's been executed
+            env.storage()
+                .persistent()
+                .remove(&DataKey::TimelockExtensionAgreement(escrow_id));
+
+            // Emit event
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("tlock_ext"), escrow_id),
+                TimelockExtendedEvent {
+                    escrow_id,
+                    previous_auto_release_ledger,
+                    new_auto_release_ledger,
+                    extension_ledgers: agreement.additional_ledgers,
+                },
+            );
+
+            Ok(true)
+        } else {
+            // Store updated agreement with one approval
+            env.storage()
+                .persistent()
+                .set(&DataKey::TimelockExtensionAgreement(escrow_id), &agreement);
+            Ok(false)
+        }
+    }
+
+    /// Get the current timelock extension agreement for an escrow, if any.
+    pub fn get_timelock_extension_agreement(
+        env: Env,
+        escrow_id: u64,
+    ) -> Option<TimelockExtensionAgreement> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TimelockExtensionAgreement(escrow_id))
     }
 
     /// Buyer releases funds after passing inspection. Only the buyer may call.
