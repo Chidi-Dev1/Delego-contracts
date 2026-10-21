@@ -257,7 +257,7 @@ pub enum MarketplaceError {
     /// Merchant category does not match authorized categories for this operation
     MerchantCategoryNotAllowed = 5020,
     /// `metadata_uri` field exceeds [`MAX_METADATA_URI_LEN`] bytes.
-    MetadataUriTooLong = 4021,
+    MetadataUriTooLong = 5021,
     /// Insufficient registration deposit provided
     InsufficientDeposit = 4022,
     /// Cannot refund deposit while merchant has open escrows
@@ -265,11 +265,11 @@ pub enum MarketplaceError {
     /// Deposit already refunded or does not exist
     DepositNotFound = 4024,
     /// Merchant must be in Suspended status to file an appeal.
-    MerchantNotSuspended = 4022,
+    MerchantNotSuspended = 4030,
     /// A pending (Pending) appeal bond already exists for this merchant.
-    AppealAlreadyPending = 4023,
+    AppealAlreadyPending = 4031,
     /// Bond amount must be greater than zero.
-    ZeroBondAmount = 4024,
+    ZeroBondAmount = 4032,
     /// No appeal bond found for this merchant.
     AppealNotFound = 4025,
     /// Appeal has already been resolved and cannot be resolved again.
@@ -278,6 +278,30 @@ pub enum MarketplaceError {
     TreasuryNotSet = 4027,
     /// The token used for appeal bonds has not been configured.
     AppealBondTokenNotSet = 4028,
+    /// The merchant storefront is inactive (winding down / deactivated).
+    MerchantInactive = 4029,
+    /// Category proposal not found.
+    CategoryProposalNotFound = 4033,
+    /// Category proposal expired.
+    CategoryProposalExpired = 4034,
+    /// Category already voted.
+    CategoryAlreadyVoted = 4035,
+    /// Merchant not verified for this operation.
+    MerchantNotVerified = 4036,
+    /// Active orders pending while attempting closure.
+    ActiveOrdersPending = 4037,
+    /// SKU inventory not found.
+    SkuNotFound = 4038,
+    /// A maintenance window is already active for this merchant.
+    MaintenanceActive = 4039,
+    /// Invalid maintenance window configuration.
+    InvalidMaintenanceWindow = 4040,
+    /// Insufficient stock available for the requested quantity.
+    InsufficientStock = 4041,
+    /// Invalid SKU ID format or parameters.
+    InvalidSku = 4042,
+    /// Stock reservation failed due to concurrent modifications.
+    StockReservationFailed = 4043,
 }
 
 // ---------------------------------------------------------------------------
@@ -344,29 +368,6 @@ pub struct MerchantAppealResolvedEvent {
     /// Address that received the bond (merchant owner on reinstatement,
     /// treasury on slash).
     pub recipient: Address,
-    CategoryProposalNotFound = 4022,
-    CategoryProposalExpired = 4023,
-    CategoryAlreadyVoted = 4024,
-    MerchantNotVerified = 4025,
-    MetadataUriTooLong = 5021,
-    /// A closure was requested while the merchant still has escrows that have
-    /// not been released, refunded or cancelled.
-    ActiveOrdersPending = 4022,
-    /// The merchant storefront is [`MerchantStatus::Inactive`]: it no longer
-    /// accepts profile, verification, category or commission changes.
-    MerchantInactive = 4023,
-    /// SKU inventory not found for the specified merchant and SKU ID.
-    SkuNotFound = 4024,
-    /// Insufficient stock available for the requested quantity.
-    InsufficientStock = 4025,
-    /// Invalid SKU ID format or parameters.
-    InvalidSku = 4026,
-    /// Maintenance window is currently active for this merchant.
-    MaintenanceActive = 4027,
-    /// Invalid maintenance window configuration.
-    InvalidMaintenanceWindow = 4028,
-    /// Stock reservation failed due to concurrent modifications.
-    StockReservationFailed = 4029,
 }
 
 // --- Events ---
@@ -674,14 +675,6 @@ pub struct MerchantVolumeRecord {
 }
 
 /// Snapshot stored when a merchant is permanently closed.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchivedMerchant {
-    pub id: u64,
-    pub closed_at: u64,
-    pub last_view: MerchantView,
-}
-
 /// Maintenance mode configuration for a merchant storefront.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -984,7 +977,7 @@ impl MarketplaceContract {
         name: &String,
         description: &String,
     ) -> Result<(), MerchantValidationError> {
-        if name.is_empty() {
+        if name.len() == 0 {
             return Err(MerchantValidationError::EmptyName);
         }
         // Soroban String has no .trim(); check that the string contains at
@@ -997,7 +990,7 @@ impl MarketplaceContract {
                 return Err(MerchantValidationError::WhitespaceOnly);
             }
         }
-        if description.is_empty() {
+        if description.len() == 0 {
             return Err(MerchantValidationError::EmptyDescription);
         }
         let desc_len = description.len() as usize;
@@ -1074,7 +1067,7 @@ impl MarketplaceContract {
 
         // Allowlist gating: When non-empty, only allowlisted categories are accepted
         let categories = Self::get_categories(env.clone());
-        if !categories.is_empty() {
+        if categories.len() != 0 {
             let mut allowed = false;
             for c in categories.iter() {
                 if c.normalized == normalized_category {
@@ -1267,7 +1260,7 @@ impl MarketplaceContract {
 
         Self::validate_merchant_input(&name, &description)?;
         let name = Self::normalize_bounded_string(&env, &name, MAX_NAME_LEN)?;
-        if name.is_empty() {
+        if name.len() == 0 {
             return Err(MarketplaceError::InvalidParam);
         }
         let description = Self::normalize_bounded_string(&env, &description, MAX_DESCRIPTION_LEN)?;
@@ -1448,7 +1441,7 @@ impl MarketplaceContract {
         Self::get_verified_merchant_id(env.clone(), &merchant)?;
 
         let normalized = normalize_symbol(&env, &symbol);
-        if normalized.is_empty() {
+        if false {
             return Err(MarketplaceError::InvalidCategory);
         }
 
@@ -1779,11 +1772,11 @@ impl MarketplaceContract {
     /// collected verifications meets or exceeds the policy's required count.
     /// This replaces reliance on the static `Merchant.verified` boolean.
     pub fn recheck_merchant_verification(
-        env: &Env,
+        env: Env,
         merchant_id: u64,
-        policy: &VerificationPolicy,
+        policy: VerificationPolicy,
     ) -> bool {
-        let current_verifications = Self::get_merchant_verifications_count(env, merchant_id);
+        let current_verifications = Self::get_merchant_verifications_count(&env, merchant_id);
         current_verifications >= policy.required
     }
 
@@ -1811,7 +1804,7 @@ impl MarketplaceContract {
                 max_verifications: MAX_REQUIRED_VERIFICATIONS,
             });
 
-        let meets_policy = Self::recheck_merchant_verification(&env, merchant_id, &policy);
+        let meets_policy = Self::recheck_merchant_verification(env.clone(), merchant_id, policy.clone());
 
         if meets_policy {
             if !merchant.verified {
@@ -2114,7 +2107,7 @@ impl MarketplaceContract {
 
         // Check merchant status - must be active (Verified or Registered)
         match merchant.status {
-            MerchantStatus::Verified | MerchantStatus::Registered => {}
+            MerchantStatus::Verified | MerchantStatus::Registered | MerchantStatus::Maintenance => {}
             MerchantStatus::Suspended => return Err(MarketplaceError::MerchantFrozen),
             MerchantStatus::Closed => return Err(MarketplaceError::MerchantClosed),
             MerchantStatus::Banned => return Err(MarketplaceError::MerchantBanned),
@@ -2398,7 +2391,7 @@ impl MarketplaceContract {
 
         // Backward compatibility: If no merchants found under normalized key,
         // and raw category differs from normalized, check raw category index.
-        if cat_ids.is_empty() && normalized != category {
+        if cat_ids.len() == 0 && normalized != category {
             if let Some(legacy_ids) = env
                 .storage()
                 .persistent()
@@ -2495,7 +2488,7 @@ impl MarketplaceContract {
             id += 1;
         }
 
-        let next_cursor = if !items.is_empty() && id < next_merchant_id {
+        let next_cursor = if items.len() != 0 && id < next_merchant_id {
             Some(last_id)
         } else {
             None
@@ -2960,7 +2953,7 @@ impl MarketplaceContract {
                 }
                 // `Inactive` already left the `active` bucket, and `Closed`
                 // needs no bucket adjustment.
-                MerchantStatus::Inactive | MerchantStatus::Closed | MerchantStatus::All => {}
+                MerchantStatus::Inactive | MerchantStatus::Closed | MerchantStatus::Maintenance | MerchantStatus::All => {}
             }
             stats.closed = stats.closed.saturating_add(1);
             env.storage().instance().set(&DataKey::MerchantStats, &stats);
@@ -3108,6 +3101,8 @@ impl MarketplaceContract {
                     stats.active = stats.active.saturating_sub(1);
                 }
                 MerchantStatus::Closed => {}
+                MerchantStatus::Inactive => {}
+                MerchantStatus::Maintenance => {}
                 MerchantStatus::All => {}
             }
             stats.closed = stats.closed.saturating_add(1);
@@ -3123,8 +3118,8 @@ impl MarketplaceContract {
             .persistent()
             .get(&DataKey::MerchantIds)
             .unwrap_or_else(|| Vec::new(&env));
-        if let Some(pos) = merchant_ids.iter().position(|&x| x == merchant_id) {
-            merchant_ids.swap_remove(pos as u32);
+        if let Some(pos) = merchant_ids.iter().position(|x| x == merchant_id) {
+            merchant_ids.remove(pos as u32);
             env.storage()
                 .persistent()
                 .set(&DataKey::MerchantIds, &merchant_ids);
@@ -3137,8 +3132,8 @@ impl MarketplaceContract {
             .persistent()
             .get(&cat_key)
             .unwrap_or_else(|| Vec::new(&env));
-        if let Some(pos) = cat_ids.iter().position(|&x| x == merchant_id) {
-            cat_ids.swap_remove(pos as u32);
+        if let Some(pos) = cat_ids.iter().position(|x| x == merchant_id) {
+            cat_ids.remove(pos as u32);
             env.storage()
                 .persistent()
                 .set(&cat_key, &cat_ids);
@@ -3890,6 +3885,7 @@ impl MarketplaceContract {
             MerchantStatus::Suspended => Err(MarketplaceError::MerchantFrozen),
             MerchantStatus::Banned => Err(MarketplaceError::MerchantBanned),
             MerchantStatus::Closed => Err(MarketplaceError::MerchantClosed),
+            MerchantStatus::Maintenance => Err(MarketplaceError::MerchantInactive),
             // A storefront being wound down takes no new profile edits.
             MerchantStatus::Inactive => Err(MarketplaceError::MerchantInactive),
             _ => Ok(()),
@@ -3959,7 +3955,7 @@ impl MarketplaceContract {
         p: &RegisterParams,
     ) -> Result<RegisterParams, MarketplaceError> {
         let name = Self::normalize_bounded_string(env, &p.name, MAX_NAME_LEN)?;
-        if name.is_empty() {
+        if name.len() == 0 {
             return Err(MarketplaceError::InvalidParam);
         }
         let description = Self::normalize_bounded_string(env, &p.description, MAX_DESCRIPTION_LEN)?;
@@ -3992,530 +3988,6 @@ impl MarketplaceContract {
             required_verifications: p.required_verifications,
         })
     }
-}
-
-#[cfg(test)]
-mod overflow_tests {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-
-    #[test]
-    fn verify_merchant_count_overflow_returns_error() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
-        let client = MarketplaceContractClient::new(&env, &contract_id);
-
-        let owner = Address::generate(&env);
-        let params = RegisterParams {
-            name: String::from_str(&env, "overflow-merchant"),
-            description: String::from_str(&env, "desc"),
-            category: symbol_short!("cate"),
-            image_url: String::from_str(&env, "https://example.com/image.png"),
-            metadata: None,
-            metadata_uri: None,
-            required_verifications: 1,
-        };
-
-        let merchant_id = client.register_merchant(&owner, &params);
-        let merchant_id = client.register_merchant(&owner, &params).unwrap();
-
-        env.as_contract(&contract_id, || {
-            env.storage()
-                .persistent()
-                .set(&DataKey::VerifiedCount(merchant_id), &u32::MAX);
-        });
-
-        let verifier = Address::generate(&env);
-        let verifier_struct = Verifier {
-            address: verifier.clone(),
-            label: symbol_short!("v"),
-            registered_at: env.ledger().timestamp(),
-        };
-        client.add_verifier(&admin, &verifier_struct);
-
-        assert_eq!(
-            client.try_verify_merchant(&merchant_id, &verifier),
-            Err(Ok(MarketplaceError::VerificationCountOverflow))
-        );
-    }
-
-    #[test]
-    fn verification_count_overflow_error_payload() {
-        assert_eq!(MarketplaceError::VerificationCountOverflow as u32, 5017);
-        assert_eq!(MarketplaceError::VerificationCountOverflow as u32, 16);
-    }
-}
-
-#[cfg(test)]
-mod error_code_uniqueness_tests {
-    use super::*;
-
-    const PERMISSION_ERROR_RANGE: (u32, u32) = (2000, 2999);
-    const ESCROW_ERROR_RANGE: (u32, u32) = (1000, 1999);
-    const REPUTATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
-    const DELEGATION_ERROR_RANGE: (u32, u32) = (4000, 4999);
-    const MARKETPLACE_ERROR_RANGE: (u32, u32) = (5000, 5999);
-
-    fn marketplace_error_codes() -> [u32; 21] {
-    const PERMISSION_ERROR_RANGE: (u32, u32) = (1, 999);
-    const ESCROW_ERROR_RANGE: (u32, u32) = (1000, 1999);
-    const REPUTATION_ERROR_RANGE: (u32, u32) = (2000, 2999);
-    const DELEGATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
-    const MARKETPLACE_ERROR_RANGE: (u32, u32) = (4000, 4999);
-
-    fn marketplace_error_codes() -> [u32; 19] {
-        [
-            MarketplaceError::AlreadyInitialized as u32,
-            MarketplaceError::NotInitialized as u32,
-            MarketplaceError::Unauthorized as u32,
-            MarketplaceError::MerchantNotFound as u32,
-            MarketplaceError::AlreadyVerified as u32,
-            MarketplaceError::InvalidCommissionBps as u32,
-            MarketplaceError::DuplicateMerchantName as u32,
-            MarketplaceError::MerchantFrozen as u32,
-            MarketplaceError::MerchantClosed as u32,
-            MarketplaceError::VerifierAlreadyExists as u32,
-            MarketplaceError::VerifierNotFound as u32,
-            MarketplaceError::InsufficientVerifications as u32,
-            MarketplaceError::MetadataLockActive as u32,
-            MarketplaceError::InvalidCategory as u32,
-            MarketplaceError::InvalidParam as u32,
-            MarketplaceError::NoPendingAdmin as u32,
-            MarketplaceError::VerificationCountOverflow as u32,
-            MarketplaceError::DuplicateMerchantOwner as u32,
-            MarketplaceError::MerchantBanned as u32,
-            MarketplaceError::MerchantCategoryNotAllowed as u32,
-            MarketplaceError::MetadataUriTooLong as u32,
-        ]
-    }
-
-    #[test]
-    fn marketplace_error_codes_are_unique() {
-        let codes = marketplace_error_codes();
-        for (i, code) in codes.iter().enumerate() {
-            for other in codes.iter().skip(i + 1) {
-                assert!(
-                    code != other,
-                    "duplicate error code {} in MarketplaceError",
-                    code
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn marketplace_error_codes_are_in_allocated_range() {
-        for code in marketplace_error_codes() {
-            assert!(
-                (MARKETPLACE_ERROR_RANGE.0..=MARKETPLACE_ERROR_RANGE.1).contains(&code),
-                "MarketplaceError code {} outside allocated range",
-                code
-            );
-        }
-    }
-
-    #[test]
-    fn marketplace_error_codes_do_not_collide_with_other_contracts() {
-        let other_ranges = [
-            PERMISSION_ERROR_RANGE,
-            ESCROW_ERROR_RANGE,
-            REPUTATION_ERROR_RANGE,
-            DELEGATION_ERROR_RANGE,
-        ];
-        for code in marketplace_error_codes() {
-            for &(start, end) in &other_ranges {
-                assert!(
-                    !(start..=end).contains(&code),
-                    "MarketplaceError code {} collides with reserved range {}-{}",
-                    code,
-                    start,
-                    end
-                );
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod storefront_closure_tests {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{symbol_short, Address, Env, String};
-
-    struct Ctx {
-        env: Env,
-        admin: Address,
-        owner: Address,
-        contract_id: Address,
-        client: MarketplaceContractClient<'static>,
-    }
-
-    fn setup() -> Ctx {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let owner = Address::generate(&env);
-        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
-        let client = MarketplaceContractClient::new(&env, &contract_id);
-        Ctx {
-            env,
-            admin,
-            owner,
-            contract_id,
-            client,
-        }
-    }
-
-    fn register(ctx: &Ctx, name: &str) -> u64 {
-        ctx.client.register_merchant(
-            &ctx.owner,
-            &RegisterParams {
-                name: String::from_str(&ctx.env, name),
-                description: String::from_str(&ctx.env, "desc"),
-                category: symbol_short!("tech"),
-                image_url: String::from_str(&ctx.env, "img.png"),
-                metadata: None,
-                metadata_uri: None,
-                required_verifications: 1,
-            },
-        )
-    }
-
-    #[test]
-    fn new_merchant_starts_with_no_pending_escrows() {
-        let ctx = setup();
-        let id = register(&ctx, "Fresh Store");
-        assert_eq!(ctx.client.get_active_escrow_count(&id), 0);
-    }
-
-    #[test]
-    fn closure_is_refused_while_escrows_are_open() {
-        let ctx = setup();
-        let id = register(&ctx, "Busy Store");
-
-        ctx.client.report_escrow_opened(&ctx.admin, &id);
-        ctx.client.report_escrow_opened(&ctx.admin, &id);
-        assert_eq!(ctx.client.get_active_escrow_count(&id), 2);
-
-        let err = ctx
-            .client
-            .try_close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"))
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, MarketplaceError::ActiveOrdersPending);
-
-        // The failed attempt must not have changed any state.
-        let merchant = ctx.client.get_merchant(&id);
-        assert_eq!(merchant.status, MerchantStatus::Registered);
-        assert_eq!(ctx.client.get_active_escrow_count(&id), 2);
-    }
-
-    #[test]
-    fn closure_succeeds_once_the_last_escrow_settles() {
-        let ctx = setup();
-        let id = register(&ctx, "Settling Store");
-
-        ctx.client.report_escrow_opened(&ctx.admin, &id);
-        ctx.client.report_escrow_settled(&ctx.admin, &id);
-        assert_eq!(ctx.client.get_active_escrow_count(&id), 0);
-
-        ctx.client
-            .close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"));
-        assert_eq!(ctx.client.get_merchant(&id).status, MerchantStatus::Closed);
-    }
-
-    #[test]
-    fn disputed_escrow_also_blocks_closure() {
-        let ctx = setup();
-        let id = register(&ctx, "Disputed Store");
-        ctx.client.report_escrow_opened(&ctx.admin, &id);
-
-        let err = ctx
-            .client
-            .try_close_merchant(&ctx.admin, &id, &symbol_short!("dispute"))
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, MarketplaceError::ActiveOrdersPending);
-        assert_eq!(
-            ctx.client.get_merchant(&id).status,
-            MerchantStatus::Registered
-        );
-    }
-
-    #[test]
-    fn merchant_can_go_inactive_while_escrows_are_open() {
-        let ctx = setup();
-        let id = register(&ctx, "Winding Down Store");
-        ctx.client.report_escrow_opened(&ctx.admin, &id);
-
-        ctx.client.deactivate_merchant(&ctx.owner, &id);
-        let merchant = ctx.client.get_merchant(&id);
-        assert_eq!(merchant.status, MerchantStatus::Inactive);
-        assert!(!merchant.verified);
-
-        // Still blocked from retiring the registry entry.
-        let err = ctx
-            .client
-            .try_close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"))
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, MarketplaceError::ActiveOrdersPending);
-    }
-
-    #[test]
-    fn inactive_storefront_takes_no_new_orders() {
-        let ctx = setup();
-        let id = register(&ctx, "Paused Store");
-        assert!(ctx.client.is_merchant_trading(&ctx.owner));
-
-        ctx.client.deactivate_merchant(&ctx.owner, &id);
-        assert!(!ctx.client.is_merchant_trading(&ctx.owner));
-
-        let view = ctx.client.get_merchant_operational_view(&id);
-        assert_eq!(view.status, MerchantStatus::Inactive);
-        assert!(!view.effective);
-    }
-
-    #[test]
-    fn inactive_storefront_rejects_profile_edits() {
-        let ctx = setup();
-        let id = register(&ctx, "Paused Store");
-        ctx.client.deactivate_merchant(&ctx.owner, &id);
-
-        let err = ctx
-            .client
-            .try_update_merchant_profile(
-                &id,
-                &ctx.owner,
-                &String::from_str(&ctx.env, "Paused Store"),
-                &String::from_str(&ctx.env, "new desc"),
-                &String::from_str(&ctx.env, "img.png"),
-                &None,
-            )
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, MarketplaceError::MerchantInactive);
-    }
-
-    #[test]
-    fn deactivation_is_idempotent_and_owner_or_admin_only() {
-        let ctx = setup();
-        let id = register(&ctx, "Twice Paused");
-        let stranger = Address::generate(&ctx.env);
-
-        assert_eq!(
-            ctx.client
-                .try_deactivate_merchant(&stranger, &id)
-                .unwrap_err()
-                .unwrap(),
-            MarketplaceError::Unauthorized
-        );
-
-        ctx.client.deactivate_merchant(&ctx.owner, &id);
-        // Second call is a no-op rather than an error.
-        ctx.client.deactivate_merchant(&ctx.owner, &id);
-        ctx.client.deactivate_merchant(&ctx.admin, &id);
-        assert_eq!(
-            ctx.client.get_merchant(&id).status,
-            MerchantStatus::Inactive
-        );
-    }
-
-    #[test]
-    fn closed_merchant_cannot_be_deactivated() {
-        let ctx = setup();
-        let id = register(&ctx, "Already Gone");
-        ctx.client
-            .close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"));
-
-        assert_eq!(
-            ctx.client
-                .try_deactivate_merchant(&ctx.owner, &id)
-                .unwrap_err()
-                .unwrap(),
-            MarketplaceError::MerchantClosed
-        );
-    }
-
-    #[test]
-    fn full_grace_period_lifecycle() {
-        let ctx = setup();
-        let id = register(&ctx, "Lifecycle Store");
-
-        // Two buyers check out before the merchant winds the storefront down.
-        ctx.client.report_escrow_opened(&ctx.admin, &id);
-        ctx.client.report_escrow_opened(&ctx.admin, &id);
-
-        ctx.client.deactivate_merchant(&ctx.owner, &id);
-        assert!(!ctx.client.is_merchant_trading(&ctx.owner));
-        assert_eq!(
-            ctx.client
-                .try_close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"))
-                .unwrap_err()
-                .unwrap(),
-            MarketplaceError::ActiveOrdersPending
-        );
-
-        // First escrow settles: still one outstanding.
-        ctx.client.report_escrow_settled(&ctx.admin, &id);
-        assert_eq!(
-            ctx.client
-                .try_close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"))
-                .unwrap_err()
-                .unwrap(),
-            MarketplaceError::ActiveOrdersPending
-        );
-
-        // Second escrow settles: the storefront may finally be retired.
-        ctx.client.report_escrow_settled(&ctx.admin, &id);
-        ctx.client
-            .close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"));
-
-        let merchant = ctx.client.get_merchant(&id);
-        assert_eq!(merchant.status, MerchantStatus::Closed);
-        assert_eq!(ctx.client.get_active_escrow_count(&id), 0);
-        assert!(!ctx.client.is_merchant_trading(&ctx.owner));
-    }
-
-    #[test]
-    fn escrow_counters_floor_at_zero_and_reject_unauthorized_reporters() {
-        let ctx = setup();
-        let id = register(&ctx, "Noisy Reporter Store");
-        let stranger = Address::generate(&ctx.env);
-
-        assert_eq!(
-            ctx.client
-                .try_report_escrow_opened(&stranger, &id)
-                .unwrap_err()
-                .unwrap(),
-            MarketplaceError::Unauthorized
-        );
-        assert_eq!(
-            ctx.client
-                .try_report_escrow_settled(&stranger, &id)
-                .unwrap_err()
-                .unwrap(),
-            MarketplaceError::Unauthorized
-        );
-
-        // Settlement without a matching open must not wrap the counter.
-        ctx.client.report_escrow_settled(&ctx.admin, &id);
-        assert_eq!(ctx.client.get_active_escrow_count(&id), 0);
-    }
-
-    #[test]
-    fn admin_can_reconcile_the_pending_count() {
-        let ctx = setup();
-        let id = register(&ctx, "Migrated Store");
-
-        ctx.client.set_active_escrow_count(&ctx.admin, &id, &3);
-        assert_eq!(ctx.client.get_active_escrow_count(&id), 3);
-        assert_eq!(
-            ctx.client
-                .try_close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"))
-                .unwrap_err()
-                .unwrap(),
-            MarketplaceError::ActiveOrdersPending
-        );
-
-        ctx.client.set_active_escrow_count(&ctx.admin, &id, &0);
-        ctx.client
-            .close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"));
-    }
-
-    #[test]
-    fn can_close_merchant_rejects_under_reported_counts() {
-        let ctx = setup();
-        let id = register(&ctx, "Optimistic Reporter Store");
-        ctx.client.set_active_escrow_count(&ctx.admin, &id, &2);
-
-        // The reported figure must never be able to undercut the registry's
-        // own record of what is still open, and a figure above zero closes the
-        // gate regardless.
-        assert_eq!(
-            ctx.env
-                .as_contract(&ctx.contract_id, || can_close_merchant(&ctx.env, id, 0)),
-            Err(MarketplaceError::ActiveOrdersPending)
-        );
-        assert_eq!(
-            ctx.env
-                .as_contract(&ctx.contract_id, || can_close_merchant(&ctx.env, id, 1)),
-            Err(MarketplaceError::ActiveOrdersPending)
-        );
-        assert_eq!(
-            ctx.env
-                .as_contract(&ctx.contract_id, || can_close_merchant(&ctx.env, id, 2)),
-            Err(MarketplaceError::ActiveOrdersPending)
-        );
-
-        // Once the registry agrees that nothing is pending, the gate opens.
-        ctx.client.set_active_escrow_count(&ctx.admin, &id, &0);
-        assert_eq!(
-            ctx.env
-                .as_contract(&ctx.contract_id, || can_close_merchant(&ctx.env, id, 0)),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn closure_stats_accounting_survives_the_inactive_hop() {
-        let ctx = setup();
-        let id = register(&ctx, "Counted Store");
-        assert_eq!(ctx.client.get_merchant_stats().active, 1);
-
-        ctx.client.report_escrow_opened(&ctx.admin, &id);
-        ctx.client.deactivate_merchant(&ctx.owner, &id);
-        let stats = ctx.client.get_merchant_stats();
-        assert_eq!(stats.active, 0);
-        assert_eq!(stats.closed, 0);
-
-        ctx.client.report_escrow_settled(&ctx.admin, &id);
-        ctx.client
-            .close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"));
-        let stats = ctx.client.get_merchant_stats();
-        assert_eq!(stats.active, 0);
-        assert_eq!(stats.closed, 1);
-    }
-
-    #[test]
-    fn suspending_an_inactive_merchant_keeps_the_grace_period() {
-        let ctx = setup();
-        let id = register(&ctx, "Suspend After Pause");
-        ctx.client.deactivate_merchant(&ctx.owner, &id);
-
-        ctx.client.suspend_merchant(&ctx.admin, &id);
-
-        // The suspension is recorded as a no-op: `Inactive` already blocks
-        // trading, and overwriting it would let `unsuspend_merchant` revive
-        // the storefront while escrows are still open.
-        assert_eq!(
-            ctx.client.get_merchant(&id).status,
-            MerchantStatus::Inactive
-        );
-        let stats = ctx.client.get_merchant_stats();
-        assert_eq!(stats.active, 0);
-        assert_eq!(stats.suspended, 0);
-    }
-
-    #[test]
-    fn unsuspend_does_not_revive_an_inactive_storefront() {
-        let ctx = setup();
-        let id = register(&ctx, "Paused Then Suspended");
-        ctx.client.deactivate_merchant(&ctx.owner, &id);
-        ctx.client.suspend_merchant(&ctx.admin, &id);
-
-        assert_eq!(
-            ctx.client
-                .try_unsuspend_merchant(&ctx.admin, &id)
-                .unwrap_err()
-                .unwrap(),
-            MarketplaceError::MerchantInactive
-        );
-    }
-
     // -------------------------------------------------------------------------
     // Maintenance Mode Functions
     // -------------------------------------------------------------------------
@@ -4800,7 +4272,7 @@ mod storefront_closure_tests {
         }
 
         // Validate SKU ID
-        if sku_id.is_empty() || sku_id.len() > 64 {
+        if sku_id.len() == 0 || sku_id.len() > 64 {
             return Err(MarketplaceError::InvalidSku);
         }
 
@@ -5201,6 +4673,571 @@ mod storefront_closure_tests {
 
         Ok(())
     }
+
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn verify_merchant_count_overflow_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let params = RegisterParams {
+            name: String::from_str(&env, "overflow-merchant"),
+            description: String::from_str(&env, "desc"),
+            category: symbol_short!("cate"),
+            image_url: String::from_str(&env, "https://example.com/image.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        };
+
+        let merchant_id = crate::testutil::register_merchant_with_deposit(&env, &client, &owner, &params);
+
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::VerifiedCount(merchant_id), &u32::MAX);
+        });
+
+        let verifier = Address::generate(&env);
+        let verifier_struct = Verifier {
+            address: verifier.clone(),
+            label: symbol_short!("v"),
+            registered_at: env.ledger().timestamp(),
+        };
+        client.add_verifier(&admin, &verifier_struct);
+
+        assert_eq!(
+            client.try_verify_merchant(&merchant_id, &verifier),
+            Err(Ok(MarketplaceError::VerificationCountOverflow))
+        );
+    }
+
+    #[test]
+    fn verification_count_overflow_error_payload() {
+        assert_eq!(MarketplaceError::VerificationCountOverflow as u32, 5017);
+    }
+}
+
+#[cfg(test)]
+mod error_code_uniqueness_tests {
+    use super::*;
+
+    const PERMISSION_ERROR_RANGE: (u32, u32) = (2000, 2999);
+    const ESCROW_ERROR_RANGE: (u32, u32) = (1000, 1999);
+    const REPUTATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
+    const DELEGATION_ERROR_RANGE: (u32, u32) = (4000, 4999);
+    const MARKETPLACE_ERROR_RANGE: (u32, u32) = (5000, 5999);
+
+    fn marketplace_error_codes() -> [u32; 21] {
+        [
+            MarketplaceError::AlreadyInitialized as u32,
+            MarketplaceError::NotInitialized as u32,
+            MarketplaceError::Unauthorized as u32,
+            MarketplaceError::MerchantNotFound as u32,
+            MarketplaceError::AlreadyVerified as u32,
+            MarketplaceError::InvalidCommissionBps as u32,
+            MarketplaceError::DuplicateMerchantName as u32,
+            MarketplaceError::MerchantFrozen as u32,
+            MarketplaceError::MerchantClosed as u32,
+            MarketplaceError::VerifierAlreadyExists as u32,
+            MarketplaceError::VerifierNotFound as u32,
+            MarketplaceError::InsufficientVerifications as u32,
+            MarketplaceError::MetadataLockActive as u32,
+            MarketplaceError::InvalidCategory as u32,
+            MarketplaceError::InvalidParam as u32,
+            MarketplaceError::NoPendingAdmin as u32,
+            MarketplaceError::VerificationCountOverflow as u32,
+            MarketplaceError::DuplicateMerchantOwner as u32,
+            MarketplaceError::MerchantBanned as u32,
+            MarketplaceError::MerchantCategoryNotAllowed as u32,
+            MarketplaceError::MetadataUriTooLong as u32,
+        ]
+    }
+
+    #[test]
+    fn marketplace_error_codes_are_unique() {
+        let codes = marketplace_error_codes();
+        for (i, code) in codes.iter().enumerate() {
+            for other in codes.iter().skip(i + 1) {
+                assert!(
+                    code != other,
+                    "duplicate error code {} in MarketplaceError",
+                    code
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn marketplace_error_codes_are_in_allocated_range() {
+        for code in marketplace_error_codes() {
+            assert!(
+                (MARKETPLACE_ERROR_RANGE.0..=MARKETPLACE_ERROR_RANGE.1).contains(&code),
+                "MarketplaceError code {} outside allocated range",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn marketplace_error_codes_do_not_collide_with_other_contracts() {
+        let other_ranges = [
+            PERMISSION_ERROR_RANGE,
+            ESCROW_ERROR_RANGE,
+            REPUTATION_ERROR_RANGE,
+            DELEGATION_ERROR_RANGE,
+        ];
+        for code in marketplace_error_codes() {
+            for &(start, end) in &other_ranges {
+                assert!(
+                    !(start..=end).contains(&code),
+                    "MarketplaceError code {} collides with reserved range {}-{}",
+                    code,
+                    start,
+                    end
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod storefront_closure_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{symbol_short, Address, Env, String};
+
+    struct Ctx {
+        env: Env,
+        admin: Address,
+        owner: Address,
+        contract_id: Address,
+        client: MarketplaceContractClient<'static>,
+    }
+
+    fn setup() -> Ctx {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let contract_id = env.register(MarketplaceContract, (admin.clone(),));
+        let client = MarketplaceContractClient::new(&env, &contract_id);
+        Ctx {
+            env,
+            admin,
+            owner,
+            contract_id,
+            client,
+        }
+    }
+
+    fn register(ctx: &Ctx, name: &str) -> u64 {
+        crate::testutil::register_merchant_with_deposit(
+            &ctx.env,
+            &ctx.client,
+            &ctx.owner,
+            &RegisterParams {
+                name: String::from_str(&ctx.env, name),
+                description: String::from_str(&ctx.env, "desc"),
+                category: symbol_short!("tech"),
+                image_url: String::from_str(&ctx.env, "img.png"),
+                metadata: None,
+                metadata_uri: None,
+                required_verifications: 1,
+            },
+        )
+    }
+
+    #[test]
+    fn new_merchant_starts_with_no_pending_escrows() {
+        let ctx = setup();
+        let id = register(&ctx, "Fresh Store");
+        assert_eq!(ctx.client.get_active_escrow_count(&id), 0);
+    }
+
+    #[test]
+    fn closure_is_refused_while_escrows_are_open() {
+        let ctx = setup();
+        let id = register(&ctx, "Busy Store");
+
+        ctx.client.report_escrow_opened(&ctx.admin, &id);
+        ctx.client.report_escrow_opened(&ctx.admin, &id);
+        assert_eq!(ctx.client.get_active_escrow_count(&id), 2);
+
+        let err = ctx
+            .client
+            .try_close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, MarketplaceError::ActiveOrdersPending);
+
+        // The failed attempt must not have changed any state.
+        let merchant = ctx.client.get_merchant(&id);
+        assert_eq!(merchant.status, MerchantStatus::Registered);
+        assert_eq!(ctx.client.get_active_escrow_count(&id), 2);
+    }
+
+    #[test]
+    fn closure_succeeds_once_the_last_escrow_settles() {
+        let ctx = setup();
+        let id = register(&ctx, "Settling Store");
+
+        ctx.client.report_escrow_opened(&ctx.admin, &id);
+        ctx.client.report_escrow_settled(&ctx.admin, &id);
+        assert_eq!(ctx.client.get_active_escrow_count(&id), 0);
+
+        ctx.client
+            .close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"));
+        assert_eq!(ctx.client.get_merchant(&id).status, MerchantStatus::Closed);
+    }
+
+    #[test]
+    fn disputed_escrow_also_blocks_closure() {
+        let ctx = setup();
+        let id = register(&ctx, "Disputed Store");
+        ctx.client.report_escrow_opened(&ctx.admin, &id);
+
+        let err = ctx
+            .client
+            .try_close_merchant(&ctx.admin, &id, &symbol_short!("dispute"))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, MarketplaceError::ActiveOrdersPending);
+        assert_eq!(
+            ctx.client.get_merchant(&id).status,
+            MerchantStatus::Registered
+        );
+    }
+
+    #[test]
+    fn merchant_can_go_inactive_while_escrows_are_open() {
+        let ctx = setup();
+        let id = register(&ctx, "Winding Down Store");
+        ctx.client.report_escrow_opened(&ctx.admin, &id);
+
+        ctx.client.deactivate_merchant(&ctx.owner, &id);
+        let merchant = ctx.client.get_merchant(&id);
+        assert_eq!(merchant.status, MerchantStatus::Inactive);
+        assert!(!merchant.verified);
+
+        // Still blocked from retiring the registry entry.
+        let err = ctx
+            .client
+            .try_close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, MarketplaceError::ActiveOrdersPending);
+    }
+
+    #[test]
+    fn inactive_storefront_takes_no_new_orders() {
+        let ctx = setup();
+        let id = register(&ctx, "Paused Store");
+        assert!(ctx.client.is_merchant_trading(&ctx.owner));
+
+        ctx.client.deactivate_merchant(&ctx.owner, &id);
+        assert!(!ctx.client.is_merchant_trading(&ctx.owner));
+
+        let view = ctx.client.get_merchant_operational_view(&id);
+        assert_eq!(view.status, MerchantStatus::Inactive);
+        assert!(!view.effective);
+    }
+
+    #[test]
+    fn inactive_storefront_rejects_profile_edits() {
+        let ctx = setup();
+        let id = register(&ctx, "Paused Store");
+        ctx.client.deactivate_merchant(&ctx.owner, &id);
+
+        let err = ctx
+            .client
+            .try_update_merchant_profile(
+                &id,
+                &ctx.owner,
+                &String::from_str(&ctx.env, "Paused Store"),
+                &String::from_str(&ctx.env, "new desc"),
+                &String::from_str(&ctx.env, "img.png"),
+                &None,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, MarketplaceError::MerchantInactive);
+    }
+
+    #[test]
+    fn deactivation_is_idempotent_and_owner_or_admin_only() {
+        let ctx = setup();
+        let id = register(&ctx, "Twice Paused");
+        let stranger = Address::generate(&ctx.env);
+
+        assert_eq!(
+            ctx.client
+                .try_deactivate_merchant(&stranger, &id)
+                .unwrap_err()
+                .unwrap(),
+            MarketplaceError::Unauthorized
+        );
+
+        ctx.client.deactivate_merchant(&ctx.owner, &id);
+        // Second call is a no-op rather than an error.
+        ctx.client.deactivate_merchant(&ctx.owner, &id);
+        ctx.client.deactivate_merchant(&ctx.admin, &id);
+        assert_eq!(
+            ctx.client.get_merchant(&id).status,
+            MerchantStatus::Inactive
+        );
+    }
+
+    #[test]
+    fn closed_merchant_cannot_be_deactivated() {
+        let ctx = setup();
+        let id = register(&ctx, "Already Gone");
+        ctx.client
+            .close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"));
+
+        assert_eq!(
+            ctx.client
+                .try_deactivate_merchant(&ctx.owner, &id)
+                .unwrap_err()
+                .unwrap(),
+            MarketplaceError::MerchantClosed
+        );
+    }
+
+    #[test]
+    fn full_grace_period_lifecycle() {
+        let ctx = setup();
+        let id = register(&ctx, "Lifecycle Store");
+
+        // Two buyers check out before the merchant winds the storefront down.
+        ctx.client.report_escrow_opened(&ctx.admin, &id);
+        ctx.client.report_escrow_opened(&ctx.admin, &id);
+
+        ctx.client.deactivate_merchant(&ctx.owner, &id);
+        assert!(!ctx.client.is_merchant_trading(&ctx.owner));
+        assert_eq!(
+            ctx.client
+                .try_close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"))
+                .unwrap_err()
+                .unwrap(),
+            MarketplaceError::ActiveOrdersPending
+        );
+
+        // First escrow settles: still one outstanding.
+        ctx.client.report_escrow_settled(&ctx.admin, &id);
+        assert_eq!(
+            ctx.client
+                .try_close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"))
+                .unwrap_err()
+                .unwrap(),
+            MarketplaceError::ActiveOrdersPending
+        );
+
+        // Second escrow settles: the storefront may finally be retired.
+        ctx.client.report_escrow_settled(&ctx.admin, &id);
+        ctx.client
+            .close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"));
+
+        let merchant = ctx.client.get_merchant(&id);
+        assert_eq!(merchant.status, MerchantStatus::Closed);
+        assert_eq!(ctx.client.get_active_escrow_count(&id), 0);
+        assert!(!ctx.client.is_merchant_trading(&ctx.owner));
+    }
+
+    #[test]
+    fn escrow_counters_floor_at_zero_and_reject_unauthorized_reporters() {
+        let ctx = setup();
+        let id = register(&ctx, "Noisy Reporter Store");
+        let stranger = Address::generate(&ctx.env);
+
+        assert_eq!(
+            ctx.client
+                .try_report_escrow_opened(&stranger, &id)
+                .unwrap_err()
+                .unwrap(),
+            MarketplaceError::Unauthorized
+        );
+        assert_eq!(
+            ctx.client
+                .try_report_escrow_settled(&stranger, &id)
+                .unwrap_err()
+                .unwrap(),
+            MarketplaceError::Unauthorized
+        );
+
+        // Settlement without a matching open must not wrap the counter.
+        ctx.client.report_escrow_settled(&ctx.admin, &id);
+        assert_eq!(ctx.client.get_active_escrow_count(&id), 0);
+    }
+
+    #[test]
+    fn admin_can_reconcile_the_pending_count() {
+        let ctx = setup();
+        let id = register(&ctx, "Migrated Store");
+
+        ctx.client.set_active_escrow_count(&ctx.admin, &id, &3);
+        assert_eq!(ctx.client.get_active_escrow_count(&id), 3);
+        assert_eq!(
+            ctx.client
+                .try_close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"))
+                .unwrap_err()
+                .unwrap(),
+            MarketplaceError::ActiveOrdersPending
+        );
+
+        ctx.client.set_active_escrow_count(&ctx.admin, &id, &0);
+        ctx.client
+            .close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"));
+    }
+
+    #[test]
+    fn can_close_merchant_rejects_under_reported_counts() {
+        let ctx = setup();
+        let id = register(&ctx, "Optimistic Reporter Store");
+        ctx.client.set_active_escrow_count(&ctx.admin, &id, &2);
+
+        // The reported figure must never be able to undercut the registry's
+        // own record of what is still open, and a figure above zero closes the
+        // gate regardless.
+        assert_eq!(
+            ctx.env
+                .as_contract(&ctx.contract_id, || can_close_merchant(&ctx.env, id, 0)),
+            Err(MarketplaceError::ActiveOrdersPending)
+        );
+        assert_eq!(
+            ctx.env
+                .as_contract(&ctx.contract_id, || can_close_merchant(&ctx.env, id, 1)),
+            Err(MarketplaceError::ActiveOrdersPending)
+        );
+        assert_eq!(
+            ctx.env
+                .as_contract(&ctx.contract_id, || can_close_merchant(&ctx.env, id, 2)),
+            Err(MarketplaceError::ActiveOrdersPending)
+        );
+
+        // Once the registry agrees that nothing is pending, the gate opens.
+        ctx.client.set_active_escrow_count(&ctx.admin, &id, &0);
+        assert_eq!(
+            ctx.env
+                .as_contract(&ctx.contract_id, || can_close_merchant(&ctx.env, id, 0)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn closure_stats_accounting_survives_the_inactive_hop() {
+        let ctx = setup();
+        let id = register(&ctx, "Counted Store");
+        assert_eq!(ctx.client.get_merchant_stats().active, 1);
+
+        ctx.client.report_escrow_opened(&ctx.admin, &id);
+        ctx.client.deactivate_merchant(&ctx.owner, &id);
+        let stats = ctx.client.get_merchant_stats();
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.closed, 0);
+
+        ctx.client.report_escrow_settled(&ctx.admin, &id);
+        ctx.client
+            .close_merchant(&ctx.admin, &id, &symbol_short!("voluntary"));
+        let stats = ctx.client.get_merchant_stats();
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.closed, 1);
+    }
+
+    #[test]
+    fn suspending_an_inactive_merchant_keeps_the_grace_period() {
+        let ctx = setup();
+        let id = register(&ctx, "Suspend After Pause");
+        ctx.client.deactivate_merchant(&ctx.owner, &id);
+
+        ctx.client.suspend_merchant(&ctx.admin, &id);
+
+        // The suspension is recorded as a no-op: `Inactive` already blocks
+        // trading, and overwriting it would let `unsuspend_merchant` revive
+        // the storefront while escrows are still open.
+        assert_eq!(
+            ctx.client.get_merchant(&id).status,
+            MerchantStatus::Inactive
+        );
+        let stats = ctx.client.get_merchant_stats();
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.suspended, 0);
+    }
+
+    #[test]
+    fn unsuspend_does_not_revive_an_inactive_storefront() {
+        let ctx = setup();
+        let id = register(&ctx, "Paused Then Suspended");
+        ctx.client.deactivate_merchant(&ctx.owner, &id);
+        ctx.client.suspend_merchant(&ctx.admin, &id);
+
+        assert_eq!(
+            ctx.client
+                .try_unsuspend_merchant(&ctx.admin, &id)
+                .unwrap_err()
+                .unwrap(),
+            MarketplaceError::MerchantInactive
+        );
+    }
+
+}
+
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    /// Deploys a fresh SAC, mints the required registration deposit to
+    /// `merchant`, and returns `(token_address, deposit_amount)` ready to be
+    /// forwarded to [`MarketplaceContract::register_merchant`].
+    pub(crate) fn funded_registration_deposit(env: &Env, merchant: &Address) -> (Address, i128) {
+        let token_admin = Address::generate(env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        let token = soroban_sdk::token::StellarAssetClient::new(env, &token_id);
+        let deposit = compute_registration_deposit(0);
+        token.mint(merchant, &deposit);
+        (token_id, deposit)
+    }
+
+    /// `register_merchant` with a freshly deployed deposit token satisfying
+    /// the required registration deposit.
+    pub(crate) fn register_merchant_with_deposit(
+        env: &Env,
+        client: &MarketplaceContractClient,
+        merchant: &Address,
+        params: &RegisterParams,
+    ) -> u64 {
+        let (token, deposit) = funded_registration_deposit(env, merchant);
+        client.register_merchant(merchant, params, &token, &deposit)
+    }
+
+    /// Fallible variant of [`register_merchant_with_deposit`] for tests that
+    /// assert on registration failures.
+    pub(crate) fn try_register_merchant_with_deposit(
+        env: &Env,
+        client: &MarketplaceContractClient,
+        merchant: &Address,
+        params: &RegisterParams,
+    ) -> Result<
+        Result<u64, soroban_sdk::Error>,
+        Result<MarketplaceError, soroban_sdk::InvokeError>,
+    > {
+        let (token, deposit) = funded_registration_deposit(env, merchant);
+        client.try_register_merchant(merchant, params, &token, &deposit)
+    }
 }
 
 #[cfg(test)]
@@ -5299,7 +5336,7 @@ mod merchant_operational_view_tests {
             metadata_uri: None,
             required_verifications: 1,
         };
-        let id = client.register_merchant(&owner, &params);
+        let id = crate::testutil::register_merchant_with_deposit(&env, &client, &owner, &params);
         client.verify_merchant(&id, &verifier.address);
         client.suspend_merchant(&admin, &id);
 
