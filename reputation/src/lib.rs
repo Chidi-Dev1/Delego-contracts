@@ -109,10 +109,37 @@ pub fn compute_fixed_point_decay(initial_score: u32, elapsed_ledgers: u32) -> u3
     }
 }
 
+/// Classification of an entity in the reputation system. Merchants risk
+/// non-delivery and counterfeit items; buyer agents risk payment
+/// delinquency and frivolous dispute abuse. Each role is evaluated against
+/// domain-relevant metrics rather than a single uniform score.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EntityRole {
+    Merchant,
+    BuyerAgent,
+}
+
+/// Role-scoped performance indicators tracked alongside the base reputation
+/// score. The same three fields are stored for both roles, but risk
+/// assessment algorithms weight them differently: merchants are evaluated
+/// primarily on fulfillment rate, while buyer agents are evaluated on
+/// dispute frequency and timely payment rate.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleSpecificMetrics {
+    pub role: EntityRole,
+    pub fulfillment_rate_bps: u32,
+    pub dispute_frequency_bps: u32,
+    pub timely_payment_rate_bps: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReputationScore {
     pub entity: Address,
+    /// Classification determining which domain metrics apply to this entity.
+    pub role: EntityRole,
     /// 0-10000 basis points (0.00% to 100.00%). Masked to `0` by
     /// [`ReputationContract::get_reputation`] until `total_transactions`
     /// reaches `ReputationConfig::min_transactions_threshold`.
@@ -782,6 +809,8 @@ pub enum DataKey {
     /// Cached composite score for an entity, recomputed on each
     /// `record_transaction`/`rate_entity`.
     CompositeScore(Address),
+    /// Role-specific performance indicators for an entity, keyed by address.
+    RoleMetrics(Address),
 
     /// Marks an escrow id as already used for a `submit_verified_review`
     /// call, so the same settled escrow cannot back more than one verified
@@ -1501,6 +1530,116 @@ impl ReputationContract {
             expired,
             score_matches,
             current,
+    /// Classifies `entity` as either a merchant or buyer agent. Admin-only;
+    /// the role determines which domain metrics are relevant for risk
+    /// assessment (fulfillment for merchants, payment timeliness and dispute
+    /// frequency for buyer agents).
+    pub fn set_entity_role(
+        env: Env,
+        admin: Address,
+        entity: Address,
+        role: EntityRole,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+
+        let mut rep = Self::load_or_default_reputation(&env, &entity);
+        rep.role = role.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Reputation(entity.clone()), &rep);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Reputation(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Initialize role-specific metrics for the newly classified entity.
+        let metrics = Self::compute_role_metrics(&rep);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RoleMetrics(entity.clone()), &metrics);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RoleMetrics(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    /// Returns the role-specific performance indicators for `entity`.
+    pub fn get_role_specific_metrics(
+        env: Env,
+        entity: Address,
+    ) -> Result<RoleSpecificMetrics, ReputationError> {
+        let rep = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Reputation(entity.clone()))
+            .ok_or(ReputationError::EntityNotFound)?;
+
+        Self::bump_entity(&env, &entity);
+
+        let metrics = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RoleMetrics(entity.clone()))
+            .unwrap_or_else(|| Self::compute_role_metrics(&rep));
+        Ok(metrics)
+    }
+
+    /// Returns role-specific metrics tailored for a merchant. Returns
+    /// `EntityNotFound` if the entity has no reputation record, or if the
+    /// entity is not classified as a merchant.
+    pub fn get_merchant_metrics(
+        env: Env,
+        entity: Address,
+    ) -> Result<RoleSpecificMetrics, ReputationError> {
+        let metrics = Self::get_role_specific_metrics(env.clone(), entity.clone())?;
+        match metrics.role {
+            EntityRole::Merchant => Ok(metrics),
+            EntityRole::BuyerAgent => Err(ReputationError::EntityNotFound),
+        }
+    }
+
+    /// Returns role-specific metrics tailored for a buyer agent. Returns
+    /// `EntityNotFound` if the entity has no reputation record, or if the
+    /// entity is not classified as a buyer agent.
+    pub fn get_buyer_agent_metrics(
+        env: Env,
+        entity: Address,
+    ) -> Result<RoleSpecificMetrics, ReputationError> {
+        let metrics = Self::get_role_specific_metrics(env.clone(), entity.clone())?;
+        match metrics.role {
+            EntityRole::BuyerAgent => Ok(metrics),
+            EntityRole::Merchant => Err(ReputationError::EntityNotFound),
+        }
+    }
+
+    /// Computes role-specific performance indicators from a reputation
+    /// record. Fulfillment rate is the share of successful transactions;
+    /// dispute frequency is the share of disputed transactions; timely
+    /// payment rate mirrors fulfillment for buyer-agent risk assessment.
+    fn compute_role_metrics(rep: &ReputationScore) -> RoleSpecificMetrics {
+        let total = rep.total_transactions;
+        if total == 0 {
+            return RoleSpecificMetrics {
+                role: rep.role.clone(),
+                fulfillment_rate_bps: 0,
+                dispute_frequency_bps: 0,
+                timely_payment_rate_bps: 0,
+            };
+        }
+        let fulfillment_rate_bps =
+            (rep.successful_transactions as u128 * BPS_SCALE as u128 / total as u128) as u32;
+        let dispute_frequency_bps =
+            (rep.disputed_transactions as u128 * BPS_SCALE as u128 / total as u128) as u32;
+        RoleSpecificMetrics {
+            role: rep.role.clone(),
+            fulfillment_rate_bps,
+            dispute_frequency_bps,
+            timely_payment_rate_bps: fulfillment_rate_bps,
         }
     }
 
@@ -2336,6 +2475,7 @@ impl ReputationContract {
             .get(&DataKey::Reputation(entity.clone()))
             .unwrap_or(ReputationScore {
                 entity: entity.clone(),
+                role: EntityRole::Merchant,
                 score: 0,
                 total_transactions: 0,
                 successful_transactions: 0,
@@ -2409,6 +2549,17 @@ impl ReputationContract {
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+
+        // Keep role-specific metrics in sync with the updated lifetime counts.
+        let metrics = Self::compute_role_metrics(&rep);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RoleMetrics(entity.clone()), &metrics);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RoleMetrics(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     /// Adjusts `entity`'s lifetime counters when an already-recorded escrow's
@@ -2438,6 +2589,17 @@ impl ReputationContract {
             .set(&DataKey::Reputation(entity.clone()), &rep);
         env.storage().persistent().extend_ttl(
             &DataKey::Reputation(entity.clone()),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Keep role-specific metrics in sync with the updated lifetime counts.
+        let metrics = Self::compute_role_metrics(&rep);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RoleMetrics(entity.clone()), &metrics);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RoleMetrics(entity.clone()),
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
