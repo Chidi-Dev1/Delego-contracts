@@ -14,8 +14,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    IntoVal, InvokeError, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN,
+    ConversionError, Env, EnvBase, IntoVal, InvokeError, MapObject, String, Symbol, TryFromVal,
+    TryIntoVal, Val, Vec,
 };
 
 pub mod algorithm;
@@ -543,7 +544,8 @@ pub enum ReputationError {
     /// not in `Released` status, its `order_id` did not match
     /// `order_hash`, or `rater`/`entity` are not its buyer/seller pair
     /// (issue #286).
-    UnverifiedOrder = 0x0003_000C,
+    UnverifiedOrder = 3012,
+    /// Reporter did not flag the entity.
     NotFlagReporter = 3011,
     /// Review commitment already exists for this escrow_id.
     DuplicateReviewCommitment = 3012,
@@ -765,6 +767,11 @@ pub struct ReputationCursor {
 /// `(score_bps, merchant_id)` pair of the last record on the page, with
 /// `has_more` telling the caller whether to resume from it.
 #[contracttype]
+/// This type intentionally does not derive `contracttype`: it contains
+/// `Option<ReputationCursor>`, and the SDK's `testutils` expansion cannot
+/// convert `Option<UDT>` to `ScVal` (it requires `Into<ScVal>` for the inner
+/// type while contract types only get a `TryFrom` impl). The hand-written
+/// `Val` conversions below are the equivalent of the derive output.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RankedMerchantPage {
     pub merchants: Vec<MerchantView>,
@@ -787,7 +794,43 @@ impl RankedMerchantPage {
         Some(ReputationCursor {
             last_score_bps: self.next_last_score_bps,
             last_merchant_id: self.next_last_merchant_id,
+impl TryFromVal<Env, Val> for RankedMerchantPage {
+    type Error = ConversionError;
+
+    fn try_from_val(env: &Env, val: &Val) -> Result<Self, Self::Error> {
+        const KEYS: [&'static str; 3] = ["merchants", "next_cursor", "total_count"];
+        let mut vals: [Val; 3] = [Val::VOID.to_val(); 3];
+        let map: MapObject = val.try_into().map_err(|_| ConversionError)?;
+        env.map_unpack_to_slice(map, &KEYS, &mut vals)
+            .map_err(|_| ConversionError)?;
+        Ok(Self {
+            merchants: vals[0].try_into_val(env).map_err(|_| ConversionError)?,
+            next_cursor: vals[1].try_into_val(env).map_err(|_| ConversionError)?,
+            total_count: vals[2].try_into_val(env).map_err(|_| ConversionError)?,
         })
+    }
+}
+
+impl TryFromVal<Env, RankedMerchantPage> for Val {
+    type Error = ConversionError;
+
+    fn try_from_val(env: &Env, val: &RankedMerchantPage) -> Result<Self, Self::Error> {
+        const KEYS: [&'static str; 3] = ["merchants", "next_cursor", "total_count"];
+        let vals: [Val; 3] = [
+            (&val.merchants)
+                .try_into_val(env)
+                .map_err(|_| ConversionError)?,
+            (&val.next_cursor)
+                .try_into_val(env)
+                .map_err(|_| ConversionError)?,
+            (&val.total_count)
+                .try_into_val(env)
+                .map_err(|_| ConversionError)?,
+        ];
+        Ok(env
+            .map_new_from_slices(&KEYS, &vals)
+            .map_err(|_| ConversionError)?
+            .into())
     }
 }
 

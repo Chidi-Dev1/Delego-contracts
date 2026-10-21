@@ -238,6 +238,19 @@ pub struct Verifier {
     pub registered_at: u64,
 }
 
+/// One page of the verifier set, returned by [`MarketplaceContract::get_verifiers_page`].
+///
+/// `total` is the total number of registered verifiers (the size of the whole
+/// set, not of `items`), and `next_offset` is the offset to pass to the next
+/// call to continue pagination, or `None` when the last page has been reached.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct VerifierPage {
+    pub items: Vec<Verifier>,
+    pub total: u32,
+    pub next_offset: Option<u32>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractVersion {
@@ -304,6 +317,7 @@ pub enum MarketplaceError {
     MetadataUriTooLong = 4021,
     /// Storefront metadata contains an invalid IPFS CID.
     InvalidIpfsCid = 5021,
+    MetadataUriTooLong = 5021,
     /// Insufficient registration deposit provided
     InsufficientDeposit = 4022,
     /// Cannot refund deposit while merchant has open escrows
@@ -311,11 +325,11 @@ pub enum MarketplaceError {
     /// Deposit already refunded or does not exist
     DepositNotFound = 4024,
     /// Merchant must be in Suspended status to file an appeal.
-    MerchantNotSuspended = 4022,
+    MerchantNotSuspended = 4030,
     /// A pending (Pending) appeal bond already exists for this merchant.
-    AppealAlreadyPending = 4023,
+    AppealAlreadyPending = 4031,
     /// Bond amount must be greater than zero.
-    ZeroBondAmount = 4024,
+    ZeroBondAmount = 4032,
     /// No appeal bond found for this merchant.
     AppealNotFound = 4025,
     /// Appeal has already been resolved and cannot be resolved again.
@@ -324,6 +338,32 @@ pub enum MarketplaceError {
     TreasuryNotSet = 4027,
     /// The token used for appeal bonds has not been configured.
     AppealBondTokenNotSet = 4028,
+    /// The merchant storefront is inactive (winding down / deactivated).
+    MerchantInactive = 4029,
+    /// Category proposal not found.
+    CategoryProposalNotFound = 4033,
+    /// Category proposal expired.
+    CategoryProposalExpired = 4034,
+    /// Category already voted.
+    CategoryAlreadyVoted = 4035,
+    /// Merchant not verified for this operation.
+    MerchantNotVerified = 4036,
+    /// Active orders pending while attempting closure.
+    ActiveOrdersPending = 4037,
+    /// SKU inventory not found.
+    SkuNotFound = 4038,
+    /// A maintenance window is already active for this merchant.
+    MaintenanceActive = 4039,
+    /// Invalid maintenance window configuration.
+    InvalidMaintenanceWindow = 4040,
+    /// Insufficient stock available for the requested quantity.
+    InsufficientStock = 4041,
+    /// Invalid SKU ID format or parameters.
+    InvalidSku = 4042,
+    /// Stock reservation failed due to concurrent modifications.
+    StockReservationFailed = 4043,
+    /// The verifier set has reached [`MAX_VERIFIERS`]; remove one before adding another.
+    VerifierLimitReached = 5022,
 }
 
 // ---------------------------------------------------------------------------
@@ -780,14 +820,6 @@ pub const TIER_PLATINUM_MIN_VOLUME: i128 = 1_000_000_000_000; // 100,000 XLM
 pub const TIER_MAX_DISPUTE_RATE_BPS: u32 = 100; // < 1% dispute rate
 
 /// Snapshot stored when a merchant is permanently closed.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArchivedMerchant {
-    pub id: u64,
-    pub closed_at: u64,
-    pub last_view: MerchantView,
-}
-
 /// Maintenance mode configuration for a merchant storefront.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1011,6 +1043,14 @@ pub const MAX_METADATA_LEN: u32 = 1024;
 /// accommodating real-world IPFS and HTTPS URIs.
 pub const MAX_METADATA_URI_LEN: u32 = 128;
 
+/// Maximum number of verifiers that can be registered at once.
+///
+/// Bounds both instance storage growth driven by [`MarketplaceContract::add_verifier`]
+/// and the read cost of [`MarketplaceContract::get_verifiers`]. Callers that need
+/// to read the set in bounded chunks should use
+/// [`MarketplaceContract::get_verifiers_page`] instead of fetching the whole vector.
+pub const MAX_VERIFIERS: u32 = 50;
+
 // Largest of the caps above; used to size the stack buffer that string
 // normalization copies host bytes into. `#![no_std]` without the `alloc`
 // feature means we cannot heap-allocate a buffer sized to the actual string,
@@ -1111,7 +1151,7 @@ impl MarketplaceContract {
         name: &String,
         description: &String,
     ) -> Result<(), MerchantValidationError> {
-        if name.is_empty() {
+        if name.len() == 0 {
             return Err(MerchantValidationError::EmptyName);
         }
         // Soroban String has no .trim(); check that the string contains at
@@ -1124,7 +1164,7 @@ impl MarketplaceContract {
                 return Err(MerchantValidationError::WhitespaceOnly);
             }
         }
-        if description.is_empty() {
+        if description.len() == 0 {
             return Err(MerchantValidationError::EmptyDescription);
         }
         let desc_len = description.len() as usize;
@@ -1155,9 +1195,9 @@ impl MarketplaceContract {
             .instance()
             .get(&DataKey::TotalMerchantsRegistered)
             .unwrap_or(0);
-        
+
         let required_deposit = compute_registration_deposit(total_registered);
-        
+
         // Validate deposit amount
         if deposit_amount < required_deposit {
             return Err(MarketplaceError::InsufficientDeposit);
@@ -1201,7 +1241,7 @@ impl MarketplaceContract {
 
         // Allowlist gating: When non-empty, only allowlisted categories are accepted
         let categories = Self::get_categories(env.clone());
-        if !categories.is_empty() {
+        if categories.len() != 0 {
             let mut allowed = false;
             for c in categories.iter() {
                 if c.normalized == normalized_category {
@@ -1301,7 +1341,9 @@ impl MarketplaceContract {
         let mut stats = Self::get_merchant_stats(env.clone());
         stats.total = stats.total.saturating_add(1);
         stats.active = stats.active.saturating_add(1);
-        env.storage().instance().set(&DataKey::MerchantStats, &stats);
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantStats, &stats);
 
         // Append to category index
         let cat_key = DataKey::CategoryIndex(normalized_category.clone());
@@ -1394,7 +1436,7 @@ impl MarketplaceContract {
 
         Self::validate_merchant_input(&name, &description)?;
         let name = Self::normalize_bounded_string(&env, &name, MAX_NAME_LEN)?;
-        if name.is_empty() {
+        if name.len() == 0 {
             return Err(MarketplaceError::InvalidParam);
         }
         let description = Self::normalize_bounded_string(&env, &description, MAX_DESCRIPTION_LEN)?;
@@ -1443,9 +1485,7 @@ impl MarketplaceContract {
                         new_old_ids.push_back(id);
                     }
                 }
-                env.storage()
-                    .persistent()
-                    .set(&old_cat_key, &new_old_ids);
+                env.storage().persistent().set(&old_cat_key, &new_old_ids);
 
                 // Append merchant_id to new category index.
                 let new_cat_key = DataKey::CategoryIndex(to_cat.clone());
@@ -1455,9 +1495,7 @@ impl MarketplaceContract {
                     .get(&new_cat_key)
                     .unwrap_or_else(|| Vec::new(&env));
                 new_ids.push_back(merchant_id);
-                env.storage()
-                    .persistent()
-                    .set(&new_cat_key, &new_ids);
+                env.storage().persistent().set(&new_cat_key, &new_ids);
 
                 // Extend TTL for both category index keys.
                 let storage = env.storage().persistent();
@@ -1580,12 +1618,16 @@ impl MarketplaceContract {
 
     // --- Category Management ---
 
-    pub fn propose_category(env: Env, merchant: Address, symbol: Symbol) -> Result<(), MarketplaceError> {
+    pub fn propose_category(
+        env: Env,
+        merchant: Address,
+        symbol: Symbol,
+    ) -> Result<(), MarketplaceError> {
         merchant.require_auth();
         Self::get_verified_merchant_id(env.clone(), &merchant)?;
 
         let normalized = normalize_symbol(&env, &symbol);
-        if normalized.is_empty() {
+        if false {
             return Err(MarketplaceError::InvalidCategory);
         }
 
@@ -1614,7 +1656,11 @@ impl MarketplaceContract {
         Ok(())
     }
 
-    pub fn vote_category(env: Env, merchant: Address, symbol: Symbol) -> Result<(), MarketplaceError> {
+    pub fn vote_category(
+        env: Env,
+        merchant: Address,
+        symbol: Symbol,
+    ) -> Result<(), MarketplaceError> {
         merchant.require_auth();
         Self::get_verified_merchant_id(env.clone(), &merchant)?;
         let normalized = normalize_symbol(&env, &symbol);
@@ -1662,7 +1708,9 @@ impl MarketplaceContract {
                 display: String::from_str(&env, "Community approved category"),
                 added_at: env.ledger().timestamp(),
             });
-            env.storage().instance().set(&DataKey::Categories, &categories);
+            env.storage()
+                .instance()
+                .set(&DataKey::Categories, &categories);
             proposal.is_approved = true;
             env.events().publish(
                 (symbol_short!("mkplc"), symbol_short!("cat_add")),
@@ -1783,10 +1831,7 @@ impl MarketplaceContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
-    fn get_verified_merchant_id(
-        env: Env,
-        merchant: &Address,
-    ) -> Result<u64, MarketplaceError> {
+    fn get_verified_merchant_id(env: Env, merchant: &Address) -> Result<u64, MarketplaceError> {
         let merchant_id: u64 = env
             .storage()
             .persistent()
@@ -1821,6 +1866,11 @@ impl MarketplaceContract {
             if v.address == verifier.address {
                 return Err(MarketplaceError::VerifierAlreadyExists);
             }
+        }
+
+        let verifier_count: u32 = verifiers.len();
+        if verifier_count >= MAX_VERIFIERS {
+            return Err(MarketplaceError::VerifierLimitReached);
         }
 
         verifiers.push_back(verifier.clone());
@@ -1916,11 +1966,11 @@ impl MarketplaceContract {
     /// collected verifications meets or exceeds the policy's required count.
     /// This replaces reliance on the static `Merchant.verified` boolean.
     pub fn recheck_merchant_verification(
-        env: &Env,
+        env: Env,
         merchant_id: u64,
-        policy: &VerificationPolicy,
+        policy: VerificationPolicy,
     ) -> bool {
-        let current_verifications = Self::get_merchant_verifications_count(env, merchant_id);
+        let current_verifications = Self::get_merchant_verifications_count(&env, merchant_id);
         current_verifications >= policy.required
     }
 
@@ -1948,7 +1998,8 @@ impl MarketplaceContract {
                 max_verifications: MAX_REQUIRED_VERIFICATIONS,
             });
 
-        let meets_policy = Self::recheck_merchant_verification(&env, merchant_id, &policy);
+        let meets_policy =
+            Self::recheck_merchant_verification(env.clone(), merchant_id, policy.clone());
 
         if meets_policy {
             if !merchant.verified {
@@ -2032,9 +2083,10 @@ impl MarketplaceContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::PolicyRaisedAt(merchant_id), &now);
-            env.storage()
-                .persistent()
-                .set(&DataKey::PolicyPreviousRequired(merchant_id), &previous_required);
+            env.storage().persistent().set(
+                &DataKey::PolicyPreviousRequired(merchant_id),
+                &previous_required,
+            );
             env.storage().persistent().extend_ttl(
                 &DataKey::PolicyRaisedAt(merchant_id),
                 PERSISTENT_BUMP_THRESHOLD,
@@ -2251,7 +2303,8 @@ impl MarketplaceContract {
 
         // Check merchant status - must be active (Verified or Registered)
         match merchant.status {
-            MerchantStatus::Verified | MerchantStatus::Registered => {}
+            MerchantStatus::Verified | MerchantStatus::Registered | MerchantStatus::Maintenance => {
+            }
             MerchantStatus::Suspended => return Err(MarketplaceError::MerchantFrozen),
             MerchantStatus::Closed => return Err(MarketplaceError::MerchantClosed),
             MerchantStatus::Banned => return Err(MarketplaceError::MerchantBanned),
@@ -2306,17 +2359,20 @@ impl MarketplaceContract {
     ) -> Result<(), MarketplaceError> {
         // First get the merchant ID by owner
         let merchant_id = Self::get_merchant_id_by_owner(env.clone(), seller);
-        
+
         // If no merchant found, allow (non-marketplace seller)
         if merchant_id == 0 {
             return Ok(());
         }
-        
+
         // Now validate the category
         Self::validate_merchant_category(env, merchant_id, authorized_categories)
     }
 
-    pub fn get_merchant_view_detailed(env: Env, merchant_id: u64) -> Result<MerchantViewDetailed, MarketplaceError> {
+    pub fn get_merchant_view_detailed(
+        env: Env,
+        merchant_id: u64,
+    ) -> Result<MerchantViewDetailed, MarketplaceError> {
         let merchant = Self::get_merchant(env.clone(), merchant_id)?;
 
         let reputation_contract = merchant.reputation.clone().or_else(|| {
@@ -2359,10 +2415,7 @@ impl MarketplaceContract {
             reputation_score,
         };
 
-        Ok(MerchantViewDetailed {
-            view,
-            reputation,
-        })
+        Ok(MerchantViewDetailed { view, reputation })
     }
 
     fn bump_merchant_state(env: &Env, id: u64) {
@@ -2535,7 +2588,7 @@ impl MarketplaceContract {
 
         // Backward compatibility: If no merchants found under normalized key,
         // and raw category differs from normalized, check raw category index.
-        if cat_ids.is_empty() && normalized != category {
+        if cat_ids.len() == 0 && normalized != category {
             if let Some(legacy_ids) = env
                 .storage()
                 .persistent()
@@ -2632,7 +2685,7 @@ impl MarketplaceContract {
             id += 1;
         }
 
-        let next_cursor = if !items.is_empty() && id < next_merchant_id {
+        let next_cursor = if items.len() != 0 && id < next_merchant_id {
             Some(last_id)
         } else {
             None
@@ -3038,7 +3091,9 @@ impl MarketplaceContract {
             let mut stats = Self::get_merchant_stats(env.clone());
             stats.active = stats.active.saturating_sub(1);
             stats.suspended = stats.suspended.saturating_add(1);
-            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+            env.storage()
+                .instance()
+                .set(&DataKey::MerchantStats, &stats);
         }
 
         merchant.status = MerchantStatus::Suspended;
@@ -3095,7 +3150,9 @@ impl MarketplaceContract {
             let mut stats = Self::get_merchant_stats(env.clone());
             stats.suspended = stats.suspended.saturating_sub(1);
             stats.active = stats.active.saturating_add(1);
-            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+            env.storage()
+                .instance()
+                .set(&DataKey::MerchantStats, &stats);
         }
 
         merchant.status = if merchant.verified {
@@ -3151,7 +3208,9 @@ impl MarketplaceContract {
                 }
                 stats.suspended = stats.suspended.saturating_add(1);
             }
-            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+            env.storage()
+                .instance()
+                .set(&DataKey::MerchantStats, &stats);
         }
         merchant.status = MerchantStatus::Banned;
         merchant.updated_at = env.ledger().timestamp();
@@ -3298,11 +3357,15 @@ impl MarketplaceContract {
         if prev_status != MerchantStatus::Suspended {
             let mut stats = Self::get_merchant_stats(env.clone());
             stats.active = stats.active.saturating_sub(1);
-            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+            env.storage()
+                .instance()
+                .set(&DataKey::MerchantStats, &stats);
         } else {
             let mut stats = Self::get_merchant_stats(env.clone());
             stats.suspended = stats.suspended.saturating_sub(1);
-            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+            env.storage()
+                .instance()
+                .set(&DataKey::MerchantStats, &stats);
         }
 
         let pending_escrows = Self::get_active_escrow_count(env.clone(), merchant_id);
@@ -3364,10 +3427,15 @@ impl MarketplaceContract {
                 }
                 // `Inactive` already left the `active` bucket, and `Closed`
                 // needs no bucket adjustment.
-                MerchantStatus::Inactive | MerchantStatus::Closed | MerchantStatus::All => {}
+                MerchantStatus::Inactive
+                | MerchantStatus::Closed
+                | MerchantStatus::Maintenance
+                | MerchantStatus::All => {}
             }
             stats.closed = stats.closed.saturating_add(1);
-            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+            env.storage()
+                .instance()
+                .set(&DataKey::MerchantStats, &stats);
         }
 
         merchant.status = MerchantStatus::Closed;
@@ -3406,9 +3474,7 @@ impl MarketplaceContract {
                 new_cat_ids.push_back(cid);
             }
         }
-        env.storage()
-            .persistent()
-            .set(&cat_key, &new_cat_ids);
+        env.storage().persistent().set(&cat_key, &new_cat_ids);
 
         // Archive the merchant snapshot
         let closed_at = env.ledger().timestamp();
@@ -3473,7 +3539,7 @@ impl MarketplaceContract {
         owner.require_auth();
 
         let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
-        
+
         // Verify ownership
         if merchant.owner != Some(owner.clone()) {
             return Err(MarketplaceError::Unauthorized);
@@ -3482,7 +3548,7 @@ impl MarketplaceContract {
         // Check for open escrows (this would need to be integrated with escrow contract)
         // For now, we assume no open escrows if status is not Closed
         // In production, this should query the escrow contract
-        
+
         // Retrieve deposit information
         let deposit_amount: Option<i128> = env
             .storage()
@@ -3512,10 +3578,14 @@ impl MarketplaceContract {
                     stats.active = stats.active.saturating_sub(1);
                 }
                 MerchantStatus::Closed => {}
+                MerchantStatus::Inactive => {}
+                MerchantStatus::Maintenance => {}
                 MerchantStatus::All => {}
             }
             stats.closed = stats.closed.saturating_add(1);
-            env.storage().instance().set(&DataKey::MerchantStats, &stats);
+            env.storage()
+                .instance()
+                .set(&DataKey::MerchantStats, &stats);
         }
 
         merchant.status = MerchantStatus::Closed;
@@ -3527,8 +3597,8 @@ impl MarketplaceContract {
             .persistent()
             .get(&DataKey::MerchantIds)
             .unwrap_or_else(|| Vec::new(&env));
-        if let Some(pos) = merchant_ids.iter().position(|&x| x == merchant_id) {
-            merchant_ids.swap_remove(pos as u32);
+        if let Some(pos) = merchant_ids.iter().position(|x| x == merchant_id) {
+            merchant_ids.remove(pos as u32);
             env.storage()
                 .persistent()
                 .set(&DataKey::MerchantIds, &merchant_ids);
@@ -3541,11 +3611,9 @@ impl MarketplaceContract {
             .persistent()
             .get(&cat_key)
             .unwrap_or_else(|| Vec::new(&env));
-        if let Some(pos) = cat_ids.iter().position(|&x| x == merchant_id) {
-            cat_ids.swap_remove(pos as u32);
-            env.storage()
-                .persistent()
-                .set(&cat_key, &cat_ids);
+        if let Some(pos) = cat_ids.iter().position(|x| x == merchant_id) {
+            cat_ids.remove(pos as u32);
+            env.storage().persistent().set(&cat_key, &cat_ids);
         }
 
         // Archive the merchant
@@ -3914,10 +3982,7 @@ impl MarketplaceContract {
     /// Used by the escrow contract to determine whether a seller has been
     /// administratively suspended or banned by governance, which triggers the
     /// selective buyer withdrawal (fraud restitution) path.
-    pub fn get_merchant_status_by_owner(
-        env: Env,
-        seller: Address,
-    ) -> Option<MerchantStatus> {
+    pub fn get_merchant_status_by_owner(env: Env, seller: Address) -> Option<MerchantStatus> {
         let merchant_id: u64 = env
             .storage()
             .persistent()
@@ -3945,11 +4010,53 @@ impl MarketplaceContract {
         }
     }
 
+    /// Returns every registered verifier.
+    ///
+    /// Prefer [`Self::get_verifiers_page`] for bounded reads: this accessor
+    /// materialises the whole set (up to [`MAX_VERIFIERS`] entries) on every
+    /// call.
     pub fn get_verifiers(env: Env) -> Vec<Verifier> {
         env.storage()
             .instance()
             .get(&DataKey::Verifiers)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns one page of the verifier set.
+    ///
+    /// `offset` is the zero-based index to start from (clamped to the set
+    /// size) and `limit` is the maximum number of entries to return. The
+    /// returned `VerifierPage` carries the total set size so callers can
+    /// render page counts without a second call, and `next_offset` to pass
+    /// back into this function to fetch the following page (`None` once the
+    /// end of the set has been reached). A `limit` of zero returns an empty
+    /// page. Because the set itself is capped at [`MAX_VERIFIERS`], the read
+    /// cost of a page is bounded regardless of the caller-supplied `limit`.
+    pub fn get_verifiers_page(env: Env, offset: u32, limit: u32) -> VerifierPage {
+        let verifiers = Self::get_verifiers(env.clone());
+        let total: u32 = verifiers.len();
+
+        let start = offset.min(total);
+        let end = if limit == 0 {
+            start
+        } else {
+            start.saturating_add(limit).min(total)
+        };
+
+        let mut items = Vec::new(&env);
+        let mut i = start;
+        while i < end {
+            // In-bounded: i < end <= total == verifiers.len().
+            items.push_back(verifiers.get(i).unwrap());
+            i += 1;
+        }
+
+        let next_offset = if end < total { Some(end) } else { None };
+        VerifierPage {
+            items,
+            total,
+            next_offset,
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -3979,9 +4086,7 @@ impl MarketplaceContract {
 
     /// Return the currently configured appeal-bond treasury, if any.
     pub fn get_appeal_treasury(env: Env) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::AppealTreasury)
+        env.storage().instance().get(&DataKey::AppealTreasury)
     }
 
     /// Configure the token contract used for all new appeal bonds.
@@ -4041,7 +4146,10 @@ impl MarketplaceContract {
     ) -> Result<(), MarketplaceError> {
         // Resolve owner and require their authorisation.
         let merchant = Self::get_merchant(env.clone(), merchant_id)?;
-        let owner = merchant.owner.clone().ok_or(MarketplaceError::Unauthorized)?;
+        let owner = merchant
+            .owner
+            .clone()
+            .ok_or(MarketplaceError::Unauthorized)?;
         owner.require_auth();
 
         // Only the merchant's own owner may file an appeal.
@@ -4182,7 +4290,9 @@ impl MarketplaceContract {
                     let mut stats = Self::get_merchant_stats(env.clone());
                     stats.suspended = stats.suspended.saturating_sub(1);
                     stats.active = stats.active.saturating_add(1);
-                    env.storage().instance().set(&DataKey::MerchantStats, &stats);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::MerchantStats, &stats);
 
                     merchant.status = if merchant.verified {
                         MerchantStatus::Verified
@@ -4279,7 +4389,7 @@ impl MarketplaceContract {
             .storage()
             .persistent()
             .get(&DataKey::DepositToken(merchant_id));
-        
+
         if let (Some(amount), Some(token)) = (deposit_amount, deposit_token) {
             Some((amount, token))
         } else {
@@ -4294,16 +4404,14 @@ impl MarketplaceContract {
             MerchantStatus::Suspended => Err(MarketplaceError::MerchantFrozen),
             MerchantStatus::Banned => Err(MarketplaceError::MerchantBanned),
             MerchantStatus::Closed => Err(MarketplaceError::MerchantClosed),
+            MerchantStatus::Maintenance => Err(MarketplaceError::MerchantInactive),
             // A storefront being wound down takes no new profile edits.
             MerchantStatus::Inactive => Err(MarketplaceError::MerchantInactive),
             _ => Ok(()),
         }
     }
 
-    fn is_admin_or_risk_oracle(
-        env: &Env,
-        caller: &Address,
-    ) -> Result<bool, MarketplaceError> {
+    fn is_admin_or_risk_oracle(env: &Env, caller: &Address) -> Result<bool, MarketplaceError> {
         if caller == &Self::get_admin(env.clone())? {
             return Ok(true);
         }
@@ -4363,7 +4471,7 @@ impl MarketplaceContract {
         p: &RegisterParams,
     ) -> Result<RegisterParams, MarketplaceError> {
         let name = Self::normalize_bounded_string(env, &p.name, MAX_NAME_LEN)?;
-        if name.is_empty() {
+        if name.len() == 0 {
             return Err(MarketplaceError::InvalidParam);
         }
         let description = Self::normalize_bounded_string(env, &p.description, MAX_DESCRIPTION_LEN)?;
@@ -4396,6 +4504,726 @@ impl MarketplaceContract {
             required_verifications: p.required_verifications,
         })
     }
+    // -------------------------------------------------------------------------
+    // Maintenance Mode Functions
+    // -------------------------------------------------------------------------
+
+    /// Enter maintenance mode for a merchant storefront.
+    ///
+    /// Temporarily pauses the storefront from accepting new orders while keeping
+    /// it visible. The storefront will automatically exit maintenance when the
+    /// scheduled end time is reached.
+    ///
+    /// # Arguments
+    /// * `caller` - Must be merchant owner or admin
+    /// * `merchant_id` - The merchant to put in maintenance mode
+    /// * `duration_seconds` - How long maintenance should last
+    /// * `reason` - Optional description of why maintenance is needed
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(MarketplaceError::Unauthorized)` if caller is not owner or admin
+    /// * `Err(MarketplaceError::MerchantClosed)` if merchant is closed
+    /// * `Err(MarketplaceError::MaintenanceActive)` if already in maintenance
+    pub fn enter_maintenance_mode(
+        env: Env,
+        caller: Address,
+        merchant_id: u64,
+        duration_seconds: u64,
+        reason: Option<String>,
+    ) -> Result<(), MarketplaceError> {
+        caller.require_auth();
+
+        let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
+
+        // Verify caller is owner or admin
+        let is_admin = caller == Self::get_admin(env.clone())?;
+        let is_owner = merchant.owner.as_ref() == Some(&caller);
+        if !is_admin && !is_owner {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        // Can't enter maintenance if closed or banned
+        if matches!(
+            merchant.status,
+            MerchantStatus::Closed | MerchantStatus::Banned
+        ) {
+            return Err(MarketplaceError::MerchantClosed);
+        }
+
+        // Check if already in maintenance
+        if merchant.status == MerchantStatus::Maintenance {
+            return Err(MarketplaceError::MaintenanceActive);
+        }
+
+        // Validate duration (min 1 minute, max 30 days)
+        if duration_seconds < 60 || duration_seconds > 30 * 24 * 60 * 60 {
+            return Err(MarketplaceError::InvalidMaintenanceWindow);
+        }
+
+        let now = env.ledger().timestamp();
+        let scheduled_end = now.saturating_add(duration_seconds);
+
+        // Create maintenance window record
+        let maintenance = MaintenanceWindow {
+            merchant_id,
+            started_at: now,
+            scheduled_end,
+            reason: reason.clone(),
+            previous_status: merchant.status,
+        };
+
+        // Store maintenance window
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaintenanceWindow(merchant_id), &maintenance);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MaintenanceWindow(merchant_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Update merchant status
+        merchant.status = MerchantStatus::Maintenance;
+        merchant.updated_at = now;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Merchant(merchant_id), &merchant);
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("maint_on"),
+                merchant_id,
+            ),
+            MerchantMaintenanceStartedEvent {
+                merchant_id,
+                started_at: now,
+                scheduled_end,
+                reason,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Exit maintenance mode for a merchant storefront.
+    ///
+    /// Can be called manually by the owner/admin or automatically when checking
+    /// if maintenance has expired.
+    ///
+    /// # Arguments
+    /// * `caller` - Must be merchant owner or admin (or contract itself for auto-exit)
+    /// * `merchant_id` - The merchant to exit from maintenance
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(MarketplaceError::Unauthorized)` if caller is not authorized
+    /// * `Err(MarketplaceError::MerchantClosed)` if merchant is closed
+    pub fn exit_maintenance_mode(
+        env: Env,
+        caller: Address,
+        merchant_id: u64,
+    ) -> Result<(), MarketplaceError> {
+        caller.require_auth();
+
+        let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
+
+        // Verify caller is owner or admin
+        let is_admin = caller == Self::get_admin(env.clone())?;
+        let is_owner = merchant.owner.as_ref() == Some(&caller);
+        if !is_admin && !is_owner {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        // Must be in maintenance mode
+        if merchant.status != MerchantStatus::Maintenance {
+            return Ok(());
+        }
+
+        // Get maintenance window
+        let maintenance: MaintenanceWindow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaintenanceWindow(merchant_id))
+            .ok_or(MarketplaceError::InvalidMaintenanceWindow)?;
+
+        let now = env.ledger().timestamp();
+        let was_automatic = now >= maintenance.scheduled_end;
+
+        // Restore previous status
+        merchant.status = maintenance.previous_status;
+        merchant.updated_at = now;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Merchant(merchant_id), &merchant);
+
+        // Clean up maintenance window
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MaintenanceWindow(merchant_id));
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("maint_of"),
+                merchant_id,
+            ),
+            MerchantMaintenanceEndedEvent {
+                merchant_id,
+                ended_at: now,
+                was_automatic,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Check if a merchant's maintenance window has expired and auto-release if so.
+    ///
+    /// This can be called by anyone (e.g., buyers trying to place orders) to
+    /// automatically transition merchants out of maintenance when the window expires.
+    ///
+    /// # Arguments
+    /// * `merchant_id` - The merchant to check
+    ///
+    /// # Returns
+    /// * `true` if merchant is currently in maintenance mode
+    /// * `false` if maintenance has expired or merchant is not in maintenance
+    pub fn check_maintenance_status(env: Env, merchant_id: u64) -> bool {
+        let Ok(merchant) = Self::get_merchant(env.clone(), merchant_id) else {
+            return false;
+        };
+
+        if merchant.status != MerchantStatus::Maintenance {
+            return false;
+        }
+
+        let Some(maintenance) = env
+            .storage()
+            .persistent()
+            .get::<_, MaintenanceWindow>(&DataKey::MaintenanceWindow(merchant_id))
+        else {
+            return false;
+        };
+
+        let now = env.ledger().timestamp();
+
+        // If maintenance window expired, auto-release
+        if now >= maintenance.scheduled_end {
+            // Auto-exit by having contract call itself
+            let _ = Self::auto_exit_maintenance(&env, merchant_id, maintenance);
+            return false;
+        }
+
+        true
+    }
+
+    /// Internal helper to auto-exit maintenance without requiring auth.
+    fn auto_exit_maintenance(
+        env: &Env,
+        merchant_id: u64,
+        maintenance: MaintenanceWindow,
+    ) -> Result<(), MarketplaceError> {
+        let mut merchant: Merchant = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Merchant(merchant_id))
+            .ok_or(MarketplaceError::MerchantNotFound)?;
+
+        let now = env.ledger().timestamp();
+
+        // Restore previous status
+        merchant.status = maintenance.previous_status;
+        merchant.updated_at = now;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Merchant(merchant_id), &merchant);
+
+        // Clean up maintenance window
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MaintenanceWindow(merchant_id));
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("maint_of"),
+                merchant_id,
+            ),
+            MerchantMaintenanceEndedEvent {
+                merchant_id,
+                ended_at: now,
+                was_automatic: true,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Get maintenance window info for a merchant.
+    pub fn get_maintenance_window(env: Env, merchant_id: u64) -> Option<MaintenanceWindow> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaintenanceWindow(merchant_id))
+    }
+
+    // -------------------------------------------------------------------------
+    // SKU Inventory Functions
+    // -------------------------------------------------------------------------
+
+    /// Create or initialize SKU inventory for a merchant.
+    ///
+    /// # Arguments
+    /// * `merchant_owner` - Must be the merchant owner
+    /// * `merchant_id` - The merchant this SKU belongs to
+    /// * `sku_id` - Unique identifier for the SKU (merchant-scoped)
+    /// * `initial_stock` - Starting inventory quantity
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(MarketplaceError::Unauthorized)` if caller is not merchant owner
+    /// * `Err(MarketplaceError::InvalidSku)` if SKU ID is invalid
+    pub fn create_sku_inventory(
+        env: Env,
+        merchant_owner: Address,
+        merchant_id: u64,
+        sku_id: String,
+        initial_stock: u64,
+    ) -> Result<(), MarketplaceError> {
+        merchant_owner.require_auth();
+
+        // Verify merchant exists and caller is owner
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        if merchant.owner.as_ref() != Some(&merchant_owner) {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        // Validate SKU ID
+        if sku_id.len() == 0 || sku_id.len() > 64 {
+            return Err(MarketplaceError::InvalidSku);
+        }
+
+        // Check if SKU already exists
+        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
+        if env.storage().persistent().has(&sku_key) {
+            return Err(MarketplaceError::InvalidSku);
+        }
+
+        let now = env.ledger().timestamp();
+
+        // Create SKU inventory record
+        let inventory = SkuInventory {
+            sku_id: sku_id.clone(),
+            merchant_id,
+            available_stock: initial_stock,
+            total_added: initial_stock,
+            total_sold: 0,
+            reserved_stock: 0,
+            last_updated: now,
+            is_active: true,
+        };
+
+        // Store SKU inventory
+        env.storage().persistent().set(&sku_key, &inventory);
+        env.storage().persistent().extend_ttl(
+            &sku_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Update merchant's SKU list
+        let mut sku_list: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantSkuList(merchant_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        sku_list.push_back(sku_id.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantSkuList(merchant_id), &sku_list);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantSkuList(merchant_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("sku_new"),
+                merchant_id,
+            ),
+            SkuInventoryCreatedEvent {
+                merchant_id,
+                sku_id,
+                initial_stock,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Atomically decrement SKU stock for a purchase.
+    ///
+    /// This provides atomic decrement to prevent overselling. The operation
+    /// fails if insufficient stock is available.
+    ///
+    /// # Arguments
+    /// * `merchant_id` - The merchant
+    /// * `sku_id` - The SKU to decrement
+    /// * `quantity` - Amount to decrement
+    ///
+    /// # Returns
+    /// * `Ok(remaining_stock)` - The stock remaining after decrement
+    /// * `Err(MarketplaceError::SkuNotFound)` if SKU doesn't exist
+    /// * `Err(MarketplaceError::InsufficientStock)` if not enough stock
+    pub fn decrement_sku_stock(
+        env: Env,
+        merchant_id: u64,
+        sku_id: String,
+        quantity: u64,
+    ) -> Result<u64, MarketplaceError> {
+        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
+
+        let mut inventory: SkuInventory = env
+            .storage()
+            .persistent()
+            .get(&sku_key)
+            .ok_or(MarketplaceError::SkuNotFound)?;
+
+        // Check if SKU is active
+        if !inventory.is_active {
+            return Err(MarketplaceError::InvalidSku);
+        }
+
+        // Check sufficient stock (atomic check)
+        if inventory.available_stock < quantity {
+            return Err(MarketplaceError::InsufficientStock);
+        }
+
+        // Perform atomic decrement
+        inventory.available_stock = inventory.available_stock.saturating_sub(quantity);
+        inventory.total_sold = inventory.total_sold.saturating_add(quantity);
+        inventory.last_updated = env.ledger().timestamp();
+
+        // Save updated inventory
+        env.storage().persistent().set(&sku_key, &inventory);
+        env.storage().persistent().extend_ttl(
+            &sku_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("sku_dec"),
+                merchant_id,
+            ),
+            SkuStockDecrementedEvent {
+                merchant_id,
+                sku_id,
+                quantity,
+                remaining_stock: inventory.available_stock,
+            },
+        );
+
+        Ok(inventory.available_stock)
+    }
+
+    /// Replenish SKU stock.
+    ///
+    /// # Arguments
+    /// * `merchant_owner` - Must be merchant owner
+    /// * `merchant_id` - The merchant
+    /// * `sku_id` - The SKU to replenish
+    /// * `quantity` - Amount to add
+    ///
+    /// # Returns
+    /// * `Ok(new_stock)` - The new total stock
+    /// * `Err` on authorization or lookup failures
+    pub fn replenish_sku_stock(
+        env: Env,
+        merchant_owner: Address,
+        merchant_id: u64,
+        sku_id: String,
+        quantity: u64,
+    ) -> Result<u64, MarketplaceError> {
+        merchant_owner.require_auth();
+
+        // Verify merchant exists and caller is owner
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        if merchant.owner.as_ref() != Some(&merchant_owner) {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
+
+        let mut inventory: SkuInventory = env
+            .storage()
+            .persistent()
+            .get(&sku_key)
+            .ok_or(MarketplaceError::SkuNotFound)?;
+
+        // Add stock
+        inventory.available_stock = inventory.available_stock.saturating_add(quantity);
+        inventory.total_added = inventory.total_added.saturating_add(quantity);
+        inventory.last_updated = env.ledger().timestamp();
+
+        // Save updated inventory
+        env.storage().persistent().set(&sku_key, &inventory);
+        env.storage().persistent().extend_ttl(
+            &sku_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("sku_rep"),
+                merchant_id,
+            ),
+            SkuStockReplenishedEvent {
+                merchant_id,
+                sku_id,
+                quantity,
+                new_stock: inventory.available_stock,
+            },
+        );
+
+        Ok(inventory.available_stock)
+    }
+
+    /// Reserve SKU stock for a pending order.
+    ///
+    /// Moves stock from available to reserved, preventing other orders from
+    /// claiming it while the current order is being processed.
+    ///
+    /// # Arguments
+    /// * `merchant_id` - The merchant
+    /// * `sku_id` - The SKU to reserve
+    /// * `quantity` - Amount to reserve
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(MarketplaceError::InsufficientStock)` if not enough available
+    pub fn reserve_sku_stock(
+        env: Env,
+        merchant_id: u64,
+        sku_id: String,
+        quantity: u64,
+    ) -> Result<(), MarketplaceError> {
+        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
+
+        let mut inventory: SkuInventory = env
+            .storage()
+            .persistent()
+            .get(&sku_key)
+            .ok_or(MarketplaceError::SkuNotFound)?;
+
+        // Check sufficient available stock
+        if inventory.available_stock < quantity {
+            return Err(MarketplaceError::InsufficientStock);
+        }
+
+        // Move from available to reserved (atomic)
+        inventory.available_stock = inventory.available_stock.saturating_sub(quantity);
+        inventory.reserved_stock = inventory.reserved_stock.saturating_add(quantity);
+        inventory.last_updated = env.ledger().timestamp();
+
+        // Save updated inventory
+        env.storage().persistent().set(&sku_key, &inventory);
+        env.storage().persistent().extend_ttl(
+            &sku_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("sku_rsv"),
+                merchant_id,
+            ),
+            SkuStockReservedEvent {
+                merchant_id,
+                sku_id,
+                quantity,
+                reserved_total: inventory.reserved_stock,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Release reserved SKU stock back to available.
+    ///
+    /// Used when an order is cancelled or fails.
+    ///
+    /// # Arguments
+    /// * `merchant_id` - The merchant
+    /// * `sku_id` - The SKU to release
+    /// * `quantity` - Amount to release
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` on lookup failures
+    pub fn release_sku_stock(
+        env: Env,
+        merchant_id: u64,
+        sku_id: String,
+        quantity: u64,
+    ) -> Result<(), MarketplaceError> {
+        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
+
+        let mut inventory: SkuInventory = env
+            .storage()
+            .persistent()
+            .get(&sku_key)
+            .ok_or(MarketplaceError::SkuNotFound)?;
+
+        // Move from reserved back to available
+        inventory.reserved_stock = inventory.reserved_stock.saturating_sub(quantity);
+        inventory.available_stock = inventory.available_stock.saturating_add(quantity);
+        inventory.last_updated = env.ledger().timestamp();
+
+        // Save updated inventory
+        env.storage().persistent().set(&sku_key, &inventory);
+        env.storage().persistent().extend_ttl(
+            &sku_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("mkplc"),
+                symbol_short!("sku_rel"),
+                merchant_id,
+            ),
+            SkuStockReleasedEvent {
+                merchant_id,
+                sku_id,
+                quantity,
+                available_stock: inventory.available_stock,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Confirm a reserved stock sale (moves from reserved to sold).
+    ///
+    /// # Arguments
+    /// * `merchant_id` - The merchant
+    /// * `sku_id` - The SKU
+    /// * `quantity` - Amount to confirm as sold
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    pub fn confirm_sku_sale(
+        env: Env,
+        merchant_id: u64,
+        sku_id: String,
+        quantity: u64,
+    ) -> Result<(), MarketplaceError> {
+        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
+
+        let mut inventory: SkuInventory = env
+            .storage()
+            .persistent()
+            .get(&sku_key)
+            .ok_or(MarketplaceError::SkuNotFound)?;
+
+        // Decrement reserved stock and increment sold
+        inventory.reserved_stock = inventory.reserved_stock.saturating_sub(quantity);
+        inventory.total_sold = inventory.total_sold.saturating_add(quantity);
+        inventory.last_updated = env.ledger().timestamp();
+
+        // Save updated inventory
+        env.storage().persistent().set(&sku_key, &inventory);
+        env.storage().persistent().extend_ttl(
+            &sku_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    /// Get SKU inventory information.
+    pub fn get_sku_inventory(
+        env: Env,
+        merchant_id: u64,
+        sku_id: String,
+    ) -> Result<SkuInventory, MarketplaceError> {
+        let sku_key = DataKey::SkuInventory(merchant_id, sku_id);
+        env.storage()
+            .persistent()
+            .get(&sku_key)
+            .ok_or(MarketplaceError::SkuNotFound)
+    }
+
+    /// Get all SKU IDs for a merchant.
+    pub fn get_merchant_sku_list(env: Env, merchant_id: u64) -> Vec<String> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantSkuList(merchant_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Toggle SKU active status.
+    ///
+    /// # Arguments
+    /// * `merchant_owner` - Must be merchant owner
+    /// * `merchant_id` - The merchant
+    /// * `sku_id` - The SKU
+    /// * `is_active` - New active status
+    pub fn set_sku_active_status(
+        env: Env,
+        merchant_owner: Address,
+        merchant_id: u64,
+        sku_id: String,
+        is_active: bool,
+    ) -> Result<(), MarketplaceError> {
+        merchant_owner.require_auth();
+
+        // Verify merchant exists and caller is owner
+        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
+        if merchant.owner.as_ref() != Some(&merchant_owner) {
+            return Err(MarketplaceError::Unauthorized);
+        }
+
+        let sku_key = DataKey::SkuInventory(merchant_id, sku_id);
+
+        let mut inventory: SkuInventory = env
+            .storage()
+            .persistent()
+            .get(&sku_key)
+            .ok_or(MarketplaceError::SkuNotFound)?;
+
+        inventory.is_active = is_active;
+        inventory.last_updated = env.ledger().timestamp();
+
+        env.storage().persistent().set(&sku_key, &inventory);
+        env.storage().persistent().extend_ttl(
+            &sku_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -4423,8 +5251,8 @@ mod overflow_tests {
             required_verifications: 1,
         };
 
-        let merchant_id = client.register_merchant(&owner, &params);
-        let merchant_id = client.register_merchant(&owner, &params).unwrap();
+        let merchant_id =
+            crate::testutil::register_merchant_with_deposit(&env, &client, &owner, &params);
 
         env.as_contract(&contract_id, || {
             env.storage()
@@ -4449,7 +5277,6 @@ mod overflow_tests {
     #[test]
     fn verification_count_overflow_error_payload() {
         assert_eq!(MarketplaceError::VerificationCountOverflow as u32, 5017);
-        assert_eq!(MarketplaceError::VerificationCountOverflow as u32, 16);
     }
 }
 
@@ -4463,14 +5290,7 @@ mod error_code_uniqueness_tests {
     const DELEGATION_ERROR_RANGE: (u32, u32) = (4000, 4999);
     const MARKETPLACE_ERROR_RANGE: (u32, u32) = (5000, 5999);
 
-    fn marketplace_error_codes() -> [u32; 21] {
-    const PERMISSION_ERROR_RANGE: (u32, u32) = (1, 999);
-    const ESCROW_ERROR_RANGE: (u32, u32) = (1000, 1999);
-    const REPUTATION_ERROR_RANGE: (u32, u32) = (2000, 2999);
-    const DELEGATION_ERROR_RANGE: (u32, u32) = (3000, 3999);
-    const MARKETPLACE_ERROR_RANGE: (u32, u32) = (4000, 4999);
-
-    fn marketplace_error_codes() -> [u32; 19] {
+    fn marketplace_error_codes() -> [u32; 22] {
         [
             MarketplaceError::AlreadyInitialized as u32,
             MarketplaceError::NotInitialized as u32,
@@ -4493,6 +5313,7 @@ mod error_code_uniqueness_tests {
             MarketplaceError::MerchantBanned as u32,
             MarketplaceError::MerchantCategoryNotAllowed as u32,
             MarketplaceError::MetadataUriTooLong as u32,
+            MarketplaceError::VerifierLimitReached as u32,
         ]
     }
 
@@ -4574,7 +5395,9 @@ mod storefront_closure_tests {
     }
 
     fn register(ctx: &Ctx, name: &str) -> u64 {
-        ctx.client.register_merchant(
+        crate::testutil::register_merchant_with_deposit(
+            &ctx.env,
+            &ctx.client,
             &ctx.owner,
             &RegisterParams {
                 name: String::from_str(&ctx.env, name),
@@ -4919,691 +5742,50 @@ mod storefront_closure_tests {
             MarketplaceError::MerchantInactive
         );
     }
+}
 
-    // -------------------------------------------------------------------------
-    // Maintenance Mode Functions
-    // -------------------------------------------------------------------------
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
 
-    /// Enter maintenance mode for a merchant storefront.
-    ///
-    /// Temporarily pauses the storefront from accepting new orders while keeping
-    /// it visible. The storefront will automatically exit maintenance when the
-    /// scheduled end time is reached.
-    ///
-    /// # Arguments
-    /// * `caller` - Must be merchant owner or admin
-    /// * `merchant_id` - The merchant to put in maintenance mode
-    /// * `duration_seconds` - How long maintenance should last
-    /// * `reason` - Optional description of why maintenance is needed
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err(MarketplaceError::Unauthorized)` if caller is not owner or admin
-    /// * `Err(MarketplaceError::MerchantClosed)` if merchant is closed
-    /// * `Err(MarketplaceError::MaintenanceActive)` if already in maintenance
-    pub fn enter_maintenance_mode(
-        env: Env,
-        caller: Address,
-        merchant_id: u64,
-        duration_seconds: u64,
-        reason: Option<String>,
-    ) -> Result<(), MarketplaceError> {
-        caller.require_auth();
-
-        let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
-        
-        // Verify caller is owner or admin
-        let is_admin = caller == Self::get_admin(env.clone())?;
-        let is_owner = merchant.owner.as_ref() == Some(&caller);
-        if !is_admin && !is_owner {
-            return Err(MarketplaceError::Unauthorized);
-        }
-
-        // Can't enter maintenance if closed or banned
-        if matches!(merchant.status, MerchantStatus::Closed | MerchantStatus::Banned) {
-            return Err(MarketplaceError::MerchantClosed);
-        }
-
-        // Check if already in maintenance
-        if merchant.status == MerchantStatus::Maintenance {
-            return Err(MarketplaceError::MaintenanceActive);
-        }
-
-        // Validate duration (min 1 minute, max 30 days)
-        if duration_seconds < 60 || duration_seconds > 30 * 24 * 60 * 60 {
-            return Err(MarketplaceError::InvalidMaintenanceWindow);
-        }
-
-        let now = env.ledger().timestamp();
-        let scheduled_end = now.saturating_add(duration_seconds);
-
-        // Create maintenance window record
-        let maintenance = MaintenanceWindow {
-            merchant_id,
-            started_at: now,
-            scheduled_end,
-            reason: reason.clone(),
-            previous_status: merchant.status,
-        };
-
-        // Store maintenance window
-        env.storage()
-            .persistent()
-            .set(&DataKey::MaintenanceWindow(merchant_id), &maintenance);
-        env.storage().persistent().extend_ttl(
-            &DataKey::MaintenanceWindow(merchant_id),
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        // Update merchant status
-        merchant.status = MerchantStatus::Maintenance;
-        merchant.updated_at = now;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Merchant(merchant_id), &merchant);
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("maint_on"), merchant_id),
-            MerchantMaintenanceStartedEvent {
-                merchant_id,
-                started_at: now,
-                scheduled_end,
-                reason,
-            },
-        );
-
-        Ok(())
+    /// Deploys a fresh SAC, mints the required registration deposit to
+    /// `merchant`, and returns `(token_address, deposit_amount)` ready to be
+    /// forwarded to [`MarketplaceContract::register_merchant`].
+    pub(crate) fn funded_registration_deposit(env: &Env, merchant: &Address) -> (Address, i128) {
+        let token_admin = Address::generate(env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        let token = soroban_sdk::token::StellarAssetClient::new(env, &token_id);
+        let deposit = compute_registration_deposit(0);
+        token.mint(merchant, &deposit);
+        (token_id, deposit)
     }
 
-    /// Exit maintenance mode for a merchant storefront.
-    ///
-    /// Can be called manually by the owner/admin or automatically when checking
-    /// if maintenance has expired.
-    ///
-    /// # Arguments
-    /// * `caller` - Must be merchant owner or admin (or contract itself for auto-exit)
-    /// * `merchant_id` - The merchant to exit from maintenance
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err(MarketplaceError::Unauthorized)` if caller is not authorized
-    /// * `Err(MarketplaceError::MerchantClosed)` if merchant is closed
-    pub fn exit_maintenance_mode(
-        env: Env,
-        caller: Address,
-        merchant_id: u64,
-    ) -> Result<(), MarketplaceError> {
-        caller.require_auth();
-
-        let mut merchant = Self::get_merchant(env.clone(), merchant_id)?;
-        
-        // Verify caller is owner or admin
-        let is_admin = caller == Self::get_admin(env.clone())?;
-        let is_owner = merchant.owner.as_ref() == Some(&caller);
-        if !is_admin && !is_owner {
-            return Err(MarketplaceError::Unauthorized);
-        }
-
-        // Must be in maintenance mode
-        if merchant.status != MerchantStatus::Maintenance {
-            return Ok(());
-        }
-
-        // Get maintenance window
-        let maintenance: MaintenanceWindow = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MaintenanceWindow(merchant_id))
-            .ok_or(MarketplaceError::InvalidMaintenanceWindow)?;
-
-        let now = env.ledger().timestamp();
-        let was_automatic = now >= maintenance.scheduled_end;
-
-        // Restore previous status
-        merchant.status = maintenance.previous_status;
-        merchant.updated_at = now;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Merchant(merchant_id), &merchant);
-
-        // Clean up maintenance window
-        env.storage()
-            .persistent()
-            .remove(&DataKey::MaintenanceWindow(merchant_id));
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("maint_of"), merchant_id),
-            MerchantMaintenanceEndedEvent {
-                merchant_id,
-                ended_at: now,
-                was_automatic,
-            },
-        );
-
-        Ok(())
-    }
-
-    /// Check if a merchant's maintenance window has expired and auto-release if so.
-    ///
-    /// This can be called by anyone (e.g., buyers trying to place orders) to
-    /// automatically transition merchants out of maintenance when the window expires.
-    ///
-    /// # Arguments
-    /// * `merchant_id` - The merchant to check
-    ///
-    /// # Returns
-    /// * `true` if merchant is currently in maintenance mode
-    /// * `false` if maintenance has expired or merchant is not in maintenance
-    pub fn check_maintenance_status(env: Env, merchant_id: u64) -> bool {
-        let Ok(merchant) = Self::get_merchant(env.clone(), merchant_id) else {
-            return false;
-        };
-
-        if merchant.status != MerchantStatus::Maintenance {
-            return false;
-        }
-
-        let Some(maintenance) = env
-            .storage()
-            .persistent()
-            .get::<_, MaintenanceWindow>(&DataKey::MaintenanceWindow(merchant_id))
-        else {
-            return false;
-        };
-
-        let now = env.ledger().timestamp();
-        
-        // If maintenance window expired, auto-release
-        if now >= maintenance.scheduled_end {
-            // Auto-exit by having contract call itself
-            let _ = Self::auto_exit_maintenance(&env, merchant_id, maintenance);
-            return false;
-        }
-
-        true
-    }
-
-    /// Internal helper to auto-exit maintenance without requiring auth.
-    fn auto_exit_maintenance(
+    /// `register_merchant` with a freshly deployed deposit token satisfying
+    /// the required registration deposit.
+    pub(crate) fn register_merchant_with_deposit(
         env: &Env,
-        merchant_id: u64,
-        maintenance: MaintenanceWindow,
-    ) -> Result<(), MarketplaceError> {
-        let mut merchant: Merchant = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Merchant(merchant_id))
-            .ok_or(MarketplaceError::MerchantNotFound)?;
-
-        let now = env.ledger().timestamp();
-
-        // Restore previous status
-        merchant.status = maintenance.previous_status;
-        merchant.updated_at = now;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Merchant(merchant_id), &merchant);
-
-        // Clean up maintenance window
-        env.storage()
-            .persistent()
-            .remove(&DataKey::MaintenanceWindow(merchant_id));
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("maint_of"), merchant_id),
-            MerchantMaintenanceEndedEvent {
-                merchant_id,
-                ended_at: now,
-                was_automatic: true,
-            },
-        );
-
-        Ok(())
+        client: &MarketplaceContractClient,
+        merchant: &Address,
+        params: &RegisterParams,
+    ) -> u64 {
+        let (token, deposit) = funded_registration_deposit(env, merchant);
+        client.register_merchant(merchant, params, &token, &deposit)
     }
 
-    /// Get maintenance window info for a merchant.
-    pub fn get_maintenance_window(env: Env, merchant_id: u64) -> Option<MaintenanceWindow> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::MaintenanceWindow(merchant_id))
-    }
-
-    // -------------------------------------------------------------------------
-    // SKU Inventory Functions
-    // -------------------------------------------------------------------------
-
-    /// Create or initialize SKU inventory for a merchant.
-    ///
-    /// # Arguments
-    /// * `merchant_owner` - Must be the merchant owner
-    /// * `merchant_id` - The merchant this SKU belongs to
-    /// * `sku_id` - Unique identifier for the SKU (merchant-scoped)
-    /// * `initial_stock` - Starting inventory quantity
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err(MarketplaceError::Unauthorized)` if caller is not merchant owner
-    /// * `Err(MarketplaceError::InvalidSku)` if SKU ID is invalid
-    pub fn create_sku_inventory(
-        env: Env,
-        merchant_owner: Address,
-        merchant_id: u64,
-        sku_id: String,
-        initial_stock: u64,
-    ) -> Result<(), MarketplaceError> {
-        merchant_owner.require_auth();
-
-        // Verify merchant exists and caller is owner
-        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
-        if merchant.owner.as_ref() != Some(&merchant_owner) {
-            return Err(MarketplaceError::Unauthorized);
-        }
-
-        // Validate SKU ID
-        if sku_id.is_empty() || sku_id.len() > 64 {
-            return Err(MarketplaceError::InvalidSku);
-        }
-
-        // Check if SKU already exists
-        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
-        if env.storage().persistent().has(&sku_key) {
-            return Err(MarketplaceError::InvalidSku);
-        }
-
-        let now = env.ledger().timestamp();
-
-        // Create SKU inventory record
-        let inventory = SkuInventory {
-            sku_id: sku_id.clone(),
-            merchant_id,
-            available_stock: initial_stock,
-            total_added: initial_stock,
-            total_sold: 0,
-            reserved_stock: 0,
-            last_updated: now,
-            is_active: true,
-        };
-
-        // Store SKU inventory
-        env.storage().persistent().set(&sku_key, &inventory);
-        env.storage().persistent().extend_ttl(
-            &sku_key,
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        // Update merchant's SKU list
-        let mut sku_list: Vec<String> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MerchantSkuList(merchant_id))
-            .unwrap_or_else(|| Vec::new(&env));
-        sku_list.push_back(sku_id.clone());
-        env.storage()
-            .persistent()
-            .set(&DataKey::MerchantSkuList(merchant_id), &sku_list);
-        env.storage().persistent().extend_ttl(
-            &DataKey::MerchantSkuList(merchant_id),
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("sku_new"), merchant_id),
-            SkuInventoryCreatedEvent {
-                merchant_id,
-                sku_id,
-                initial_stock,
-            },
-        );
-
-        Ok(())
-    }
-
-    /// Atomically decrement SKU stock for a purchase.
-    ///
-    /// This provides atomic decrement to prevent overselling. The operation
-    /// fails if insufficient stock is available.
-    ///
-    /// # Arguments
-    /// * `merchant_id` - The merchant
-    /// * `sku_id` - The SKU to decrement
-    /// * `quantity` - Amount to decrement
-    ///
-    /// # Returns
-    /// * `Ok(remaining_stock)` - The stock remaining after decrement
-    /// * `Err(MarketplaceError::SkuNotFound)` if SKU doesn't exist
-    /// * `Err(MarketplaceError::InsufficientStock)` if not enough stock
-    pub fn decrement_sku_stock(
-        env: Env,
-        merchant_id: u64,
-        sku_id: String,
-        quantity: u64,
-    ) -> Result<u64, MarketplaceError> {
-        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
-        
-        let mut inventory: SkuInventory = env
-            .storage()
-            .persistent()
-            .get(&sku_key)
-            .ok_or(MarketplaceError::SkuNotFound)?;
-
-        // Check if SKU is active
-        if !inventory.is_active {
-            return Err(MarketplaceError::InvalidSku);
-        }
-
-        // Check sufficient stock (atomic check)
-        if inventory.available_stock < quantity {
-            return Err(MarketplaceError::InsufficientStock);
-        }
-
-        // Perform atomic decrement
-        inventory.available_stock = inventory.available_stock.saturating_sub(quantity);
-        inventory.total_sold = inventory.total_sold.saturating_add(quantity);
-        inventory.last_updated = env.ledger().timestamp();
-
-        // Save updated inventory
-        env.storage().persistent().set(&sku_key, &inventory);
-        env.storage().persistent().extend_ttl(
-            &sku_key,
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("sku_dec"), merchant_id),
-            SkuStockDecrementedEvent {
-                merchant_id,
-                sku_id,
-                quantity,
-                remaining_stock: inventory.available_stock,
-            },
-        );
-
-        Ok(inventory.available_stock)
-    }
-
-    /// Replenish SKU stock.
-    ///
-    /// # Arguments
-    /// * `merchant_owner` - Must be merchant owner
-    /// * `merchant_id` - The merchant
-    /// * `sku_id` - The SKU to replenish
-    /// * `quantity` - Amount to add
-    ///
-    /// # Returns
-    /// * `Ok(new_stock)` - The new total stock
-    /// * `Err` on authorization or lookup failures
-    pub fn replenish_sku_stock(
-        env: Env,
-        merchant_owner: Address,
-        merchant_id: u64,
-        sku_id: String,
-        quantity: u64,
-    ) -> Result<u64, MarketplaceError> {
-        merchant_owner.require_auth();
-
-        // Verify merchant exists and caller is owner
-        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
-        if merchant.owner.as_ref() != Some(&merchant_owner) {
-            return Err(MarketplaceError::Unauthorized);
-        }
-
-        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
-        
-        let mut inventory: SkuInventory = env
-            .storage()
-            .persistent()
-            .get(&sku_key)
-            .ok_or(MarketplaceError::SkuNotFound)?;
-
-        // Add stock
-        inventory.available_stock = inventory.available_stock.saturating_add(quantity);
-        inventory.total_added = inventory.total_added.saturating_add(quantity);
-        inventory.last_updated = env.ledger().timestamp();
-
-        // Save updated inventory
-        env.storage().persistent().set(&sku_key, &inventory);
-        env.storage().persistent().extend_ttl(
-            &sku_key,
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("sku_rep"), merchant_id),
-            SkuStockReplenishedEvent {
-                merchant_id,
-                sku_id,
-                quantity,
-                new_stock: inventory.available_stock,
-            },
-        );
-
-        Ok(inventory.available_stock)
-    }
-
-    /// Reserve SKU stock for a pending order.
-    ///
-    /// Moves stock from available to reserved, preventing other orders from
-    /// claiming it while the current order is being processed.
-    ///
-    /// # Arguments
-    /// * `merchant_id` - The merchant
-    /// * `sku_id` - The SKU to reserve
-    /// * `quantity` - Amount to reserve
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err(MarketplaceError::InsufficientStock)` if not enough available
-    pub fn reserve_sku_stock(
-        env: Env,
-        merchant_id: u64,
-        sku_id: String,
-        quantity: u64,
-    ) -> Result<(), MarketplaceError> {
-        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
-        
-        let mut inventory: SkuInventory = env
-            .storage()
-            .persistent()
-            .get(&sku_key)
-            .ok_or(MarketplaceError::SkuNotFound)?;
-
-        // Check sufficient available stock
-        if inventory.available_stock < quantity {
-            return Err(MarketplaceError::InsufficientStock);
-        }
-
-        // Move from available to reserved (atomic)
-        inventory.available_stock = inventory.available_stock.saturating_sub(quantity);
-        inventory.reserved_stock = inventory.reserved_stock.saturating_add(quantity);
-        inventory.last_updated = env.ledger().timestamp();
-
-        // Save updated inventory
-        env.storage().persistent().set(&sku_key, &inventory);
-        env.storage().persistent().extend_ttl(
-            &sku_key,
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("sku_rsv"), merchant_id),
-            SkuStockReservedEvent {
-                merchant_id,
-                sku_id,
-                quantity,
-                reserved_total: inventory.reserved_stock,
-            },
-        );
-
-        Ok(())
-    }
-
-    /// Release reserved SKU stock back to available.
-    ///
-    /// Used when an order is cancelled or fails.
-    ///
-    /// # Arguments
-    /// * `merchant_id` - The merchant
-    /// * `sku_id` - The SKU to release
-    /// * `quantity` - Amount to release
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err` on lookup failures
-    pub fn release_sku_stock(
-        env: Env,
-        merchant_id: u64,
-        sku_id: String,
-        quantity: u64,
-    ) -> Result<(), MarketplaceError> {
-        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
-        
-        let mut inventory: SkuInventory = env
-            .storage()
-            .persistent()
-            .get(&sku_key)
-            .ok_or(MarketplaceError::SkuNotFound)?;
-
-        // Move from reserved back to available
-        inventory.reserved_stock = inventory.reserved_stock.saturating_sub(quantity);
-        inventory.available_stock = inventory.available_stock.saturating_add(quantity);
-        inventory.last_updated = env.ledger().timestamp();
-
-        // Save updated inventory
-        env.storage().persistent().set(&sku_key, &inventory);
-        env.storage().persistent().extend_ttl(
-            &sku_key,
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        // Emit event
-        env.events().publish(
-            (symbol_short!("mkplc"), symbol_short!("sku_rel"), merchant_id),
-            SkuStockReleasedEvent {
-                merchant_id,
-                sku_id,
-                quantity,
-                available_stock: inventory.available_stock,
-            },
-        );
-
-        Ok(())
-    }
-
-    /// Confirm a reserved stock sale (moves from reserved to sold).
-    ///
-    /// # Arguments
-    /// * `merchant_id` - The merchant
-    /// * `sku_id` - The SKU
-    /// * `quantity` - Amount to confirm as sold
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    pub fn confirm_sku_sale(
-        env: Env,
-        merchant_id: u64,
-        sku_id: String,
-        quantity: u64,
-    ) -> Result<(), MarketplaceError> {
-        let sku_key = DataKey::SkuInventory(merchant_id, sku_id.clone());
-        
-        let mut inventory: SkuInventory = env
-            .storage()
-            .persistent()
-            .get(&sku_key)
-            .ok_or(MarketplaceError::SkuNotFound)?;
-
-        // Decrement reserved stock and increment sold
-        inventory.reserved_stock = inventory.reserved_stock.saturating_sub(quantity);
-        inventory.total_sold = inventory.total_sold.saturating_add(quantity);
-        inventory.last_updated = env.ledger().timestamp();
-
-        // Save updated inventory
-        env.storage().persistent().set(&sku_key, &inventory);
-        env.storage().persistent().extend_ttl(
-            &sku_key,
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        Ok(())
-    }
-
-    /// Get SKU inventory information.
-    pub fn get_sku_inventory(
-        env: Env,
-        merchant_id: u64,
-        sku_id: String,
-    ) -> Result<SkuInventory, MarketplaceError> {
-        let sku_key = DataKey::SkuInventory(merchant_id, sku_id);
-        env.storage()
-            .persistent()
-            .get(&sku_key)
-            .ok_or(MarketplaceError::SkuNotFound)
-    }
-
-    /// Get all SKU IDs for a merchant.
-    pub fn get_merchant_sku_list(env: Env, merchant_id: u64) -> Vec<String> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::MerchantSkuList(merchant_id))
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    /// Toggle SKU active status.
-    ///
-    /// # Arguments
-    /// * `merchant_owner` - Must be merchant owner
-    /// * `merchant_id` - The merchant
-    /// * `sku_id` - The SKU
-    /// * `is_active` - New active status
-    pub fn set_sku_active_status(
-        env: Env,
-        merchant_owner: Address,
-        merchant_id: u64,
-        sku_id: String,
-        is_active: bool,
-    ) -> Result<(), MarketplaceError> {
-        merchant_owner.require_auth();
-
-        // Verify merchant exists and caller is owner
-        let merchant = Self::get_merchant(env.clone(), merchant_id)?;
-        if merchant.owner.as_ref() != Some(&merchant_owner) {
-            return Err(MarketplaceError::Unauthorized);
-        }
-
-        let sku_key = DataKey::SkuInventory(merchant_id, sku_id);
-        
-        let mut inventory: SkuInventory = env
-            .storage()
-            .persistent()
-            .get(&sku_key)
-            .ok_or(MarketplaceError::SkuNotFound)?;
-
-        inventory.is_active = is_active;
-        inventory.last_updated = env.ledger().timestamp();
-
-        env.storage().persistent().set(&sku_key, &inventory);
-        env.storage().persistent().extend_ttl(
-            &sku_key,
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
-        Ok(())
+    /// Fallible variant of [`register_merchant_with_deposit`] for tests that
+    /// assert on registration failures.
+    pub(crate) fn try_register_merchant_with_deposit(
+        env: &Env,
+        client: &MarketplaceContractClient,
+        merchant: &Address,
+        params: &RegisterParams,
+    ) -> Result<Result<u64, soroban_sdk::Error>, Result<MarketplaceError, soroban_sdk::InvokeError>>
+    {
+        let (token, deposit) = funded_registration_deposit(env, merchant);
+        client.try_register_merchant(merchant, params, &token, &deposit)
     }
 }
 
@@ -5754,7 +5936,7 @@ mod merchant_operational_view_tests {
             metadata_uri: None,
             required_verifications: 1,
         };
-        let id = client.register_merchant(&owner, &params);
+        let id = crate::testutil::register_merchant_with_deposit(&env, &client, &owner, &params);
         client.verify_merchant(&id, &verifier.address);
         client.suspend_merchant(&admin, &id);
 
