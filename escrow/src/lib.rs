@@ -1457,6 +1457,16 @@ pub struct KeeperBountyPaidEvent {
     pub new_timeout_ledger: u32,
 }
 
+/// Emitted when a keeper extends the storage TTL for an active escrow.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowTtlExtendedEvent {
+    /// Numeric escrow identifier.
+    pub escrow_id: u64,
+    /// Requested extension in ledgers.
+    pub ledgers_to_extend: u32,
+}
+
 /// Emitted when escrow enters inspection period after delivery confirmation.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -2264,6 +2274,8 @@ pub enum EscrowError {
     TimelockExtensionAlreadyApproved = 454,
     /// Timelock extension not yet approved by both parties.
     TimelockExtensionPendingApproval = 455,
+    /// Requested storage TTL extension is outside the supported bounds.
+    InvalidTtlExtension = 450,
 }
 
 /// Runs `f` under a re-entrancy lock and returns its result unchanged.
@@ -2803,6 +2815,9 @@ const MAX_TREASURIES: u32 = 10;
 /// must not be evicted while funds are still locked.
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280; // ~1 day of ledgers (5s/ledger)
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400; // ~30 days of ledgers
+/// Minimum and maximum permissionless storage extensions (~1 day to ~116 days).
+pub const MIN_ESCROW_TTL_EXTENSION: u32 = 17_280;
+pub const MAX_ESCROW_TTL_EXTENSION: u32 = 2_000_000;
 
 /// Minimum ledgers between bump_ttl_with_bounty calls to prevent bounty draining.
 const BUMP_RATE_LIMIT_LEDGERS: u32 = 100;
@@ -8376,7 +8391,7 @@ impl EscrowContract {
     }
 
     /// Permissionless keeper entrypoint: extend the persistent-storage TTL of
-    /// an active (non-terminal) escrow so it cannot be archived out from
+    /// an active (non-terminal) escrow by a bounded number of ledgers so it cannot be archived out from
     /// under its funds while resolution — including a pending dispute — is
     /// still in progress (issue #282). Unlike `bump_ttl_with_bounty`, this
     /// does not adjust `timeout_ledger`, pay a bounty, or rate-limit calls,
@@ -8389,7 +8404,14 @@ impl EscrowContract {
     /// Returns [`EscrowError::NotFound`] if the escrow does not exist, or one
     /// of the "already terminal" errors if it has already reached
     /// `Released`, `Refunded`, or `Cancelled`.
-    pub fn extend_escrow_ttl(env: Env, escrow_id: u64) -> Result<bool, EscrowError> {
+    pub fn extend_escrow_ttl(
+        env: Env,
+        escrow_id: u64,
+        ledgers_to_extend: u32,
+    ) -> Result<u32, EscrowError> {
+        if !(MIN_ESCROW_TTL_EXTENSION..=MAX_ESCROW_TTL_EXTENSION).contains(&ledgers_to_extend) {
+            return Err(EscrowError::InvalidTtlExtension);
+        }
         let key = DataKey::Escrow(escrow_id);
         let record: EscrowRecord = match env.storage().persistent().get(&key) {
             Some(rec) => rec,
@@ -8400,14 +8422,22 @@ impl EscrowContract {
 
         env.storage().persistent().extend_ttl(
             &key,
-            PERSISTENT_BUMP_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
+            PERSISTENT_BUMP_THRESHOLD.min(ledgers_to_extend),
+            ledgers_to_extend,
         );
         env.storage()
             .instance()
-            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD.min(ledgers_to_extend), ledgers_to_extend);
 
-        Ok(true)
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("ttl_ext"), escrow_id),
+            EscrowTtlExtendedEvent {
+                escrow_id,
+                ledgers_to_extend,
+            },
+        );
+
+        Ok(ledgers_to_extend)
     }
 
     /// Resolve a disputed escrow with an initial ruling. Only the admin may call.
