@@ -11,4 +11,16 @@ pub enum PermissionError {
 
     #[msg("Invalid authorization signature")]
     InvalidSignature,
+
+    #[msg("Token asset is not authorized for this delegation")]
+    AssetNotAuthorized,
+
+    #[msg("Spend exceeds the configured allowance")]
+    ExceedsAllowance,
+
+    #[msg("Delegation is paused")]
+    DelegationPaused,
+
+    #[msg("Delegation has expired")]
+    DelegationExpired,
 }
