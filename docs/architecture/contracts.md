@@ -27,6 +27,24 @@ Smart contracts are used for trust-critical operations that require blockchain g
 
 ## Contract Types
 
+### Recurring permission accounting
+
+Persistent single-owner permissions can opt into an immutable
+`RecurringQuotaConfig`. A separate `DataKey::RecurringQuota(owner, delegate)`
+stores the requested public configuration and the current epoch's spend.
+This preserves the existing serialized `PermissionRecord` layout and keeps
+the lifetime counter independent of record replacement or cleanup.
+
+Validation computes the ledger-aligned current epoch without changing state.
+Available spend is the smaller of the effective epoch allowance and the
+unspent lifetime cap. Successful spending records both counters using checked
+arithmetic, together with the permission debit in the same transaction.
+All single-owner spend entrypoints and ancestor accounting share this logic;
+failed calls roll back quota, events and nonce changes. The cap cannot be
+reconfigured, and transfers of configured pairs are rejected rather than
+duplicating lifetime state. Quota state is deliberately not removed on revoke
+or prune, so a subsequent grant to that same pair retains its cap.
+
 ### Escrow Contract
 
 **On-chain State**: Locked funds per order
