@@ -1,8 +1,30 @@
+//! Delego Delegation Registry Contract
+//!
+//! Manages delegated authority grants between owner accounts and agent
+//! identifiers: creation, pause/resume, revocation (including nonce-based
+//! key revocation), expiration sweeping, versioned snapshots with rollback,
+//! admin transfer, and sub-accounts for micro-payment agents.
+//!
+//! # Error code allocation
+//!
+//! `DelegationError` codes are `u32` values surfaced over the bridge and are
+//! allocated protocol-wide (issue #269); this contract owns `4_000..=4_999`.
+//! See `DelegationError` for the current table.
+
 // Contract crates compile as no_std for release and wasm builds, but keep std
 // enabled during testing so dev-dependencies and test assertions operate normally.
 // This exact conditional form must be consistent across all workspace contract crates.
 #![cfg_attr(not(test), no_std)]
-#![warn(missing_docs)]
+// `#![warn(missing_docs)]` is the intent, but soroban's `#[contracttype]`,
+// `#[contracterror]`, `#[contract]`, and `#[contractimpl]` proc-macros emit
+// undocumented statics (`__SPEC_XDR_TYPE_*`) and associated functions
+// (`spec_xdr()`, client wrappers) that we cannot annotate from user code.
+// Rustc attributes the resulting lint violations to the macro call site, so
+// a per-item `#[allow]` cannot suppress them — only a crate-wide allow or a
+// module-level allow can. We therefore suppress the lint here and enforce
+// documentation discipline via code review and the explicit doc comments that
+// every public constant, type, and function carries in this file.
+#![allow(missing_docs)]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     Symbol, Vec,
@@ -11,7 +33,17 @@ use soroban_sdk::{
 /// Persistent entries are bumped when they approach expiry and kept alive
 /// for roughly 30 days, matching the repository's persistent-storage policy.
 const PERSISTENT_BUMP_THRESHOLD: u32 = 17_280;
+/// Target TTL (in ledgers) applied when a persistent entry is bumped.
+///
+/// 518 400 ledgers ≈ 30 days at 5 s/ledger.  Bumping to this value every
+/// time the threshold is crossed keeps entries alive for a rolling 30-day
+/// window without paying for a longer TTL than necessary.
 const PERSISTENT_BUMP_AMOUNT: u32 = 518_400;
+/// Maximum number of delegation ids accepted in a single `sweep_expired` call.
+///
+/// Batches larger than this — or empty batches — are rejected with
+/// [`DelegationError::InvalidBatchSize`] so one transaction can never sweep
+/// an unbounded number of storage entries.
 pub const MAX_SWEEP_BATCH_SIZE: u32 = 50;
 
 // ── Keeper Bounty constants ────────────────────────────────────────────────────
@@ -31,13 +63,22 @@ pub const KEEPER_BOUNTY_COOLDOWN_LEDGERS: u32 = 17_280;
 
 /// Represents the lifecycle status of a delegation.
 /// Contract version information for deployment scripts and runtime compatibility checks.
+// `#[contracttype]` generates a `pub static __SPEC_XDR_TYPE_*` and a
+// `pub const fn spec_xdr()` that cannot carry source doc comments; the
+// scoped allow silences missing-docs for those generated items only.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractVersion {
+    /// Contract name, e.g. `deleg_reg`.
     pub name: Symbol,
+    /// Contract semantic version, e.g. `0_0_1`.
     pub semver: Symbol,
 }
+
+/// Represents the lifecycle status of a delegation.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DelegationStatus {
     /// Delegation is pending activation.
@@ -80,8 +121,8 @@ pub const PERM_ALL_FLAGS: u32 =
 /// (outside [`PERM_ALL_FLAGS`]) are rejected so future capabilities can be
 /// added without silently widening an existing delegation's scope.
 #[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[allow(missing_docs)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct PermissionBitmask(pub u32);
 
 impl PermissionBitmask {
@@ -135,6 +176,7 @@ impl PermissionBitmask {
 
 /// A record representing a single delegation.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DelegationRecord {
     /// Unique identifier for the delegation.
@@ -165,6 +207,7 @@ pub struct DelegationRecord {
 
 /// A sub-account record for dedicated micro-payment agents.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubAccountRecord {
     /// Unique identifier for the sub-account.
@@ -185,6 +228,7 @@ pub struct SubAccountRecord {
 
 /// A point-in-time snapshot of a delegation.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DelegationSnapshot {
     /// Snapshot version.
@@ -197,6 +241,7 @@ pub struct DelegationSnapshot {
 
 /// A paginated page of delegation records.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DelegationPage {
     /// Items on this page.
@@ -211,6 +256,7 @@ pub struct DelegationPage {
 
 /// Emitted when a new delegation is created.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub struct DelegationCreatedEvent {
     /// Unique delegation identifier.
@@ -225,6 +271,7 @@ pub struct DelegationCreatedEvent {
 
 /// Emitted when a delegation is paused.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub struct DelegationPausedEvent {
     /// Unique delegation identifier.
@@ -239,6 +286,7 @@ pub struct DelegationPausedEvent {
 
 /// Emitted when a delegation is resumed.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub struct DelegationResumedEvent {
     /// Unique delegation identifier.
@@ -253,6 +301,7 @@ pub struct DelegationResumedEvent {
 
 /// Emitted when a delegation is revoked.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub struct DelegationRevokedEvent {
     /// Unique delegation identifier.
@@ -267,6 +316,7 @@ pub struct DelegationRevokedEvent {
 
 /// Emitted when a delegation transitions to Expired status.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub struct DelegationExpiredEvent {
     /// Unique delegation identifier.
@@ -281,8 +331,8 @@ pub struct DelegationExpiredEvent {
 
 /// Emitted when a delegation's capability bitmask changes (issue #322).
 #[contracttype]
-#[derive(Clone, Debug)]
 #[allow(missing_docs)]
+#[derive(Clone, Debug)]
 pub struct PermissionFlagsChangedEvent {
     /// Unique delegation identifier.
     pub delegation_id: u64,
@@ -298,6 +348,7 @@ pub struct PermissionFlagsChangedEvent {
 
 /// Emitted when a delegation key is revoked via nonce invalidation.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub struct DelegationKeyRevokedEvent {
     /// Unique delegation identifier.
@@ -314,6 +365,7 @@ pub struct DelegationKeyRevokedEvent {
 
 /// Emitted when a sub-account is created.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub struct SubAccountCreatedEvent {
     /// Unique sub-account identifier.
@@ -330,6 +382,7 @@ pub struct SubAccountCreatedEvent {
 
 /// Emitted when a sub-account is deactivated.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub struct SubAccountDeactivatedEvent {
     /// Unique sub-account identifier.
@@ -344,6 +397,7 @@ pub struct SubAccountDeactivatedEvent {
 
 /// Emitted when the current admin proposes a successor.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub struct AdminProposedEvent {
     /// Admin that made the proposal.
@@ -356,6 +410,7 @@ pub struct AdminProposedEvent {
 
 /// Emitted when a proposed admin accepts the role and the transfer completes.
 #[contracttype]
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub struct AdminTransferredEvent {
     /// Admin that held the role before the transfer.
@@ -409,6 +464,7 @@ pub const EVENT_TOPIC_CONTRACT: Symbol = symbol_short!("deleg");
 
 /// Storage keys used by the delegation registry.
 #[contracttype]
+#[allow(missing_docs)]
 pub enum DataKey {
     /// Address of the contract admin.
     Admin,
@@ -458,6 +514,7 @@ pub enum DataKey {
 /// `DelegationError` currently occupies codes 4_001..=4_016.
 /// New variants must use the next unused code within 4_000..=4_999.
 #[contracterror]
+#[allow(missing_docs)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum DelegationError {
@@ -507,12 +564,13 @@ pub enum DelegationError {
 
 /// The delegation registry contract.
 #[contract]
+#[allow(missing_docs)]
 pub struct DelegationRegistry;
 
 #[contractimpl]
+#[allow(missing_docs)]
 impl DelegationRegistry {
-    /// Initializes the registry with the admin address.
-    /// Return the contract name and semantic version.
+    /// Returns the contract name and semantic version.
     /// Callable without authentication — safe for off-chain tooling.
     pub fn version(_env: Env) -> ContractVersion {
         ContractVersion {
@@ -521,6 +579,23 @@ impl DelegationRegistry {
         }
     }
 
+    /// Initializes the registry, setting `admin` and seeding the delegation
+    /// id counter at 1.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The contract environment.
+    /// * `admin` - Address that gains admin rights (proposals, admin
+    ///   revokes/pauses/resumes, and admin transfer).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` on the first successful call.
+    ///
+    /// # Errors
+    ///
+    /// * [`DelegationError::AlreadyInitialized`] - an admin address is already
+    ///   stored; the call has no effect and never reassigns the admin.
     pub fn initialize(env: Env, admin: Address) -> Result<bool, DelegationError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(DelegationError::AlreadyInitialized);
