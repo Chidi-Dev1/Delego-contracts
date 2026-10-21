@@ -1620,6 +1620,21 @@ pub struct PathPaymentSettledEvent {
     pub settled_by: Address,
 }
 
+/// Administrative capability assigned independently to an account.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ContractRole {
+    /// Full administrative capability, including role management.
+    Admin = 1,
+    /// May resolve disputed escrows.
+    Arbitrator = 2,
+    /// May update fee configuration.
+    FeeManager = 3,
+    /// May pause escrow creation.
+    Pauser = 4,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -1631,6 +1646,8 @@ pub enum DataKey {
     LastEscrowId,
     PendingAdmin,
     AdminList,
+    /// Explicit role assignment; false entries preserve independently revoked grants.
+    Role(Address, ContractRole),
     FeeConfig,
     AmountLimits,
     QuorumConfig,
@@ -3097,6 +3114,7 @@ impl EscrowContract {
 
         // Atomically store admin and configuration at deploy time
         env.storage().instance().set(&DataKey::Admin, &config.admin);
+        env.storage().instance().set(&DataKey::Role(config.admin.clone(), ContractRole::Admin), &true);
         env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
         env.storage().instance().set(
             &DataKey::FeeConfig,
@@ -3144,6 +3162,7 @@ impl EscrowContract {
             return Err(EscrowError::InvalidAddress);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Role(admin.clone(), ContractRole::Admin), &true);
         env.storage().instance().set(&DataKey::LastEscrowId, &0u64);
         env.storage()
             .instance()
@@ -3784,6 +3803,9 @@ impl EscrowContract {
             }
             unique_arbiters.push_back(arbiter);
         }
+        for arbiter in unique_arbiters.iter() {
+            env.storage().instance().set(&DataKey::Role(arbiter, ContractRole::Arbitrator), &true);
+        }
         let quorum_config = QuorumConfig {
             arbiters: unique_arbiters,
             threshold,
@@ -3816,7 +3838,9 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::QuorumConfig)
             .ok_or(EscrowError::QuorumConfigNotSet)?;
-        if !quorum_config.arbiters.contains(&arbiter) {
+        if !quorum_config.arbiters.contains(&arbiter)
+            || !Self::has_role(env.clone(), arbiter.clone(), ContractRole::Arbitrator)
+        {
             return Err(EscrowError::NotAnArbiter);
         }
 
@@ -4181,7 +4205,7 @@ impl EscrowContract {
     /// Update the fee percentage. Admin-only.
     pub fn update_fee(env: Env, admin: Address, new_fee_bps: u32) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin.clone()) {
+        if Self::require_role(&env, &admin, ContractRole::FeeManager).is_err() {
             return Err(EscrowError::Unauthorized);
         }
         if new_fee_bps > 1000 {
@@ -4219,7 +4243,7 @@ impl EscrowContract {
         min_fee_stroops: i128,
     ) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin) {
+        if Self::require_role(&env, &admin, ContractRole::FeeManager).is_err() {
             return Err(EscrowError::Unauthorized);
         }
         if !(0..=MAX_MIN_FEE_STROOPS).contains(&min_fee_stroops) {
@@ -4474,7 +4498,7 @@ impl EscrowContract {
         shares: soroban_sdk::Vec<TreasuryShare>,
     ) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin.clone()) {
+        if Self::require_role(&env, &admin, ContractRole::FeeManager).is_err() {
             return Err(EscrowError::Unauthorized);
         }
 
@@ -4531,7 +4555,7 @@ impl EscrowContract {
         tiers: Vec<FeeTier>,
     ) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin.clone()) {
+        if Self::require_role(&env, &admin, ContractRole::FeeManager).is_err() {
             return Err(EscrowError::Unauthorized);
         }
         if tiers.len() > MAX_FEE_TIERS {
@@ -8248,9 +8272,7 @@ impl EscrowContract {
         caller.require_auth();
         Self::enter_release(&env)?;
 
-        if !Self::is_admin(env.clone(), caller.clone()) {
-            return Err(EscrowError::Unauthorized);
-        }
+        Self::require_role(&env, &caller, ContractRole::Arbitrator)?;
 
         let key = DataKey::Escrow(escrow_id);
         let mut record: EscrowRecord = match env.storage().persistent().get(&key) {
@@ -8352,7 +8374,7 @@ impl EscrowContract {
         award: DisputeResolutionAward,
     ) -> Result<bool, EscrowError> {
         caller.require_auth();
-        if !Self::is_admin(env.clone(), caller.clone()) {
+        if Self::require_role(&env, &caller, ContractRole::Arbitrator).is_err() {
             return Err(EscrowError::Unauthorized);
         }
 
@@ -9478,6 +9500,11 @@ impl EscrowContract {
                 .set(&DataKey::AdminList, &admin_list);
         }
 
+        let previous_admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(EscrowError::NotFound)?;
+        if previous_admin != new_admin {
+            env.storage().instance().set(&DataKey::Role(previous_admin, ContractRole::Admin), &false);
+        }
+        env.storage().instance().set(&DataKey::Role(new_admin.clone(), ContractRole::Admin), &true);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.events().publish(
@@ -9535,6 +9562,7 @@ impl EscrowContract {
         if admin_list.contains(&new_co_admin) {
             return Err(EscrowError::AdminAlreadyExists);
         }
+        env.storage().instance().set(&DataKey::Role(new_co_admin.clone(), ContractRole::Admin), &true);
         admin_list.push_back(new_co_admin);
         env.storage()
             .instance()
@@ -10054,7 +10082,7 @@ impl EscrowContract {
     /// Set or clear the admin pause flag for new escrow creation. Admin-only.
     pub fn set_create_paused(env: Env, admin: Address, paused: bool) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin.clone()) {
+        if Self::require_role(&env, &admin, ContractRole::Pauser).is_err() {
             return Err(EscrowError::Unauthorized);
         }
         let pause_state = EscrowPauseState {
@@ -10086,7 +10114,7 @@ impl EscrowContract {
         duration_ledgers: u32,
     ) -> Result<bool, EscrowError> {
         admin.require_auth();
-        if !Self::is_admin(env.clone(), admin.clone()) {
+        if Self::require_role(&env, &admin, ContractRole::Pauser).is_err() {
             return Err(EscrowError::Unauthorized);
         }
         let current_ledger = env.ledger().sequence();
@@ -10882,20 +10910,50 @@ impl EscrowContract {
         }
     }
 
-    pub fn is_admin(env: Env, address: Address) -> bool {
-        let primary_admin: Address = match env.storage().instance().get(&DataKey::Admin) {
-            Some(addr) => addr,
-            None => return false,
-        };
-        if address == primary_admin {
-            return true;
+    /// Check whether `address` has a role. Admin grants every operational role.
+    pub fn has_role(env: Env, address: Address, role: ContractRole) -> bool {
+        if role == ContractRole::Admin {
+            let role_key = DataKey::Role(address.clone(), role);
+            if env.storage().instance().has(&role_key) {
+                return env.storage().instance().get(&role_key).unwrap_or(false);
+            }
+            // Existing deployments predate the role map; infer their old admin
+            // set until each account receives an explicit role entry.
+            if env.storage().instance().get::<_, Address>(&DataKey::Admin) == Some(address.clone()) {
+                return true;
+            }
+            let admins: soroban_sdk::Vec<Address> = env.storage().instance().get(&DataKey::AdminList)
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            return admins.contains(&address);
         }
-        let admin_list: soroban_sdk::Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AdminList)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        admin_list.contains(&address)
+        Self::has_role(env.clone(), address.clone(), ContractRole::Admin)
+            || env.storage().instance().get(&DataKey::Role(address, role)).unwrap_or(false)
+    }
+
+    fn require_role(env: &Env, address: &Address, role: ContractRole) -> Result<(), EscrowError> {
+        if Self::has_role(env.clone(), address.clone(), role) { Ok(()) } else { Err(EscrowError::Unauthorized) }
+    }
+
+    /// Grant an independent administrative capability. Only an Admin may manage roles.
+    pub fn grant_role(env: Env, admin: Address, account: Address, role: ContractRole) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        Self::require_role(&env, &admin, ContractRole::Admin)?;
+        env.storage().instance().set(&DataKey::Role(account.clone(), role), &true);
+        env.events().publish((symbol_short!("admin"), symbol_short!("role_add")), (admin, account, role, env.ledger().timestamp()));
+        Ok(true)
+    }
+
+    /// Revoke an independent administrative capability without transferring Admin.
+    pub fn revoke_role(env: Env, admin: Address, account: Address, role: ContractRole) -> Result<bool, EscrowError> {
+        admin.require_auth();
+        Self::require_role(&env, &admin, ContractRole::Admin)?;
+        env.storage().instance().set(&DataKey::Role(account.clone(), role), &false);
+        env.events().publish((symbol_short!("admin"), symbol_short!("role_del")), (admin, account, role, env.ledger().timestamp()));
+        Ok(true)
+    }
+
+    pub fn is_admin(env: Env, address: Address) -> bool {
+        Self::has_role(env, address, ContractRole::Admin)
     }
 
     /// Configured upgrade threshold, defaulting to [`MIN_UPGRADE_THRESHOLD`].
