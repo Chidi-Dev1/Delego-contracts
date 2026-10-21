@@ -2436,6 +2436,11 @@ fn set_sequence(env: &Env, sequence: u32) {
 /// Records `count` freshly Released transactions for `entity`, enough to pass
 /// the config's `min_transactions_threshold` when `count >= 5`.
 fn seed_released_transactions(
+// --- fraud reputation slashing (issue #392) ---
+
+/// Registers the standard 5-escrow clean history so `entity` has a visible
+/// score of 10_000 before a fraud ruling lands.
+fn seed_clean_history(
     client: &ReputationContractClient,
     admin: &Address,
     entity: &Address,
@@ -2444,6 +2449,8 @@ fn seed_released_transactions(
     count: u64,
 ) {
     for i in start..(start + count) {
+) {
+    for i in 0..5u64 {
         client.record_transaction(
             admin,
             &i,
@@ -2774,4 +2781,237 @@ fn test_attestation_is_expired_boundaries() {
     let verification = client.verify_score_attestation(&malformed);
     assert!(!verification.valid);
     assert!(verification.expired);
+}
+
+#[test]
+fn test_fraud_slash_reduces_score_by_penalty() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    seed_clean_history(&client, &admin, &merchant, &counterparty);
+    assert_eq!(client.get_reputation(&merchant).score, 10_000);
+
+    client.set_fraud_authority(&admin, &escrow);
+    assert_eq!(client.get_fraud_authority(), Some(escrow.clone()));
+
+    let new_score = client.apply_fraud_reputation_slash(&merchant, &crate::FRAUD_PENALTY_SCORE_BPS);
+
+    // A confirmed fraud ruling costs exactly the fixed 25% penalty.
+    assert_eq!(new_score, 7_500);
+    assert_eq!(client.get_reputation(&merchant).score, 7_500);
+    let record = client.get_fraud_record(&merchant);
+    assert_eq!(record.strike_count, 1);
+    assert_eq!(
+        record.accumulated_penalty_bps,
+        crate::FRAUD_PENALTY_SCORE_BPS
+    );
+}
+
+#[test]
+fn test_fraud_slash_survives_later_score_recomputation() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    seed_clean_history(&client, &admin, &merchant, &counterparty);
+    client.set_fraud_authority(&admin, &escrow);
+    client.apply_fraud_reputation_slash(&merchant, &crate::FRAUD_PENALTY_SCORE_BPS);
+
+    // A long run of clean Released outcomes after the ruling must not restore
+    // the merchant's score: the slash is part of the score, not a one-off
+    // edit that the next recompute overwrites.
+    for i in 100..120u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &merchant,
+            &counterparty,
+            &1_000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+
+    let rep = client.get_reputation(&merchant);
+    assert_eq!(rep.score, 7_500);
+    assert_eq!(client.get_fraud_record(&merchant).strike_count, 1);
+    assert_eq!(client.get_score_decomposition(&merchant).penalty_bps, 2_500);
+}
+
+#[test]
+fn test_fraud_slash_accumulates_and_clamps_at_zero() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    seed_clean_history(&client, &admin, &merchant, &counterparty);
+    client.set_fraud_authority(&admin, &escrow);
+
+    // A maximum legal slash removes the entire score without underflowing.
+    let score = client.apply_fraud_reputation_slash(&merchant, &10_000u32);
+    assert_eq!(score, 0);
+    assert_eq!(client.get_reputation(&merchant).score, 0);
+
+    // A second ruling keeps clamping at 0 while the permanent audit trail
+    // keeps growing.
+    let score = client.apply_fraud_reputation_slash(&merchant, &2_500u32);
+    assert_eq!(score, 0);
+    let record = client.get_fraud_record(&merchant);
+    assert_eq!(record.strike_count, 2);
+    assert_eq!(record.accumulated_penalty_bps, 12_500);
+    assert_eq!(
+        client.get_score_decomposition(&merchant).final_score,
+        0,
+        "score must stay clamped at the floor"
+    );
+}
+
+#[test]
+fn test_fraud_slash_for_unknown_merchant_records_strike() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    client.set_fraud_authority(&admin, &escrow);
+
+    let score = client.apply_fraud_reputation_slash(&merchant, &crate::FRAUD_PENALTY_SCORE_BPS);
+
+    assert_eq!(score, 0);
+    let record = client.get_fraud_record(&merchant);
+    assert_eq!(record.strike_count, 1);
+    // The merchant now has an explicit record at the floor rather than
+    // disappearing from the registry.
+    assert_eq!(client.get_reputation(&merchant).score, 0);
+}
+
+#[test]
+fn test_fraud_slash_requires_configured_authority() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let merchant = Address::generate(&env);
+
+    // No escrow contract has been authorized yet.
+    let res = client.try_apply_fraud_reputation_slash(&merchant, &2_500u32);
+    assert_eq!(res, Err(Ok(ReputationError::NotInitialized)));
+    assert_eq!(client.get_fraud_record(&merchant).strike_count, 0);
+}
+
+#[test]
+fn test_fraud_slash_rejects_unauthorized_caller() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    client.set_fraud_authority(&admin, &escrow);
+
+    // With no mocked authorization at all, the configured authority has not
+    // signed the invocation, so the slash must be rejected.
+    env.mock_auths(&[]);
+    let res = client.try_apply_fraud_reputation_slash(&merchant, &2_500u32);
+    assert!(res.is_err(), "slash without authority auth must fail");
+    assert_eq!(client.get_fraud_record(&merchant).strike_count, 0);
+
+    // Mocking an unrelated account's authorization is also insufficient.
+    let stranger = Address::generate(&env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &stranger,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "apply_fraud_reputation_slash",
+            args: (merchant.clone(), 2_500u32).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let res = client.try_apply_fraud_reputation_slash(&merchant, &2_500u32);
+    assert!(res.is_err(), "stranger auth must not authorize a slash");
+    assert_eq!(client.get_fraud_record(&merchant).strike_count, 0);
+}
+
+#[test]
+fn test_fraud_slash_accepts_authorized_escrow_contract() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    seed_clean_history(&client, &admin, &merchant, &counterparty);
+    client.set_fraud_authority(&admin, &escrow);
+
+    // Only the configured escrow's authorization satisfies the call.
+    env.mock_auths(&[MockAuth {
+        address: &escrow,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "apply_fraud_reputation_slash",
+            args: (merchant.clone(), crate::FRAUD_PENALTY_SCORE_BPS).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let score = client.apply_fraud_reputation_slash(&merchant, &crate::FRAUD_PENALTY_SCORE_BPS);
+    assert_eq!(score, 7_500);
+}
+
+#[test]
+fn test_fraud_slash_rejects_out_of_range_penalty() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    client.set_fraud_authority(&admin, &escrow);
+
+    // Zero would be a silent no-op rather than a penalty.
+    assert_eq!(
+        client.try_apply_fraud_reputation_slash(&merchant, &0u32),
+        Err(Ok(ReputationError::InvalidParam))
+    );
+    // More than 100% of the score is not a meaningful slash.
+    assert_eq!(
+        client.try_apply_fraud_reputation_slash(&merchant, &10_001u32),
+        Err(Ok(ReputationError::InvalidParam))
+    );
+    assert_eq!(client.get_fraud_record(&merchant).strike_count, 0);
+}
+
+#[test]
+fn test_set_fraud_authority_requires_admin() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let not_admin = Address::generate(&env);
+    let escrow = Address::generate(&env);
+
+    let res = client.try_set_fraud_authority(&not_admin, &escrow);
+    assert_eq!(res, Err(Ok(ReputationError::Unauthorized)));
+    assert_eq!(client.get_fraud_authority(), None);
+}
+
+#[test]
+fn test_set_fraud_authority_replaces_previous_authority() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let old_escrow = Address::generate(&env);
+    let new_escrow = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    client.set_fraud_authority(&admin, &old_escrow);
+    client.set_fraud_authority(&admin, &new_escrow);
+    assert_eq!(client.get_fraud_authority(), Some(new_escrow.clone()));
+
+    // The replaced authority can no longer slash.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &old_escrow,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "apply_fraud_reputation_slash",
+            args: (merchant.clone(), 2_500u32).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let res = client.try_apply_fraud_reputation_slash(&merchant, &2_500u32);
+    assert!(res.is_err());
 }

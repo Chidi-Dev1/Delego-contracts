@@ -136,6 +136,9 @@ pub struct ReputationScore {
 pub struct ScoreDecomposition {
     pub entity: Address,
     pub base_score_bps: i128,
+    /// Total penalty subtracted from `base_score_bps`: dispute penalties for
+    /// currently-relevant disputes plus the accumulated fraud slashes from
+    /// [`ReputationContract::apply_fraud_reputation_slash`] (issue #392).
     pub penalty_bps: i128,
     pub total_transactions: u64,
     pub final_score: u32,
@@ -639,6 +642,43 @@ pub struct EntityHistoryPrunedEvent {
     pub pruned_by: Address,
 }
 
+/// Emitted when a confirmed fraud ruling slashes a merchant's score
+/// (issue #392). `strike_count` is the permanent lifetime count, and
+/// `accumulated_penalty_bps` is the total slash still applied at every
+/// recomputation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FraudReputationSlashedEvent {
+    pub merchant: Address,
+    pub penalty_bps: u32,
+    pub accumulated_penalty_bps: u32,
+    /// Score persisted before the slash (the raw stored score —
+    /// `get_reputation` may mask it to `0` below the visibility threshold).
+    pub previous_score_bps: u32,
+    /// Score persisted after the slash was applied and re-clamped.
+    pub new_score_bps: u32,
+    pub strike_count: u32,
+}
+
+/// Emitted when the admin authorizes an escrow contract to slash reputation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FraudAuthoritySetEvent {
+    pub admin: Address,
+    pub authority: Address,
+}
+
+/// Public view of a merchant's fraud record (issue #392).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudRecord {
+    /// Permanent number of confirmed fraud rulings against the merchant.
+    pub strike_count: u32,
+    /// Total penalty in basis points still deducted from the merchant's score
+    /// on every recomputation.
+    pub accumulated_penalty_bps: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReputationScoreUpdatedEvent {
@@ -784,6 +824,16 @@ pub enum DataKey {
     FraudReportsByTarget(Address),
     /// Blinded review receipt nullifier to prevent double-submission
     BlindedReviewNullifier(BytesN<32>),
+    /// Trusted escrow contract allowed to slash reputation after a confirmed
+    /// fraud ruling (issue #392). Set by the admin.
+    FraudAuthority,
+    /// Permanent count of confirmed fraud rulings recorded against an entity.
+    /// Never reset — not by `unfreeze_entity`, not by a later clean history.
+    FraudStrikes(Address),
+    /// Accumulated fraud penalty for an entity, in basis points. Persisted so
+    /// every later score recomputation keeps subtracting it instead of
+    /// washing the slash out with the next recorded transaction.
+    FraudPenalty(Address),
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -825,6 +875,16 @@ fn normalize_score_i128(raw_score: i128) -> u32 {
     let bounded = raw_score.clamp(i64::MIN as i128, i64::MAX as i128);
     normalize_score(bounded as i64)
 }
+/// Default reputation slash applied to a merchant when an escrow dispute is
+/// resolved with a confirmed fraud ruling: -25% (-2,500 basis points), i.e.
+/// one confirmed fraud costs a quarter of the score, far beyond what a single
+/// negative review can cost.
+///
+/// [`ReputationContract::apply_fraud_reputation_slash`] takes the penalty as
+/// a parameter so the escrow contract can choose a stronger penalty for
+/// egregious cases, but callers should pass this constant for the standard
+/// fraud ruling.
+pub const FRAUD_PENALTY_SCORE_BPS: u32 = 2_500;
 
 /// The maximum number of full half-lives after which the recency weight is
 /// treated as zero.  With `BPS_SCALE = 10_000`, the right-shift
@@ -1799,6 +1859,140 @@ impl ReputationContract {
         Ok(())
     }
 
+    // --- Fraud slashing ---
+
+    /// Authorizes `authority` — normally the escrow contract — to slash
+    /// merchant reputation after a confirmed fraud ruling (issue #392).
+    ///
+    /// Admin-only, and deliberately a separate trust grant from anything the
+    /// backend relaying ordinary transactions holds: a compromised
+    /// transaction-relay key cannot slash merchants, only submit outcomes.
+    /// Re-setting the authority replaces the previous one.
+    pub fn set_fraud_authority(
+        env: Env,
+        admin: Address,
+        authority: Address,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudAuthority, &authority);
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                Symbol::new(&env, "fraud_auth"),
+                authority.clone(),
+            ),
+            FraudAuthoritySetEvent { admin, authority },
+        );
+        Ok(())
+    }
+
+    /// Returns the escrow contract currently trusted to slash reputation, if
+    /// one has been configured.
+    pub fn get_fraud_authority(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::FraudAuthority)
+    }
+
+    /// Returns `merchant`'s permanent strike count and the accumulated fraud
+    /// penalty still applied to its score. Unknown merchants report a zeroed
+    /// record.
+    pub fn get_fraud_record(env: Env, merchant: Address) -> FraudRecord {
+        FraudRecord {
+            strike_count: env
+                .storage()
+                .persistent()
+                .get(&DataKey::FraudStrikes(merchant.clone()))
+                .unwrap_or(0),
+            accumulated_penalty_bps: env
+                .storage()
+                .persistent()
+                .get(&DataKey::FraudPenalty(merchant))
+                .unwrap_or(0),
+        }
+    }
+
+    /// Slashes `merchant`'s reputation after an escrow dispute was resolved
+    /// with a confirmed ruling of merchant fraud or counterfeit goods
+    /// (issue #392).
+    ///
+    /// Only the escrow contract configured through
+    /// [`Self::set_fraud_authority`] can call this, and that contract address
+    /// must itself authorize the invocation, so no external account can slash
+    /// a merchant directly. `penalty_bps` must be in `1..=10_000`; callers
+    /// applying the standard fraud ruling should pass
+    /// [`FRAUD_PENALTY_SCORE_BPS`].
+    ///
+    /// The deduction is immediate and deterministic, and it is *persistent*:
+    /// the penalty is accumulated on-chain and subtracted by every later score
+    /// recomputation, so subsequent transactions (even a long run of clean
+    /// ones) cannot wash the slash out of the score. Each call also increments
+    /// a permanent strike counter that no other operation resets. Returns the
+    /// merchant's new score in basis points, clamped to `0..=10_000`.
+    pub fn apply_fraud_reputation_slash(
+        env: Env,
+        merchant: Address,
+        penalty_bps: u32,
+    ) -> Result<u32, ReputationError> {
+        let authority: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::FraudAuthority)
+            .ok_or(ReputationError::NotInitialized)?;
+        authority.require_auth();
+
+        if penalty_bps == 0 || penalty_bps as i128 > BPS_SCALE {
+            return Err(ReputationError::InvalidParam);
+        }
+
+        let previous_score = Self::load_or_default_reputation(&env, &merchant).score;
+
+        // Permanent strike record. Saturating: a strike count is audit data,
+        // so it must never wrap to zero (which would read as "no fraud").
+        let strikes_key = DataKey::FraudStrikes(merchant.clone());
+        let strikes: u32 = env.storage().persistent().get(&strikes_key).unwrap_or(0);
+        let strikes = strikes.saturating_add(1);
+        env.storage().persistent().set(&strikes_key, &strikes);
+        env.storage().persistent().extend_ttl(
+            &strikes_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Accumulated penalty, re-applied by every future recomputation.
+        let penalty_key = DataKey::FraudPenalty(merchant.clone());
+        let accumulated: u32 = env.storage().persistent().get(&penalty_key).unwrap_or(0);
+        let accumulated = accumulated.saturating_add(penalty_bps);
+        env.storage().persistent().set(&penalty_key, &accumulated);
+        env.storage().persistent().extend_ttl(
+            &penalty_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let rep = Self::recompute_score(&env, &merchant)?;
+
+        env.events().publish(
+            (
+                symbol_short!("reput"),
+                symbol_short!("slashed"),
+                merchant.clone(),
+            ),
+            FraudReputationSlashedEvent {
+                merchant,
+                penalty_bps,
+                accumulated_penalty_bps: accumulated,
+                previous_score_bps: previous_score,
+                new_score_bps: rep.score,
+                strike_count: strikes,
+            },
+        );
+
+        Ok(rep.score)
+    }
+
     // --- Admin ---
 
     pub fn freeze_entity(env: Env, admin: Address, entity: Address) -> Result<(), ReputationError> {
@@ -2127,6 +2321,13 @@ impl ReputationContract {
             certified_at_ledger,
             expires_at_ledger: certified_at_ledger.saturating_add(ATTESTATION_VALIDITY_LEDGERS),
         }
+    /// Accumulated fraud penalty for `entity`, in basis points, as applied by
+    /// every score recomputation.
+    fn accumulated_fraud_penalty_bps(env: &Env, entity: &Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::FraudPenalty(entity.clone()))
+            .unwrap_or(0) as i128
     }
 
     fn load_or_default_reputation(env: &Env, entity: &Address) -> ReputationScore {
@@ -2368,6 +2569,9 @@ impl ReputationContract {
         // normalization helper; `i128` arithmetic cannot overflow here and the
         // helper clamps the final value into `0..=10_000`.
         rep.score = normalize_score_i128(base_score.saturating_sub(penalty));
+        let penalty = accumulator.disputed_recent * (config.dispute_penalty_bps as i128)
+            + Self::accumulated_fraud_penalty_bps(env, entity);
+        rep.score = (base_score - penalty).clamp(0, BPS_SCALE) as u32;
         rep.avg_rating = if accumulator.rating_weight_sum > 0 {
             normalize_score_i128(accumulator.rating_weighted_sum / accumulator.rating_weight_sum)
         } else {
@@ -2469,7 +2673,8 @@ impl ReputationContract {
         } else {
             0
         };
-        let penalty = disputed_recent * (config.dispute_penalty_bps as i128);
+        let penalty = disputed_recent * (config.dispute_penalty_bps as i128)
+            + Self::accumulated_fraud_penalty_bps(env, entity);
         let avg_rating = if rating_weight_sum > 0 {
             normalize_score_i128(rating_weighted_sum / rating_weight_sum)
         } else {
