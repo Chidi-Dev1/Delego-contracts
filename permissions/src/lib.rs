@@ -3581,9 +3581,6 @@ impl PermissionsContract {
         let key = DataKey::Permission(owner.clone(), delegate.clone());
         let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
 
-let key = DataKey::Permission(owner.clone(), delegate.clone());
-        let mut record: PermissionRecord = env.storage().persistent().get(&key).unwrap();
-
         // Reset spent when crossing an epoch boundary (issue #11).
         let current_ledger = env.ledger().sequence();
         let ledgers_since_reset = current_ledger.saturating_sub(record.last_reset_ledger);
@@ -5462,9 +5459,6 @@ let key = DataKey::Permission(owner.clone(), delegate.clone());
             return Err(PermissionError::LimitBelowSpent);
         }
 
-        let execution_time = env.ledger().timestamp() + 86400;
-        let execution_time =
-            env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
         let execution_time =
             env.ledger().timestamp() + Self::get_decrease_timelock_secs(env.clone());
 
