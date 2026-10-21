@@ -14,6 +14,7 @@ use delego_reputation::{
     ReputationConfig, ReputationContract, ReputationContractClient, ReputationError,
     TransactionOutcome,
 };
+use delego_tests::fixtures::create_mock_token_contract;
 use ed25519_dalek::{Signer, SigningKey};
 use proptest::prelude::*;
 use soroban_sdk::{
@@ -69,8 +70,7 @@ impl TestEnv {
         let treasury = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        #[allow(deprecated)]
-        let token_contract_id = env.register_stellar_asset_contract(token_admin.clone());
+        let (token_contract_id, _token_client) = create_mock_token_contract(&env, &token_admin);
         let token_admin_client =
             soroban_sdk::token::StellarAssetClient::new(&env, &token_contract_id);
         token_admin_client.mint(&buyer, &10000);
