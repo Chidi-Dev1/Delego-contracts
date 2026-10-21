@@ -109,6 +109,46 @@ fn test_zero_agent_id_rejected_with_typed_error() {
     let records = client.get_delegations_by_owner(&owner);
     assert_eq!(records.len(), 0);
 }
+#[test]
+fn test_zero_permissions_contract_rejected_with_typed_error() {
+    let (env, client, _, owner, agent_id, _) = setup();
+    env.mock_all_auths();
+    let label = Symbol::new(&env, "Zero_Perms");
+
+    for strkey in [ZERO_ACCOUNT_STRKEY, ZERO_CONTRACT_STRKEY] {
+        let zero = Address::from_str(&env, strkey);
+        let result = client.try_create_delegation(&owner, &agent_id, &zero, &label, &1000);
+        assert_eq!(result, Err(Ok(DelegationError::InvalidParam)));
+
+        let scoped = client.try_create_scoped_delegation(
+            &owner,
+            &agent_id,
+            &zero,
+            &label,
+            &1000,
+            &PermissionBitmask(PERM_FLAG_SPEND),
+        );
+        assert_eq!(scoped, Err(Ok(DelegationError::InvalidParam)));
+    }
+
+    // No delegation record may exist for the refused calls.
+    assert_eq!(client.get_delegations_by_owner(&owner).len(), 0);
+}
+
+#[test]
+fn test_zero_owner_rejected_with_typed_error() {
+    let (env, client, _, _, agent_id, permissions_contract) = setup();
+    env.mock_all_auths();
+    let label = Symbol::new(&env, "Zero_Owner");
+
+    for strkey in [ZERO_ACCOUNT_STRKEY, ZERO_CONTRACT_STRKEY] {
+        let zero = Address::from_str(&env, strkey);
+        let result =
+            client.try_create_delegation(&zero, &agent_id, &permissions_contract, &label, &1000);
+        assert_eq!(result, Err(Ok(DelegationError::InvalidParam)));
+        assert_eq!(client.get_delegations_by_owner(&zero).len(), 0);
+    }
+}
 
 #[test]
 fn test_resume_active_fails_with_typed_error() {
