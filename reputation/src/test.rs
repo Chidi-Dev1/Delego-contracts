@@ -2425,6 +2425,30 @@ fn test_hundred_consecutive_negative_reviews_never_wrap() {
             &i,
             &entity,
             &reviewer,
+// --- reputation score attestations (issue #394) ---
+
+/// Moves the mocked ledger to `sequence`, which is the checkpoint an
+/// attestation records.
+fn set_sequence(env: &Env, sequence: u32) {
+    env.ledger().set_sequence_number(sequence);
+}
+
+/// Records `count` freshly Released transactions for `entity`, enough to pass
+/// the config's `min_transactions_threshold` when `count >= 5`.
+fn seed_released_transactions(
+    client: &ReputationContractClient,
+    admin: &Address,
+    entity: &Address,
+    counterparty: &Address,
+    start: u64,
+    count: u64,
+) {
+    for i in start..(start + count) {
+        client.record_transaction(
+            admin,
+            &i,
+            entity,
+            counterparty,
             &1_000i128,
             &TransactionOutcome::Released,
         );
@@ -2551,4 +2575,203 @@ fn test_mixed_extreme_outcome_sequences_stay_bounded() {
         let recomputed = client.get_score_decomposition(&entity).final_score;
         assert_eq!(incremental, recomputed, "seed {seed}: paths disagree");
     }
+}
+
+#[test]
+fn test_generate_attestation_snapshots_public_score_and_window() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 1_000);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let attestation = client.generate_score_attestation(&entity);
+
+    assert_eq!(attestation.entity, entity);
+    assert_eq!(attestation.score_bps, 10_000);
+    assert_eq!(attestation.total_transactions, 5);
+    // Sequence checkpoint plus the documented validity window.
+    assert_eq!(attestation.certified_at_ledger, 1_000);
+    assert_eq!(
+        attestation.expires_at_ledger,
+        1_000 + crate::ATTESTATION_VALIDITY_LEDGERS
+    );
+    assert!(attestation.expires_at_ledger > attestation.certified_at_ledger);
+}
+
+#[test]
+fn test_generate_attestation_masks_score_below_threshold() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 1);
+
+    let attestation = client.generate_score_attestation(&entity);
+    let reputation = client.get_reputation(&entity);
+
+    // The attestation must agree with the canonical read path, including the
+    // min-transactions visibility gate.
+    assert_eq!(reputation.score, 0);
+    assert_eq!(attestation.score_bps, 0);
+    assert_eq!(attestation.total_transactions, 1);
+}
+
+#[test]
+fn test_generate_attestation_for_unknown_entity_is_zeroed_snapshot() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let unknown = Address::generate(&env);
+    set_sequence(&env, 42);
+
+    let attestation = client.generate_score_attestation(&unknown);
+
+    assert_eq!(attestation.entity, unknown);
+    assert_eq!(attestation.score_bps, 0);
+    assert_eq!(attestation.total_transactions, 0);
+    assert_eq!(attestation.certified_at_ledger, 42);
+    assert!(attestation.expires_at_ledger > 42);
+}
+
+#[test]
+fn test_verify_attestation_accepts_fresh_snapshot() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 500);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let attestation = client.generate_score_attestation(&entity);
+    let verification = client.verify_score_attestation(&attestation);
+
+    assert!(verification.valid);
+    assert!(!verification.expired);
+    assert!(verification.score_matches);
+    assert_eq!(verification.attestation, attestation);
+    assert_eq!(verification.current, attestation);
+}
+
+#[test]
+fn test_verify_attestation_detects_score_drift() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 500);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let cached = client.generate_score_attestation(&entity);
+
+    // A dispute lands after the snapshot was certified, degrading the score.
+    client.record_transaction(
+        &admin,
+        &99u64,
+        &entity,
+        &counterparty,
+        &1_000i128,
+        &TransactionOutcome::Disputed,
+    );
+
+    let verification = client.verify_score_attestation(&cached);
+    assert!(!verification.valid);
+    assert!(!verification.expired);
+    assert!(!verification.score_matches);
+    assert!(verification.current.score_bps < cached.score_bps);
+    // The refreshed snapshot is itself verifiable.
+    assert!(client.verify_score_attestation(&verification.current).valid);
+}
+
+#[test]
+fn test_verify_attestation_detects_transaction_count_drift() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 500);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let cached = client.generate_score_attestation(&entity);
+
+    // Same score (a clean Released outcome keeps it at 10_000), but the
+    // lifetime transaction count backing it moved on.
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 100, 1);
+
+    let verification = client.verify_score_attestation(&cached);
+    assert!(!verification.valid);
+    assert!(!verification.expired);
+    assert!(!verification.score_matches);
+    assert_eq!(verification.current.score_bps, cached.score_bps);
+    assert_eq!(
+        verification.current.total_transactions,
+        cached.total_transactions + 1
+    );
+}
+
+#[test]
+fn test_verify_attestation_detects_expiry() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 500);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let cached = client.generate_score_attestation(&entity);
+
+    // One ledger before the window closes the snapshot is still authoritative.
+    set_sequence(&env, cached.expires_at_ledger - 1);
+    let fresh_window = client.verify_score_attestation(&cached);
+    assert!(fresh_window.valid);
+    assert!(!fresh_window.expired);
+
+    // At the expiry ledger it is stale even though state is unchanged.
+    set_sequence(&env, cached.expires_at_ledger);
+    let expired = client.verify_score_attestation(&cached);
+    assert!(!expired.valid);
+    assert!(expired.expired);
+    assert!(expired.score_matches);
+    // Refreshing yields a snapshot anchored at the current ledger.
+    assert_eq!(
+        expired.current.certified_at_ledger,
+        cached.expires_at_ledger
+    );
+    assert!(client.verify_score_attestation(&expired.current).valid);
+}
+
+#[test]
+fn test_attestation_is_expired_boundaries() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+    set_sequence(&env, 100);
+    seed_released_transactions(&client, &admin, &entity, &counterparty, 0, 5);
+
+    let attestation = client.generate_score_attestation(&entity);
+    assert!(!crate::attestation_is_expired(&attestation, 100));
+    assert!(!crate::attestation_is_expired(
+        &attestation,
+        attestation.expires_at_ledger - 1
+    ));
+    assert!(crate::attestation_is_expired(
+        &attestation,
+        attestation.expires_at_ledger
+    ));
+    assert!(crate::attestation_is_expired(&attestation, u32::MAX));
+
+    // Malformed windows (expiry at or before certification) are always stale,
+    // so a hand-built snapshot cannot bypass expiry.
+    let malformed = crate::ReputationAttestation {
+        entity: entity.clone(),
+        score_bps: 10_000,
+        total_transactions: 5,
+        certified_at_ledger: 100,
+        expires_at_ledger: 100,
+    };
+    assert!(crate::attestation_is_expired(&malformed, 0));
+    let verification = client.verify_score_attestation(&malformed);
+    assert!(!verification.valid);
+    assert!(verification.expired);
 }
