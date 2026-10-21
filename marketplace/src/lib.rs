@@ -18,6 +18,8 @@ use soroban_sdk::{
 
 /// Storefront metadata storage and update support.
 pub mod storefront;
+pub mod oracle;
+pub use oracle::*;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -463,6 +465,8 @@ pub struct MerchantAppealResolvedEvent {
     ReserveLocked = 4033,
     /// Liquidation reserve has already been withdrawn or liquidated.
     ReserveAlreadyReleased = 4034,
+    /// Price timestamp is older than the allowed staleness threshold or from the future.
+    StaleOraclePrice = 5030,
 }
 
 // --- Events ---
