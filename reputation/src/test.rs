@@ -2362,4 +2362,193 @@ fn test_update_config_event_namespace_is_reput() {
     let (_, topics, _) = &cfg_upd_events[0];
     let ns: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
     assert_eq!(ns, symbol_short!("reput"), "cfg_upd event namespace must be 'reput'");
+// --- strict numeric normalization (issue #395) ---
+//
+// Score recalculation must never panic, underflow, or wrap when a merchant
+// accumulates extreme consecutive negative reviews. Every persisted score
+// funnels through `normalize_score`, which clamps the raw signed value into
+// the legal `0..=10_000` basis-point band.
+
+#[test]
+fn test_normalize_score_clamps_to_basis_point_band() {
+    assert_eq!(crate::normalize_score(i64::MIN), 0);
+    assert_eq!(crate::normalize_score(-1), 0);
+    assert_eq!(crate::normalize_score(0), 0);
+    assert_eq!(crate::normalize_score(1), 1);
+    assert_eq!(crate::normalize_score(5_000), 5_000);
+    assert_eq!(crate::normalize_score(9_999), 9_999);
+    assert_eq!(crate::normalize_score(10_000), 10_000);
+    assert_eq!(crate::normalize_score(10_001), 10_000);
+    assert_eq!(crate::normalize_score(i64::MAX), 10_000);
+}
+#[test]
+fn test_normalize_score_is_idempotent_and_monotonic() {
+    // Property: the clamp output always lands in the legal band, normalizing
+    // an already-normalized value is a no-op, and the mapping is monotonically
+    // non-decreasing across the whole signed domain.
+    const STEP: i64 = 1_000_000_000_000;
+    let mut previous = crate::normalize_score(i64::MIN);
+    let mut raw: i64 = i64::MIN;
+    while raw < i64::MAX {
+        raw = raw.saturating_add(STEP);
+        let normalized = crate::normalize_score(raw);
+        assert!(
+            normalized <= 10_000,
+            "score {normalized} escaped 0..=10_000"
+        );
+        assert!(normalized >= previous, "normalization must not decrease");
+        assert_eq!(crate::normalize_score(normalized as i64), normalized);
+        previous = normalized;
+    }
+}
+
+#[test]
+fn test_calculate_decayed_score_stays_within_basis_point_band() {
+    // Decay is a score recalculation too, so an out-of-band input must be
+    // folded back into the legal band rather than returned verbatim.
+    assert_eq!(crate::calculate_decayed_score(20_000, 0, 100), 10_000);
+    assert_eq!(crate::calculate_decayed_score(10_000, 0, 100), 10_000);
+    assert!(crate::calculate_decayed_score(10_000, 50, 100) <= 10_000);
+}
+
+#[test]
+fn test_hundred_consecutive_negative_reviews_never_wrap() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let entity = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+
+    // Establish a perfect score first so the negative run has room to fall.
+    for i in 0..5u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &reviewer,
+            &1_000i128,
+            &TransactionOutcome::Released,
+        );
+    }
+    assert_eq!(client.get_reputation(&entity).score, 10_000);
+
+    // 100 consecutive negative reviews: refunded outcomes rated 0/10_000.
+    for i in 5..105u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &reviewer,
+            &1_000i128,
+            &TransactionOutcome::Refunded,
+        );
+        client.rate_entity(&reviewer, &i, &entity, &0u32);
+
+        let rep = client.get_reputation(&entity);
+        assert!(
+            rep.score <= 10_000,
+            "score {} escaped the basis-point band on review {i}",
+            rep.score
+        );
+        assert!(rep.avg_rating <= 10_000);
+    }
+}
+
+#[test]
+fn test_hundred_disputes_with_max_penalty_saturate_at_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let mut config = default_config();
+    // Maximum legal per-dispute penalty, so the accumulated penalty is far
+    // larger than the maximum possible base score.
+    config.dispute_penalty_bps = 10_000;
+    let contract_id = env.register(ReputationContract, (admin.clone(), config));
+    let client = ReputationContractClient::new(&env, &contract_id);
+
+    let entity = Address::generate(&env);
+    let counterparty = Address::generate(&env);
+
+    for i in 0..100u64 {
+        client.record_transaction(
+            &admin,
+            &i,
+            &entity,
+            &counterparty,
+            &1_000i128,
+            &TransactionOutcome::Disputed,
+        );
+        let rep = client.get_reputation(&entity);
+        assert!(rep.score <= 10_000, "score wrapped on dispute {i}");
+    }
+
+    let rep = client.get_reputation(&entity);
+    assert_eq!(rep.score, 0);
+    assert_eq!(rep.disputed_transactions, 100);
+
+    // The raw decomposition shows the *pre-clamp* value was deeply negative:
+    // 100 disputes x 10_000 bps of penalty against a 0 bps base score. The
+    // clamp — not an accidental wrap — is what produced 0.
+    let decomposition = client.get_score_decomposition(&entity);
+    assert_eq!(decomposition.base_score_bps, 0);
+    assert_eq!(decomposition.penalty_bps, 1_000_000);
+    assert_eq!(decomposition.final_score, 0);
+}
+
+#[test]
+fn test_mixed_extreme_outcome_sequences_stay_bounded() {
+    // Deterministic pseudo-random sequences (no external proptest
+    // dependency): every generated history must leave the persisted score
+    // inside `0..=10_000`, and the incremental fast path used by
+    // `record_transaction` must agree with a full recompute.
+    fn next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    let outcomes = [
+        TransactionOutcome::Released,
+        TransactionOutcome::Refunded,
+        TransactionOutcome::Disputed,
+        TransactionOutcome::ResolvedSeller,
+        TransactionOutcome::ResolvedBuyer,
+    ];
+
+    for seed in 0..8u64 {
+        let env = Env::default();
+        let (client, admin) = setup(&env);
+        let entity = Address::generate(&env);
+        let counterparty = Address::generate(&env);
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+
+        for i in 0..40u64 {
+            let outcome = outcomes[(next(&mut state) % outcomes.len() as u64) as usize].clone();
+            let is_disputed = matches!(outcome, TransactionOutcome::Disputed);
+            client.record_transaction(&admin, &i, &entity, &counterparty, &1_000i128, &outcome);
+            if !is_disputed {
+                let rating = (next(&mut state) % 10_001) as u32;
+                client.rate_entity(&counterparty, &i, &entity, &rating);
+            }
+
+            let rep = client.get_reputation(&entity);
+            assert!(
+                rep.score <= 10_000,
+                "seed {seed} step {i}: score escaped band"
+            );
+            assert!(rep.avg_rating <= 10_000);
+
+            let decomposition = client.get_score_decomposition(&entity);
+            assert!(
+                (0..=10_000).contains(&decomposition.final_score),
+                "seed {seed} step {i}: decomposition escaped band"
+            );
+            assert!(decomposition.base_score_bps <= 10_000);
+        }
+
+        // The incrementally maintained score is re-derivable from scratch.
+        let incremental = client.get_reputation(&entity).score;
+        let recomputed = client.get_score_decomposition(&entity).final_score;
+        assert_eq!(incremental, recomputed, "seed {seed}: paths disagree");
+    }
 }
