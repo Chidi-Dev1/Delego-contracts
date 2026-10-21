@@ -26,6 +26,9 @@
 #![cfg_attr(not(test), no_std)]
 #![allow(clippy::too_many_arguments)]
 #![warn(missing_docs)]
+mod recurring_quota;
+pub use recurring_quota::RecurringQuotaConfig;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::ToXdr, Address, BytesN,
     Env, Symbol, Vec,
@@ -255,7 +258,6 @@ pub enum Epoch {
     /// Reset spent monthly (every 30 ledgers, roughly)
     Monthly,
 }
-
 
 #[cfg(test)]
 mod error_code_tests {
@@ -1368,6 +1370,8 @@ pub struct ChildPermission {
 
 #[contracttype]
 pub enum DataKey {
+    /// Immutable recurring quota and lifetime spend for a permission pair.
+    RecurringQuota(Address, Address),
     Permission(Address, Address),
     /// Temporary session-key authorization and spend state for an owner/key pair.
     EphemeralSession(Address, Address),
@@ -1518,6 +1522,9 @@ impl PermissionsContract {
     ) -> Result<(), PermissionError> {
         owner.require_auth();
 
+        if recurring_quota::load(&env, &owner, &config.session_key).is_some() {
+            return Err(PermissionError::AlreadyGranted);
+        }
         if owner == config.session_key || config.max_spend_per_session <= 0 {
             return Err(PermissionError::InvalidParam);
         }
@@ -1545,8 +1552,7 @@ impl PermissionsContract {
         if env.storage().persistent().has(&DataKey::Permission(
             owner.clone(),
             config.session_key.clone(),
-        ))
-            || env.storage().temporary().has(&key)
+        )) || env.storage().temporary().has(&key)
         {
             return Err(PermissionError::AlreadyGranted);
         }
@@ -1558,13 +1564,9 @@ impl PermissionsContract {
             .checked_add(ttl_ledgers)
             .ok_or(PermissionError::InvalidExpiry)?;
 
-        env.storage().temporary().set(
-            &key,
-            &EphemeralSessionState {
-                config,
-                spent: 0,
-            },
-        );
+        env.storage()
+            .temporary()
+            .set(&key, &EphemeralSessionState { config, spent: 0 });
         env.storage()
             .temporary()
             .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
@@ -2174,7 +2176,7 @@ impl PermissionsContract {
             return Err(PermissionError::Expired);
         }
 
-        let parent_remaining = parent_record.limit_total - parent_record.spent;
+        let parent_remaining = recurring_quota::remaining(&env, &parent_record);
         if limit_total > parent_remaining || limit_per_tx > parent_record.limit_per_tx {
             return Err(PermissionError::ExceedsParentLimit);
         }
@@ -2370,6 +2372,13 @@ impl PermissionsContract {
         new_delegate: Address,
     ) -> Result<(), PermissionError> {
         owner.require_auth();
+
+        // A quota cannot be copied into a second independent lifetime budget.
+        if recurring_quota::load(&env, &owner, &old_delegate).is_some()
+            || recurring_quota::load(&env, &owner, &new_delegate).is_some()
+        {
+            return Err(PermissionError::InvalidParam);
+        }
 
         // Prevent self-transfer
         if old_delegate == new_delegate {
@@ -2846,7 +2855,10 @@ impl PermissionsContract {
         record: &PermissionRecord,
         amount: i128,
     ) -> Result<(), PermissionError> {
-        let remaining = record.limit_total - record.spent;
+        let remaining = recurring_quota::remaining(env, record);
+        if amount <= 0 {
+            return Err(PermissionError::InvalidParam);
+        }
         if amount > remaining {
             return Err(PermissionError::ExceedsTotalLimit);
         }
@@ -2864,7 +2876,7 @@ impl PermissionsContract {
                 .get(&parent_key)
                 .ok_or(PermissionError::ParentNotFound)?;
 
-            let parent_remaining = parent_record.limit_total - parent_record.spent;
+            let parent_remaining = recurring_quota::remaining(env, &parent_record);
             if amount > parent_remaining {
                 return Err(PermissionError::ExceedsParentLimit);
             }
@@ -3616,33 +3628,44 @@ impl PermissionsContract {
                     record.spent = 0;
                     record.last_reset_ledger = current_ledger;
                 }
-            }
-            Epoch::Weekly => {
-                if ledgers_since_reset >= 7 {
-                    record.spent = 0;
-                    record.last_reset_ledger = current_ledger;
+        if !recurring_quota::consume(env, &mut record, amount)? {
+            // Reset spent when crossing an epoch boundary (issue #11).
+            let current_ledger = env.ledger().sequence();
+            let ledgers_since_reset = current_ledger.saturating_sub(record.last_reset_ledger);
+            match record.epoch {
+                Epoch::Daily => {
+                    if ledgers_since_reset >= 1 {
+                        record.spent = 0;
+                        record.last_reset_ledger = current_ledger;
+                    }
+                }
+                Epoch::Weekly => {
+                    if ledgers_since_reset >= 7 {
+                        record.spent = 0;
+                        record.last_reset_ledger = current_ledger;
+                    }
+                }
+                Epoch::Monthly => {
+                    if ledgers_since_reset >= 30 {
+                        record.spent = 0;
+                        record.last_reset_ledger = current_ledger;
+                    }
                 }
             }
-            Epoch::Monthly => {
-                if ledgers_since_reset >= 30 {
-                    record.spent = 0;
-                    record.last_reset_ledger = current_ledger;
-                }
-            }
-        }
 
-        if amount <= 0 {
-            return Err(PermissionError::InvalidParam);
+            if amount <= 0 {
+                return Err(PermissionError::InvalidParam);
+            }
+            let new_spent = record
+                .spent
+                .checked_add(amount)
+                .ok_or(PermissionError::ExceedsTotalLimit)?;
+            if new_spent > record.limit_total {
+                return Err(PermissionError::ExceedsTotalLimit);
+            }
+            record.spent = new_spent;
         }
-        let new_spent = record
-            .spent
-            .checked_add(amount)
-            .ok_or(PermissionError::ExceedsTotalLimit)?;
-        if new_spent > record.limit_total {
-            return Err(PermissionError::ExceedsTotalLimit);
-        }
-        record.spent = new_spent;
-        let remaining = record.limit_total - record.spent;
+        let remaining = recurring_quota::remaining(env, &record);
         let new_spend_ledger = env.ledger().sequence();
 
         // Capture the parent link before writing the updated record so we can
@@ -3677,14 +3700,16 @@ impl PermissionsContract {
             let mut parent_record: PermissionRecord =
                 env.storage().persistent().get(&parent_key).unwrap();
 
-            let parent_spent = parent_record
-                .spent
-                .checked_add(amount)
-                .ok_or(PermissionError::ExceedsTotalLimit)?;
-            if parent_spent > parent_record.limit_total {
-                return Err(PermissionError::ExceedsTotalLimit);
+            if !recurring_quota::consume(env, &mut parent_record, amount)? {
+                let parent_spent = parent_record
+                    .spent
+                    .checked_add(amount)
+                    .ok_or(PermissionError::ExceedsTotalLimit)?;
+                if parent_spent > parent_record.limit_total {
+                    return Err(PermissionError::ExceedsTotalLimit);
+                }
+                parent_record.spent = parent_spent;
             }
-            parent_record.spent = parent_spent;
             next_parent = match (
                 parent_record.parent_owner.clone(),
                 parent_record.parent_delegate.clone(),
@@ -5240,7 +5265,7 @@ impl PermissionsContract {
             .storage()
             .persistent()
             .get::<DataKey, PermissionRecord>(&DataKey::Permission(owner.clone(), delegate.clone()))
-            .map(|r| r.limit_total - r.spent)
+            .map(|r| recurring_quota::remaining(&env, &r))
             .unwrap_or(0);
 
         match Self::can_spend(env.clone(), owner, delegate, amount, merchant) {
@@ -5395,7 +5420,7 @@ impl PermissionsContract {
             .persistent()
             .get(&key)
             .ok_or(PermissionError::PermissionNotFound)?;
-        Ok(record.limit_total - record.spent)
+        Ok(recurring_quota::remaining(&env, &record))
     }
 
     /// Typed allowance getter: returns limit, spent, remaining (clamped ≥ 0),
@@ -5412,12 +5437,12 @@ impl PermissionsContract {
             .get(&key)
             .ok_or(PermissionError::PermissionNotFound)?;
 
-        let raw = record.limit_total - record.spent;
+        let raw = recurring_quota::remaining(&env, &record);
         let remaining = if raw < 0 { 0 } else { raw };
 
         Ok(RemainingAllowance {
             limit: record.limit_total,
-            spent: record.spent,
+            spent: recurring_quota::epoch_spent(&env, &record),
             remaining,
             expires_at_ledger: record.expires_at_ledger,
         })
@@ -6795,7 +6820,7 @@ impl PermissionsContract {
         };
 
         let remaining = {
-            let raw = record.limit_total - record.spent;
+            let raw = recurring_quota::remaining(&env, &record);
             if raw < 0 {
                 0
             } else {
@@ -6867,7 +6892,7 @@ impl PermissionsContract {
         };
 
         let remaining = if effective_status == PermissionStatus::Active {
-            let raw = record.limit_total - record.spent;
+            let raw = recurring_quota::remaining(&env, &record);
             if raw < 0 {
                 0
             } else {
@@ -7153,3 +7178,6 @@ mod audit_log_page_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod recurring_quota_tests;
