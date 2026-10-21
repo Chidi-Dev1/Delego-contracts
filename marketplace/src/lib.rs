@@ -673,6 +673,56 @@ pub struct MerchantVolumeRecord {
     pub last_updated_ledger: u32,
 }
 
+/// Verification badge tier for a merchant.
+///
+/// Merchants advance through tiers based on cumulative settled sales volume,
+/// dispute rate, and bond collateral. The tier is recomputed on every
+/// volume/dispute update and transitions emit [`MerchantTierUpdatedEvent`].
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum MerchantTier {
+    Unverified = 0,
+    Bronze = 1,
+    Silver = 2,
+    Gold = 3,
+    Platinum = 4,
+}
+
+/// Per-merchant tier state: current tier plus the inputs used to derive it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantTierState {
+    pub tier: MerchantTier,
+    /// Cumulative settled sales volume in stroops.
+    pub cumulative_volume: i128,
+    /// Disputes observed in the current window.
+    pub disputes: u32,
+    /// Total settled orders observed in the current window.
+    pub total_orders: u32,
+    /// Ledger timestamp of the last evaluation.
+    pub last_evaluated: u64,
+}
+
+/// Emitted whenever a merchant's verification tier changes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantTierUpdatedEvent {
+    pub merchant_id: u64,
+    pub previous_tier: MerchantTier,
+    pub new_tier: MerchantTier,
+    pub cumulative_volume: i128,
+    pub dispute_rate_bps: u32,
+}
+
+// Tier qualification thresholds. Volume is in stroops (1 XLM = 10_000_000).
+// Dispute rate is expressed in basis points (100 bps = 1%).
+pub const TIER_BRONZE_MIN_VOLUME: i128 = 100_000_000; // 10 XLM
+pub const TIER_SILVER_MIN_VOLUME: i128 = 1_000_000_000; // 100 XLM
+pub const TIER_GOLD_MIN_VOLUME: i128 = 100_000_000_000; // 10,000 XLM
+pub const TIER_PLATINUM_MIN_VOLUME: i128 = 1_000_000_000_000; // 100,000 XLM
+pub const TIER_MAX_DISPUTE_RATE_BPS: u32 = 100; // < 1% dispute rate
+
 /// Snapshot stored when a merchant is permanently closed.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
