@@ -194,6 +194,19 @@ pub struct Verifier {
     pub registered_at: u64,
 }
 
+/// One page of the verifier set, returned by [`MarketplaceContract::get_verifiers_page`].
+///
+/// `total` is the total number of registered verifiers (the size of the whole
+/// set, not of `items`), and `next_offset` is the offset to pass to the next
+/// call to continue pagination, or `None` when the last page has been reached.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct VerifierPage {
+    pub items: Vec<Verifier>,
+    pub total: u32,
+    pub next_offset: Option<u32>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractVersion {
@@ -302,6 +315,8 @@ pub enum MarketplaceError {
     InvalidSku = 4042,
     /// Stock reservation failed due to concurrent modifications.
     StockReservationFailed = 4043,
+    /// The verifier set has reached [`MAX_VERIFIERS`]; remove one before adding another.
+    VerifierLimitReached = 5022,
 }
 
 // ---------------------------------------------------------------------------
@@ -876,6 +891,14 @@ pub const MAX_METADATA_LEN: u32 = 1024;
 /// Keeping this cap tight prevents unbounded storage growth while still
 /// accommodating real-world IPFS and HTTPS URIs.
 pub const MAX_METADATA_URI_LEN: u32 = 128;
+
+/// Maximum number of verifiers that can be registered at once.
+///
+/// Bounds both instance storage growth driven by [`MarketplaceContract::add_verifier`]
+/// and the read cost of [`MarketplaceContract::get_verifiers`]. Callers that need
+/// to read the set in bounded chunks should use
+/// [`MarketplaceContract::get_verifiers_page`] instead of fetching the whole vector.
+pub const MAX_VERIFIERS: u32 = 50;
 
 // Largest of the caps above; used to size the stack buffer that string
 // normalization copies host bytes into. `#![no_std]` without the `alloc`
@@ -1677,6 +1700,11 @@ impl MarketplaceContract {
             if v.address == verifier.address {
                 return Err(MarketplaceError::VerifierAlreadyExists);
             }
+        }
+
+        let verifier_count: u32 = verifiers.len();
+        if verifier_count >= MAX_VERIFIERS {
+            return Err(MarketplaceError::VerifierLimitReached);
         }
 
         verifiers.push_back(verifier.clone());
@@ -3536,11 +3564,53 @@ impl MarketplaceContract {
         }
     }
 
+    /// Returns every registered verifier.
+    ///
+    /// Prefer [`Self::get_verifiers_page`] for bounded reads: this accessor
+    /// materialises the whole set (up to [`MAX_VERIFIERS`] entries) on every
+    /// call.
     pub fn get_verifiers(env: Env) -> Vec<Verifier> {
         env.storage()
             .instance()
             .get(&DataKey::Verifiers)
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns one page of the verifier set.
+    ///
+    /// `offset` is the zero-based index to start from (clamped to the set
+    /// size) and `limit` is the maximum number of entries to return. The
+    /// returned `VerifierPage` carries the total set size so callers can
+    /// render page counts without a second call, and `next_offset` to pass
+    /// back into this function to fetch the following page (`None` once the
+    /// end of the set has been reached). A `limit` of zero returns an empty
+    /// page. Because the set itself is capped at [`MAX_VERIFIERS`], the read
+    /// cost of a page is bounded regardless of the caller-supplied `limit`.
+    pub fn get_verifiers_page(env: Env, offset: u32, limit: u32) -> VerifierPage {
+        let verifiers = Self::get_verifiers(env.clone());
+        let total: u32 = verifiers.len();
+
+        let start = offset.min(total);
+        let end = if limit == 0 {
+            start
+        } else {
+            start.saturating_add(limit).min(total)
+        };
+
+        let mut items = Vec::new(&env);
+        let mut i = start;
+        while i < end {
+            // In-bounded: i < end <= total == verifiers.len().
+            items.push_back(verifiers.get(i).unwrap());
+            i += 1;
+        }
+
+        let next_offset = if end < total { Some(end) } else { None };
+        VerifierPage {
+            items,
+            total,
+            next_offset,
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -4739,7 +4809,7 @@ mod error_code_uniqueness_tests {
     const DELEGATION_ERROR_RANGE: (u32, u32) = (4000, 4999);
     const MARKETPLACE_ERROR_RANGE: (u32, u32) = (5000, 5999);
 
-    fn marketplace_error_codes() -> [u32; 21] {
+    fn marketplace_error_codes() -> [u32; 22] {
         [
             MarketplaceError::AlreadyInitialized as u32,
             MarketplaceError::NotInitialized as u32,
@@ -4762,6 +4832,7 @@ mod error_code_uniqueness_tests {
             MarketplaceError::MerchantBanned as u32,
             MarketplaceError::MerchantCategoryNotAllowed as u32,
             MarketplaceError::MetadataUriTooLong as u32,
+            MarketplaceError::VerifierLimitReached as u32,
         ]
     }
 

@@ -3,8 +3,8 @@ use crate::{
     MarketplaceContract, MarketplaceContractClient, MarketplaceError, Merchant,
     MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
     MerchantRegisteredEvent, MerchantStats, MerchantStatus, MerchantValidationError,
-    RegisterParams, VerificationPolicy, Verifier,
-    MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN, MAX_NAME_LEN,
+    RegisterParams, VerificationPolicy, Verifier, VerifierPage,
+    MAX_DESCRIPTION_LEN, MAX_IMAGE_URL_LEN, MAX_METADATA_LEN, MAX_NAME_LEN, MAX_VERIFIERS,
     normalize_symbol,
 };
 use delego_reputation::{
@@ -784,6 +784,124 @@ fn test_verifier_management() {
         not_found_err.unwrap_err().unwrap(),
         MarketplaceError::VerifierNotFound
     );
+}
+
+#[test]
+fn test_verifier_cap_enforced() {
+    let f = TestFixture::setup();
+
+    let mut addresses = std::vec::Vec::new();
+    for _ in 0..MAX_VERIFIERS {
+        let addr = Address::generate(&f.env);
+        f.client.add_verifier(
+            &f.admin,
+            &Verifier {
+                address: addr.clone(),
+                label: symbol_short!("v"),
+                registered_at: f.env.ledger().timestamp(),
+            },
+        );
+        addresses.push(addr);
+    }
+    assert_eq!(f.client.get_verifiers().len(), MAX_VERIFIERS);
+
+    // The set is full: one more add must be rejected.
+    let overflow_addr = Address::generate(&f.env);
+    let overflow_err = f.client.try_add_verifier(
+        &f.admin,
+        &Verifier {
+            address: overflow_addr.clone(),
+            label: symbol_short!("v"),
+            registered_at: f.env.ledger().timestamp(),
+        },
+    );
+    assert_eq!(
+        overflow_err.unwrap_err().unwrap(),
+        MarketplaceError::VerifierLimitReached
+    );
+    assert_eq!(f.client.get_verifiers().len(), MAX_VERIFIERS);
+
+    // Removing a verifier frees a slot again.
+    let removed = addresses.remove(0);
+    f.client.remove_verifier(&f.admin, &removed);
+    assert_eq!(f.client.get_verifiers().len(), MAX_VERIFIERS - 1);
+    f.client.add_verifier(
+        &f.admin,
+        &Verifier {
+            address: overflow_addr,
+            label: symbol_short!("v"),
+            registered_at: f.env.ledger().timestamp(),
+        },
+    );
+    assert_eq!(f.client.get_verifiers().len(), MAX_VERIFIERS);
+}
+
+#[test]
+fn test_get_verifiers_page_pagination() {
+    let f = TestFixture::setup();
+
+    let mut expected = soroban_sdk::Vec::<Address>::new(&f.env);
+    for i in 0..5u32 {
+        let addr = Address::generate(&f.env);
+        f.client.add_verifier(
+            &f.admin,
+            &Verifier {
+                address: addr.clone(),
+                label: Symbol::new(&f.env, &format!("v{i}")),
+                registered_at: f.env.ledger().timestamp(),
+            },
+        );
+        expected.push_back(addr);
+    }
+
+    // First page.
+    let page1: VerifierPage = f.client.get_verifiers_page(&0, &2);
+    assert_eq!(page1.total, 5);
+    assert_eq!(page1.items.len(), 2);
+    assert_eq!(page1.items.get(0).unwrap().address, expected.get(0).unwrap());
+    assert_eq!(page1.items.get(1).unwrap().address, expected.get(1).unwrap());
+    assert_eq!(page1.next_offset, Some(2));
+
+    // Middle page.
+    let page2: VerifierPage = f.client.get_verifiers_page(&2, &2);
+    assert_eq!(page2.total, 5);
+    assert_eq!(page2.items.len(), 2);
+    assert_eq!(page2.items.get(0).unwrap().address, expected.get(2).unwrap());
+    assert_eq!(page2.items.get(1).unwrap().address, expected.get(3).unwrap());
+    assert_eq!(page2.next_offset, Some(4));
+
+    // Final (partial) page: no further pages.
+    let page3: VerifierPage = f.client.get_verifiers_page(&4, &2);
+    assert_eq!(page3.total, 5);
+    assert_eq!(page3.items.len(), 1);
+    assert_eq!(page3.items.get(0).unwrap().address, expected.get(4).unwrap());
+    assert_eq!(page3.next_offset, None);
+
+    // A page larger than the set is clamped.
+    let big: VerifierPage = f.client.get_verifiers_page(&0, &100);
+    assert_eq!(big.items.len(), 5);
+    assert_eq!(big.next_offset, None);
+
+    // Offset beyond the set yields an empty final page.
+    let past: VerifierPage = f.client.get_verifiers_page(&10, &2);
+    assert_eq!(past.total, 5);
+    assert_eq!(past.items.len(), 0);
+    assert_eq!(past.next_offset, None);
+
+    // A zero limit yields an empty page but still points at the next offset.
+    let empty: VerifierPage = f.client.get_verifiers_page(&1, &0);
+    assert_eq!(empty.total, 5);
+    assert_eq!(empty.items.len(), 0);
+    assert_eq!(empty.next_offset, Some(1));
+}
+
+#[test]
+fn test_get_verifiers_page_empty_set() {
+    let f = TestFixture::setup();
+    let page: VerifierPage = f.client.get_verifiers_page(&0, &10);
+    assert_eq!(page.total, 0);
+    assert_eq!(page.items.len(), 0);
+    assert_eq!(page.next_offset, None);
 }
 
 #[test]
