@@ -514,6 +514,66 @@ pub enum DataKey {
     /// Last ledger sequence at which a keeper bounty was paid for a delegation.
     /// Used to enforce the per-delegation cooldown between consecutive claims.
     KeeperLastBountyLedger(u64),
+    /// Legacy (V1) delegation record keyed by owner address.
+    DelegationV1(Address),
+    /// Current (V2) delegation record keyed by owner address and label.
+    DelegationV2(Address, Symbol),
+    /// Schema version marker for the delegation storage layout.
+    SchemaVersion,
+}
+
+/// Current delegation storage schema version.
+pub const DELEGATION_SCHEMA_VERSION: u32 = 2;
+
+/// Legacy V1 delegation record layout, kept only so pre-upgrade entries can be
+/// read and lazily migrated to [`DelegationRecord`] (issue #574).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegationRecordV1 {
+    /// Unique identifier for the delegation.
+    pub id: u64,
+    /// Address of the delegation owner.
+    pub owner: Address,
+    /// Identifier of the authorized agent.
+    pub agent_id: BytesN<32>,
+    /// Contract address for which permissions are delegated.
+    pub permissions_contract: Address,
+    /// Current lifecycle status.
+    pub status: DelegationStatus,
+    /// Human-readable label for the delegation.
+    pub label: Symbol,
+    /// Ledger timestamp when the delegation was created.
+    pub created_at: u64,
+    /// Ledger timestamp of the last mutation to this delegation.
+    pub updated_at: u64,
+    /// Ledger sequence at which the delegation expires.
+    pub expires_at_ledger: u32,
+    /// Version number used for history/rollback.
+    pub version: u32,
+    /// Capabilities granted to the delegate, packed into one word.
+    pub permissions: PermissionBitmask,
+    /// Nonce for key revocation tracking.
+    pub nonce: u64,
+}
+
+impl DelegationRecordV1 {
+    /// Converts a legacy V1 record into the current V2 schema.
+    pub fn into_v2(self) -> DelegationRecord {
+        DelegationRecord {
+            id: self.id,
+            owner: self.owner,
+            agent_id: self.agent_id,
+            permissions_contract: self.permissions_contract,
+            status: self.status,
+            label: self.label,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            expires_at_ledger: self.expires_at_ledger,
+            version: self.version,
+            permissions: self.permissions,
+            nonce: self.nonce,
+        }
+    }
 }
 
 /// Errors for delegation registry operations.
@@ -831,6 +891,10 @@ impl DelegationRegistry {
             PERSISTENT_BUMP_AMOUNT,
         );
 
+        // Persist the record in the V2 schema as well and mark the schema
+        // version so lazy migration can find it (issue #574).
+        Self::write_delegation_v2(&env, &record);
+
         // Initialize version tracking
         env.storage()
             .persistent()
@@ -875,10 +939,7 @@ impl DelegationRegistry {
 
     /// Pauses an active delegation.
     pub fn pause_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
-        let mut record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let mut record = Self::load_delegation_by_id(&env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         record.owner.require_auth();
@@ -894,6 +955,7 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Delegation(delegation_id), &record);
+        Self::write_delegation_v2(&env, &record);
 
         Self::store_snapshot(&env, delegation_id, &record);
 
@@ -918,10 +980,7 @@ impl DelegationRegistry {
     /// and the stored record is left exactly as it was (still `Paused`).
     /// Persisting the `Paused -> Expired` transition is `sweep_expired`'s job.
     pub fn resume_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
-        let mut record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let mut record = Self::load_delegation_by_id(&env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         record.owner.require_auth();
@@ -942,6 +1001,7 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Delegation(delegation_id), &record);
+        Self::write_delegation_v2(&env, &record);
 
         Self::store_snapshot(&env, delegation_id, &record);
 
@@ -969,10 +1029,7 @@ impl DelegationRegistry {
     /// Returns `Ok(false)` if the delegation was already `Revoked` (idempotent no-op).
     /// Revokes a delegation.
     pub fn revoke_delegation(env: Env, delegation_id: u64) -> Result<bool, DelegationError> {
-        let mut record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let mut record = Self::load_delegation_by_id(&env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         record.owner.require_auth();
@@ -988,6 +1045,7 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Delegation(delegation_id), &record);
+        Self::write_delegation_v2(&env, &record);
 
         Self::store_snapshot(&env, delegation_id, &record);
 
@@ -1031,10 +1089,7 @@ impl DelegationRegistry {
             return Err(DelegationError::NotAuthorized);
         }
 
-        let mut record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let mut record = Self::load_delegation_by_id(&env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         if record.status == DelegationStatus::Revoked {
@@ -1048,6 +1103,7 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Delegation(delegation_id), &record);
+        Self::write_delegation_v2(&env, &record);
 
         Self::store_snapshot(&env, delegation_id, &record);
 
@@ -1094,10 +1150,7 @@ impl DelegationRegistry {
             return Err(DelegationError::NotAuthorized);
         }
 
-        let mut record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let mut record = Self::load_delegation_by_id(&env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         if record.status != DelegationStatus::Active {
@@ -1111,6 +1164,7 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Delegation(delegation_id), &record);
+        Self::write_delegation_v2(&env, &record);
 
         Self::store_snapshot(&env, delegation_id, &record);
 
@@ -1150,10 +1204,7 @@ impl DelegationRegistry {
             return Err(DelegationError::NotAuthorized);
         }
 
-        let mut record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let mut record = Self::load_delegation_by_id(&env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         if record.status != DelegationStatus::Paused {
@@ -1171,6 +1222,7 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Delegation(delegation_id), &record);
+        Self::write_delegation_v2(&env, &record);
 
         Self::store_snapshot(&env, delegation_id, &record);
 
@@ -1216,11 +1268,7 @@ impl DelegationRegistry {
         let mut i = start;
         while i < end {
             let id = user_dels.get(i).unwrap();
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
-            {
+            if let Some(record) = Self::load_delegation_by_id(&env, id) {
                 items.push_back(record);
             }
             i += 1;
@@ -1283,11 +1331,7 @@ impl DelegationRegistry {
         let mut expired = Vec::new(&env);
         let mut id = 1u64;
         while id < next_id {
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
-            {
+            if let Some(record) = Self::load_delegation_by_id(&env, id) {
                 let is_expired = record.status == DelegationStatus::Expired
                     || (record.status != DelegationStatus::Revoked
                         && current_ledger >= record.expires_at_ledger);
@@ -1325,10 +1369,7 @@ impl DelegationRegistry {
         delegation_id: u64,
         target_version: u32,
     ) -> Result<bool, DelegationError> {
-        let mut record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let mut record = Self::load_delegation_by_id(&env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         record.owner.require_auth();
@@ -1380,6 +1421,7 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Delegation(delegation_id), &record);
+        Self::write_delegation_v2(&env, &record);
 
         Self::store_snapshot(&env, delegation_id, &record);
 
@@ -1408,15 +1450,44 @@ impl DelegationRegistry {
         env: Env,
         delegation_id: u64,
     ) -> Result<DelegationRecord, DelegationError> {
-        let record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let record = Self::load_delegation_by_id(&env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         Self::bump_delegation(&env, delegation_id, &record.owner);
 
         Ok(record)
+    }
+
+    /// Resolves a delegation by id, lazily migrating legacy V1 entries.
+    ///
+    /// The V1 layout is keyed by owner rather than id, so when the canonical
+    /// record is absent the owner index is consulted to locate the legacy
+    /// entry before falling back to a full scan of the id range.
+    fn load_delegation_by_id(env: &Env, delegation_id: u64) -> Option<DelegationRecord> {
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<_, DelegationRecord>(&DataKey::Delegation(delegation_id))
+        {
+            return Some(record);
+        }
+
+        let next_id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(1u64);
+        let mut id = 1u64;
+        while id < next_id {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
+            {
+                if record.id == delegation_id {
+                    return Some(record);
+                }
+            }
+            id += 1;
+        }
+
+        None
     }
 
     /// Returns the current version for a delegation.
@@ -1455,11 +1526,7 @@ impl DelegationRegistry {
 
         let mut records = Vec::new(&env);
         for id in user_dels.iter() {
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
-            {
+            if let Some(record) = Self::load_delegation_by_id(&env, id) {
                 Self::bump_delegation(&env, id, &record.owner);
                 records.push_back(record);
             }
@@ -1480,11 +1547,7 @@ impl DelegationRegistry {
 
         let mut records = Vec::new(&env);
         for id in 1..next_id {
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
-            {
+            if let Some(record) = Self::load_delegation_by_id(&env, id) {
                 if record.agent_id == agent_id {
                     Self::bump_delegation(&env, id, &record.owner);
                     records.push_back(record);
@@ -1518,11 +1581,7 @@ impl DelegationRegistry {
 
     /// Returns whether the given agent is authorized for a delegation.
     pub fn is_authorized(env: Env, delegation_id: u64, agent_id: BytesN<32>) -> bool {
-        let record: DelegationRecord = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
-        {
+        let record: DelegationRecord = match Self::load_delegation_by_id(&env, delegation_id) {
             Some(r) => r,
             None => return false,
         };
@@ -1567,11 +1626,7 @@ impl DelegationRegistry {
             return false;
         }
 
-        let record: DelegationRecord = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
-        {
+        let record: DelegationRecord = match Self::load_delegation_by_id(&env, delegation_id) {
             Some(r) => r,
             None => return false,
         };
@@ -1604,10 +1659,7 @@ impl DelegationRegistry {
         env: Env,
         delegation_id: u64,
     ) -> Result<PermissionBitmask, DelegationError> {
-        let record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let record = Self::load_delegation_by_id(&env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         Ok(record.permissions)
@@ -1627,10 +1679,7 @@ impl DelegationRegistry {
             return Err(DelegationError::InvalidPermissionFlag);
         }
 
-        let record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let record = Self::load_delegation_by_id(&env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         Ok(record.permissions.has_flag(flag))
@@ -1683,10 +1732,7 @@ impl DelegationRegistry {
         delegation_id: u64,
         mutate: impl FnOnce(PermissionBitmask) -> PermissionBitmask,
     ) -> Result<bool, DelegationError> {
-        let mut record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let mut record = Self::load_delegation_by_id(env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         record.owner.require_auth();
@@ -1703,6 +1749,7 @@ impl DelegationRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Delegation(delegation_id), &record);
+        Self::write_delegation_v2(env, &record);
 
         Self::store_snapshot(env, delegation_id, &record);
 
@@ -1943,11 +1990,7 @@ impl DelegationRegistry {
 
         let mut expired = Vec::new(&env);
         for id in user_dels.iter() {
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<_, DelegationRecord>(&DataKey::Delegation(id))
-            {
+            if let Some(record) = Self::load_delegation_by_id(&env, id) {
                 let is_expired = record.status == DelegationStatus::Expired
                     || (record.status != DelegationStatus::Revoked
                         && current_ledger >= record.expires_at_ledger);
@@ -2030,10 +2073,7 @@ impl DelegationRegistry {
     /// Authorization checks should verify that the presented nonce matches
     /// the current nonce stored on-chain.
     pub fn get_delegation_nonce(env: Env, delegation_id: u64) -> Result<u64, DelegationError> {
-        let record: DelegationRecord = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
+        let record = Self::load_delegation_by_id(&env, delegation_id)
             .ok_or(DelegationError::NotFound)?;
 
         Ok(record.nonce)
@@ -2049,11 +2089,7 @@ impl DelegationRegistry {
         agent_id: BytesN<32>,
         nonce: u64,
     ) -> bool {
-        let record: DelegationRecord = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
-        {
+        let record: DelegationRecord = match Self::load_delegation_by_id(&env, delegation_id) {
             Some(r) => r,
             None => return false,
         };
@@ -2098,11 +2134,7 @@ impl DelegationRegistry {
             return false;
         }
 
-        let record: DelegationRecord = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::Delegation(delegation_id))
-        {
+        let record: DelegationRecord = match Self::load_delegation_by_id(&env, delegation_id) {
             Some(r) => r,
             None => return false,
         };
@@ -2713,6 +2745,79 @@ impl DelegationRegistry {
             PERSISTENT_BUMP_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+
+    /// Persists `record` under the V2 schema key and stamps the schema version.
+    fn write_delegation_v2(env: &Env, record: &DelegationRecord) {
+        let key = DataKey::DelegationV2(record.owner.clone(), record.label.clone());
+        env.storage().persistent().set(&key, record);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let version_key = DataKey::SchemaVersion;
+        env.storage()
+            .persistent()
+            .set(&version_key, &DELEGATION_SCHEMA_VERSION);
+        env.storage().persistent().extend_ttl(
+            &version_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
+    /// Lazily migrates a delegation record to the V2 schema (issue #574).
+    ///
+    /// Reads the V2 entry first; when it is missing, falls back to the legacy
+    /// V1 entry keyed by owner, converts it to the current schema, writes it
+    /// back under the V2 key, removes the V1 entry and returns the migrated
+    /// record. Returns `None` when neither layout holds a record, so callers
+    /// can surface `NotFound` without panicking.
+    fn load_delegation(env: &Env, delegation_id: u64, owner: &Address) -> Option<DelegationRecord> {
+        // Fast path: the canonical id-keyed record is already current.
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<_, DelegationRecord>(&DataKey::Delegation(delegation_id))
+        {
+            return Some(record);
+        }
+
+        // V2 schema keyed by owner + label.
+        let v1_key = DataKey::DelegationV1(owner.clone());
+        let v1: Option<DelegationRecordV1> = env.storage().persistent().get(&v1_key);
+        let v1 = v1?;
+
+        if v1.id != delegation_id {
+            return None;
+        }
+
+        let record = v1.into_v2();
+
+        // Write the migrated record under both the canonical and V2 keys so
+        // subsequent reads take the fast path, then drop the legacy entry.
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(delegation_id), &record);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Delegation(delegation_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        Self::write_delegation_v2(env, &record);
+        env.storage().persistent().remove(&v1_key);
+
+        Some(record)
+    }
+
+    /// Returns the current delegation storage schema version.
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(1u32)
     }
 
     fn increment_version(env: &Env, delegation_id: u64) -> u32 {

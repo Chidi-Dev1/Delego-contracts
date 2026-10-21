@@ -35,6 +35,7 @@ use crate::{
     MAX_METADATA_LEN, MAX_NAME_LEN,
     CommissionTier, MerchantVolumeRecord,
     ReputationCursor, RankedMerchantPage,
+    TreasurySplitConfig, RESERVE_LOCK_LEDGERS,
     AdminAcceptedEvent, AdminProposedEvent, CategoryChange, CategoryEntry, DataKey,
     MarketplaceContract, MarketplaceContractClient, MarketplaceError, Merchant,
     MerchantCategoryChangedEvent, MerchantCursor, MerchantOperationalView,
@@ -1495,6 +1496,136 @@ fn test_volume_tier_does_not_downgrade_on_manual_commission() {
 }
 
 #[test]
+fn test_merchant_operational_view_registered_merchant() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Operational Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    let view = f.client.get_merchant_operational_view(&id);
+    assert_eq!(view.status, MerchantStatus::Registered);
+    assert!(!view.verified);
+    assert_eq!(view.effective_fee_bps, f.client.get_commission(&id));
+    assert_eq!(view.bond_balance, 0);
+    assert_eq!(view.dispute_count, 0);
+}
+
+#[test]
+fn test_merchant_operational_view_verified_merchant() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let verifier = Address::generate(&f.env);
+
+    f.client.add_verifier(
+        &f.admin,
+        &Verifier {
+            address: verifier.clone(),
+            label: symbol_short!("kyc"),
+            registered_at: 1,
+        },
+    );
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Verified Operational Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+    f.client.verify_merchant(&id, &verifier);
+
+    let view = f.client.get_merchant_operational_view(&id);
+    assert_eq!(view.status, MerchantStatus::Verified);
+    assert!(view.verified);
+    assert_eq!(view.effective_fee_bps, f.client.get_commission(&id));
+    assert_eq!(view.bond_balance, 0);
+    assert_eq!(view.dispute_count, 0);
+}
+
+#[test]
+fn test_merchant_operational_view_unverified_merchant() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let verifier = Address::generate(&f.env);
+
+    f.client.add_verifier(
+        &f.admin,
+        &Verifier {
+            address: verifier.clone(),
+            label: symbol_short!("kyc"),
+            registered_at: 1,
+        },
+    );
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Unverified Operational Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 2,
+        },
+    );
+    // Only one of two required verifications.
+    f.client.verify_merchant(&id, &verifier);
+
+    let view = f.client.get_merchant_operational_view(&id);
+    assert_eq!(view.status, MerchantStatus::Registered);
+    assert!(!view.verified);
+}
+
+#[test]
+fn test_merchant_operational_view_suspended_merchant() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Suspended Operational Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+    f.client.suspend_merchant(&f.admin, &id);
+
+    let view = f.client.get_merchant_operational_view(&id);
+    assert_eq!(view.status, MerchantStatus::Suspended);
+    assert!(!view.verified);
+}
+
+#[test]
+fn test_merchant_operational_view_unregistered_merchant_not_found() {
+    let f = TestFixture::setup();
+
+    let err = f.client.try_get_merchant_operational_view(&999);
+    assert_eq!(err.unwrap_err().unwrap(), MarketplaceError::MerchantNotFound);
+}
+
+#[test]
 fn test_merchant_stats_lifecycle() {
     let f = TestFixture::setup();
     let owner1 = Address::generate(&f.env);
@@ -1967,6 +2098,237 @@ fn test_status_filtered_discovery() {
     assert_eq!(verified.items.len(), 0);
     assert_eq!(verified.total, 0);
     assert_eq!(verified.next_offset, None);
+}
+
+#[test]
+fn test_treasury_split_routes_fees_with_zero_residual() {
+    let f = TestFixture::setup();
+    let dao = Address::generate(&f.env);
+    let arbiter = Address::generate(&f.env);
+    let insurance = Address::generate(&f.env);
+
+    let config = TreasurySplitConfig {
+        dao_treasury: dao.clone(),
+        dao_bps: 7_000,
+        arbiter_pool: arbiter.clone(),
+        arbiter_bps: 2_000,
+        insurance_pool: insurance.clone(),
+        insurance_bps: 1_000,
+    };
+    f.client.set_treasury_split_config(&f.admin, &config);
+
+    let (token_id, token_client) = deploy_token(&f.env, &f.admin);
+    f.client.set_fee_token(&f.admin, &token_id);
+
+    let fee_amount: i128 = 10_000;
+    token_client.mint(&f._contract_id, &fee_amount);
+
+    f.client.route_fee_disbursements(&fee_amount);
+
+    assert_eq!(token_client.balance(&dao), 7_000);
+    assert_eq!(token_client.balance(&arbiter), 2_000);
+    assert_eq!(token_client.balance(&insurance), 1_000);
+    // Zero token leakage: contract retains nothing.
+    assert_eq!(token_client.balance(&f._contract_id), 0);
+}
+
+#[test]
+fn test_treasury_split_remainder_routed_to_insurance_pool() {
+    let f = TestFixture::setup();
+    let dao = Address::generate(&f.env);
+    let arbiter = Address::generate(&f.env);
+    let insurance = Address::generate(&f.env);
+
+    let config = TreasurySplitConfig {
+        dao_treasury: dao.clone(),
+        dao_bps: 7_000,
+        arbiter_pool: arbiter.clone(),
+        arbiter_bps: 2_000,
+        insurance_pool: insurance.clone(),
+        insurance_bps: 1_000,
+    };
+    f.client.set_treasury_split_config(&f.admin, &config);
+
+    let (token_id, token_client) = deploy_token(&f.env, &f.admin);
+    f.client.set_fee_token(&f.admin, &token_id);
+
+    // Amount chosen so integer division leaves a remainder.
+    let fee_amount: i128 = 1_001;
+    token_client.mint(&f._contract_id, &fee_amount);
+
+    f.client.route_fee_disbursements(&fee_amount);
+
+    let dao_share = fee_amount * 7_000 / 10_000;
+    let arbiter_share = fee_amount * 2_000 / 10_000;
+    assert_eq!(token_client.balance(&dao), dao_share);
+    assert_eq!(token_client.balance(&arbiter), arbiter_share);
+    // Remainder lands in the insurance pool.
+    assert_eq!(
+        token_client.balance(&insurance),
+        fee_amount - dao_share - arbiter_share
+    );
+    assert_eq!(token_client.balance(&f._contract_id), 0);
+}
+
+#[test]
+fn test_treasury_split_rejects_invalid_bps_sum() {
+    let f = TestFixture::setup();
+    let config = TreasurySplitConfig {
+        dao_treasury: Address::generate(&f.env),
+        dao_bps: 7_000,
+        arbiter_pool: Address::generate(&f.env),
+        arbiter_bps: 2_000,
+        insurance_pool: Address::generate(&f.env),
+        insurance_bps: 500,
+    };
+    let err = f.client.try_set_treasury_split_config(&f.admin, &config);
+    assert_eq!(
+        err.unwrap_err().unwrap(),
+        MarketplaceError::InvalidTreasurySplit
+    );
+}
+
+#[test]
+fn test_liquidation_reserve_locked_for_high_value_order() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let buyer = Address::generate(&f.env);
+
+    let merchant_id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "High Value Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    let order_id: u64 = 1;
+    let order_value: i128 = 20_000;
+    f.env.ledger().set_sequence_number(1_000);
+    f.client.lock_liquidation_reserve(
+        &merchant_id,
+        &order_id,
+        &order_value,
+        &buyer,
+    );
+
+    let reserve = f
+        .client
+        .get_liquidation_reserve(&order_id)
+        .expect("reserve must be locked");
+    assert_eq!(reserve.merchant, owner);
+    assert_eq!(reserve.order_id, order_id);
+    assert_eq!(reserve.reserve_amount, order_value / 10);
+    assert_eq!(reserve.unlock_ledger, 1_000 + RESERVE_LOCK_LEDGERS);
+}
+
+#[test]
+fn test_liquidation_reserve_early_withdrawal_fails() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let buyer = Address::generate(&f.env);
+
+    let merchant_id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Early Withdraw Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    let order_id: u64 = 2;
+    f.env.ledger().set_sequence_number(500);
+    f.client
+        .lock_liquidation_reserve(&merchant_id, &order_id, &20_000, &buyer);
+
+    f.env
+        .ledger()
+        .set_sequence_number(500 + RESERVE_LOCK_LEDGERS - 1);
+    let err = f.client.try_withdraw_liquidation_reserve(&order_id, &owner);
+    assert_eq!(
+        err.unwrap_err().unwrap(),
+        MarketplaceError::ReserveNotMature
+    );
+}
+
+#[test]
+fn test_liquidation_reserve_withdrawal_after_maturity() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let buyer = Address::generate(&f.env);
+
+    let merchant_id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Mature Withdraw Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    let order_id: u64 = 3;
+    f.env.ledger().set_sequence_number(100);
+    f.client
+        .lock_liquidation_reserve(&merchant_id, &order_id, &20_000, &buyer);
+
+    f.env
+        .ledger()
+        .set_sequence_number(100 + RESERVE_LOCK_LEDGERS);
+    f.client.withdraw_liquidation_reserve(&order_id, &owner);
+    assert!(f.client.get_liquidation_reserve(&order_id).is_none());
+}
+
+#[test]
+fn test_liquidation_reserve_can_be_liquidated_by_arbiter() {
+    let f = TestFixture::setup();
+    let owner = Address::generate(&f.env);
+    let buyer = Address::generate(&f.env);
+    let arbiter = Address::generate(&f.env);
+
+    f.client.set_arbiter(&f.admin, &arbiter);
+
+    let merchant_id = f.client.register_merchant(
+        &owner,
+        &RegisterParams {
+            name: String::from_str(&f.env, "Liquidated Store"),
+            description: String::from_str(&f.env, "Desc"),
+            category: symbol_short!("goods"),
+            image_url: String::from_str(&f.env, "img.png"),
+            metadata: None,
+            metadata_uri: None,
+            required_verifications: 1,
+        },
+    );
+
+    let order_id: u64 = 4;
+    f.env.ledger().set_sequence_number(200);
+    f.client
+        .lock_liquidation_reserve(&merchant_id, &order_id, &20_000, &buyer);
+
+    let (token_id, token_client) = deploy_token(&f.env, &f.admin);
+    f.client.set_reserve_token(&f.admin, &token_id);
+    token_client.mint(&f._contract_id, &2_000);
+
+    f.client
+        .liquidate_reserve(&arbiter, &order_id, &buyer);
+
+    assert_eq!(token_client.balance(&buyer), 2_000);
+    assert_eq!(token_client.balance(&f._contract_id), 0);
+    assert!(f.client.get_liquidation_reserve(&order_id).is_none());
 }
 
 #[test]
