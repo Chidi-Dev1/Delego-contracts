@@ -34,3 +34,7 @@ path = "lending_pool.rs"
 [[test]]
 name = "no_std_consistency"
 path = "no_std_consistency.rs"
+
+[[test]]
+name = "gas_benchmark"
+path = "gas_benchmark.rs"
