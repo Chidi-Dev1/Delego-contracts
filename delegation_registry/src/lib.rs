@@ -354,6 +354,16 @@ pub struct AdminTransferredEvent {
 /// Topic 0 symbol for every event emitted by the delegation registry.
 pub const EVENT_TOPIC_CONTRACT: Symbol = symbol_short!("deleg");
 
+const ZERO_ACCOUNT_STRKEY: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+const ZERO_CONTRACT_STRKEY: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+/// Returns `true` for the all-zero account or contract address, which no
+/// one can sign for. Mirrors the guard in the escrow contract.
+fn is_zero_address(env: &Env, address: &Address) -> bool {
+    address == &Address::from_str(env, ZERO_ACCOUNT_STRKEY)
+        || address == &Address::from_str(env, ZERO_CONTRACT_STRKEY)
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
 /// Storage keys used by the delegation registry.
@@ -399,7 +409,7 @@ pub enum DataKey {
 /// | `ReputationError`   | 3_000..=3_999   |
 /// | `DelegationError`   | 4_000..=4_999   |
 /// | `MarketplaceError`  | 5_000..=5_999   |
-/// `DelegationError` currently occupies codes 4_001..=4_016.
+/// `DelegationError` currently occupies codes 4_001..=4_020.
 /// New variants must use the next unused code within 4_000..=4_999.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -443,6 +453,8 @@ pub enum DelegationError {
     SubAccountNotActive = 4018,
     /// The delegation does not match the sub-account.
     DelegationMismatch = 4019,
+    /// A supplied parameter is invalid, e.g. a zero `owner` or `permissions_contract` address.
+    InvalidParam = 4020,
 }
 
 /// The delegation registry contract.
@@ -628,6 +640,12 @@ impl DelegationRegistry {
         permissions: PermissionBitmask,
     ) -> Result<u64, DelegationError> {
         owner.require_auth();
+
+        // A zero owner or permissions contract would pin the delegation to an
+        // address nobody can sign for or invoke.
+        if is_zero_address(&env, &owner) || is_zero_address(&env, &permissions_contract) {
+            return Err(DelegationError::InvalidParam);
+        }
 
         if ttl_ledgers == 0 {
             return Err(DelegationError::InvalidTtl);
@@ -1862,11 +1880,7 @@ impl DelegationRegistry {
 
         // Get or initialize the next sub-account id for this owner
         let next_id_key = DataKey::NextSubAccountId(owner.clone());
-        let id = env
-            .storage()
-            .persistent()
-            .get(&next_id_key)
-            .unwrap_or(1u64);
+        let id = env.storage().persistent().get(&next_id_key).unwrap_or(1u64);
         let next_id = id.checked_add(1).ok_or(DelegationError::IdExhausted)?;
         env.storage().persistent().set(&next_id_key, &next_id);
         env.storage().persistent().extend_ttl(
@@ -2087,10 +2101,7 @@ impl DelegationRegistry {
     }
 
     /// Returns all sub-accounts associated with a specific delegation.
-    pub fn get_sub_accounts_by_delegation(
-        env: Env,
-        delegation_id: u64,
-    ) -> Vec<SubAccountRecord> {
+    pub fn get_sub_accounts_by_delegation(env: Env, delegation_id: u64) -> Vec<SubAccountRecord> {
         // First verify the delegation exists
         let delegation: DelegationRecord = match env
             .storage()
