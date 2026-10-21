@@ -2799,6 +2799,62 @@ fn test_v1_record_read_migrates_to_v2_without_panic() {
     assert_eq!(
         client.get_circuit_breaker_status(&other_owner),
         AccountCircuitBreakerStatus::Normal
+#[test]
+fn test_ephemeral_session_bounds_exact_boundary_rejection() {
+    let (env, client, _, _, _, _) = setup();
+
+    let bounds = EphemeralSessionBounds {
+        start_ledger: 100,
+        expiry_ledger: 200,
+        max_spending_limit: 50_000,
+    };
+
+    // 1. Before start_ledger (current_ledger = 99) -> rejected with NotActive
+    env.ledger().set_sequence_number(99);
+    assert_eq!(
+        client.try_validate_session(&bounds),
+        Err(Ok(DelegationError::NotActive))
+    );
+
+    // 2. Exact start_ledger (current_ledger = 100) -> valid
+    env.ledger().set_sequence_number(100);
+    assert_eq!(client.validate_session(&bounds), true);
+
+    // 3. Within range (current_ledger = 150) -> valid
+    env.ledger().set_sequence_number(150);
+    assert_eq!(client.validate_session(&bounds), true);
+
+    // 4. Exact expiry_ledger (current_ledger = 200) -> valid
+    env.ledger().set_sequence_number(200);
+    assert_eq!(client.validate_session(&bounds), true);
+
+    // 5. Expiry boundary + 1 (current_ledger = 201) -> rejected with SessionExpired, emits event
+    env.ledger().set_sequence_number(201);
+    env.ledger().set_timestamp(1_700_000_000);
+    assert_eq!(
+        client.try_validate_session(&bounds),
+        Err(Ok(DelegationError::SessionExpired))
+    );
+
+    // Check emitted SessionExpiredEvent
+    let events = env.events().all();
+    let last_event = events.last().expect("SessionExpiredEvent must be emitted");
+    assert_eq!(
+        last_event.0,
+        client.address
+    );
+    assert_eq!(
+        last_event.1,
+        (EVENT_TOPIC_CONTRACT, symbol_short!("sess_exp")).into_val(&env)
+    );
+    let event_payload: SessionExpiredEvent = last_event.2.try_into_val(&env).unwrap();
+    assert_eq!(
+        event_payload,
+        SessionExpiredEvent {
+            expiry_ledger: 200,
+            current_ledger: 201,
+            timestamp: 1_700_000_000,
+        }
     );
 }
 
@@ -3004,4 +3060,47 @@ fn test_v1_record_write_upgrades_to_v2_preserving_active_state() {
             .unwrap();
         assert_eq!(schema_version, 2);
     });
+}
+fn test_ephemeral_session_clock_skew_resilience_and_dual_check() {
+    let (env, client, _, _, _, _) = setup();
+
+    let bounds = EphemeralSessionBounds {
+        start_ledger: 100,
+        expiry_ledger: 200,
+        max_spending_limit: 50_000,
+    };
+
+    // Case A: Wall-clock timestamp is far in the future due to NTP skew (e.g. skew says expired),
+    // but ledger sequence is valid (current_ledger = 150 <= 200).
+    // Ledger validation succeeds, ensuring clock skew does NOT falsely reject active session.
+    env.ledger().set_sequence_number(150);
+    env.ledger().set_timestamp(2_000_000_000); // skewed wall-clock
+    let expected_ts_before = 1_500_000_000; // UI thought it expired at 1.5B
+    let (is_valid, is_ts_valid) = client.validate_session_dual(&bounds, &expected_ts_before);
+    assert!(is_valid);
+    assert!(!is_ts_valid); // UI gets warning indicator about clock skew
+
+    // Case B: Wall-clock timestamp is in the past (e.g. clock drift back),
+    // but ledger sequence has passed expiry (current_ledger = 201 > 200).
+    // Ledger validation strictly rejects with SessionExpired and emits SessionExpiredEvent,
+    // ensuring clock skew CANNOT validate expired sessions.
+    env.ledger().set_sequence_number(201);
+    env.ledger().set_timestamp(1_000_000_000);
+    let expected_ts_future = 2_000_000_000;
+    assert_eq!(
+        client.try_validate_session_dual(&bounds, &expected_ts_future),
+        Err(Ok(DelegationError::SessionExpired))
+    );
+
+    let events = env.events().all();
+    let last_event = events.last().expect("SessionExpiredEvent must be emitted");
+    let event_payload: SessionExpiredEvent = last_event.2.try_into_val(&env).unwrap();
+    assert_eq!(
+        event_payload,
+        SessionExpiredEvent {
+            expiry_ledger: 200,
+            current_ledger: 201,
+            timestamp: 1_000_000_000,
+        }
+    );
 }
