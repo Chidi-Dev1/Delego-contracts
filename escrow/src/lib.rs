@@ -55,6 +55,10 @@ use soroban_sdk::{
 };
 use delego_interfaces::LendingPoolClient;
 
+/// Real, opt-in Blend lending positions (issue #490).
+pub mod blend_yield;
+pub use blend_yield::YieldBearingEscrowConfig;
+
 // Formal verification specifications for escrow lifecycle invariants
 pub mod invariants;
 
@@ -3723,6 +3727,7 @@ impl EscrowContract {
         let remaining = record.amount - record.released_amount - record.refunded_amount;
         let refunded_amount = match timeout.fallback_action {
             EscrowStatus::Refunded => {
+                blend_yield::redeem(&env, record.escrow_id);
                 let token_client = soroban_sdk::token::Client::new(&env, &record.token);
                 token_client.transfer(&env.current_contract_address(), &record.buyer, &remaining);
                 record.refunded_amount += remaining;
@@ -3948,6 +3953,7 @@ impl EscrowContract {
                 return Err(EscrowError::QuorumNotReached);
             };
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         if release_to_seller {
             let payout = Self::compute_payout(&env, &record.seller, record.amount)?;
@@ -4381,6 +4387,7 @@ impl EscrowContract {
         {
             let remaining = record.amount - record.released_amount - record.refunded_amount;
             if remaining >= KEEPER_BOUNTY_AMOUNT {
+                blend_yield::redeem(&env, record.escrow_id);
                 let token_client = soroban_sdk::token::Client::new(&env, &record.token);
                 token_client.transfer(
                     &env.current_contract_address(),
@@ -5111,6 +5118,7 @@ impl EscrowContract {
 
         Self::assert_value_conservation_invariant(&record, remaining, 0)?;
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         token_client.transfer(&env.current_contract_address(), &record.seller, &remaining);
 
@@ -5385,6 +5393,7 @@ impl EscrowContract {
             return Err(EscrowError::InsufficientEscrowBalance);
         }
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let payout = Self::compute_payout(&env, result.input_amount)?;
         Self::distribute_fee(&env, &token_client, payout.fee)?;
@@ -5879,6 +5888,56 @@ impl EscrowContract {
         Ok(last_id)
     }
 
+    /// Opt into Blend before funding. Both admin approval and buyer consent are required.
+    /// The recipient is fixed to the buyer or the configured platform treasury.
+    pub fn configure_blend_yield(
+        env: Env,
+        escrow_id: u64,
+        admin: Address,
+        config: YieldBearingEscrowConfig,
+    ) -> Result<(), EscrowError> {
+        admin.require_auth();
+        if !Self::is_admin(env.clone(), admin) {
+            return Err(EscrowError::Unauthorized);
+        }
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        record.buyer.require_auth();
+        if record.status != EscrowStatus::Created
+            || env
+                .storage()
+                .persistent()
+                .has(&DataKey::EscrowYieldConfig(escrow_id))
+        {
+            return Err(EscrowError::InvalidYieldConfig);
+        }
+        if config.yield_recipient != record.buyer
+            && config.yield_recipient != Self::get_fee_config(env.clone())?.treasury
+        {
+            return Err(EscrowError::InvalidYieldConfig);
+        }
+        blend_yield::configure(&env, escrow_id, config);
+        Ok(())
+    }
+
+    /// Read the immutable Blend configuration and realized interest.
+    pub fn get_blend_yield_config(env: Env, escrow_id: u64) -> Option<YieldBearingEscrowConfig> {
+        blend_yield::config(&env, escrow_id)
+    }
+
+    /// Full settlement alias; preserves all existing release authorization and fee rules.
+    pub fn release_funds(env: Env, escrow_id: u64, caller: Address) -> Result<bool, EscrowError> {
+        let record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(EscrowError::NotFound)?;
+        Self::release(env, escrow_id, caller, record.seller)
+    }
+
     /// Fund an existing escrow that is in `Created` status.
     pub fn fund(env: Env, escrow_id: u64, buyer: Address) -> Result<bool, EscrowError> {
         buyer.require_auth();
@@ -5915,6 +5974,8 @@ impl EscrowContract {
             balance_before,
             record.amount,
         )?;
+
+        blend_yield::fund(&env, escrow_id, &record.token, net_received);
 
         record.amount = net_received;
         record.status = EscrowStatus::Funded;
@@ -6865,6 +6926,7 @@ impl EscrowContract {
         // escrowed principal.
         Self::assert_value_conservation_invariant(&record, release_amount, 0)?;
 
+        blend_yield::redeem(env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(env, &record.token);
 
         let payout = Self::compute_payout(env, &record.seller, release_amount)?;
@@ -7356,6 +7418,7 @@ impl EscrowContract {
         // the escrowed principal.
         Self::assert_value_conservation_invariant(&record, 0, refund_amount)?;
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         token_client.transfer(
             &env.current_contract_address(),
@@ -7844,6 +7907,7 @@ impl EscrowContract {
             return Err(EscrowError::ZeroAmount);
         }
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let payout = Self::compute_payout(&env, remaining)?;
         Self::distribute_fee(&env, &token_client, payout.fee)?;
@@ -8316,6 +8380,7 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &record);
 
         // Emit event: initial ruling issued, appeal window open
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let payout = if release_to_seller {
             Some(Self::compute_payout(&env, record.amount)?)
@@ -8408,6 +8473,7 @@ impl EscrowContract {
             .checked_add(award.mediator_fee)
             .ok_or(EscrowError::InvalidDisputeAward)?;
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let contract_address = env.current_contract_address();
         if award.buyer_amount > 0 {
@@ -8598,6 +8664,7 @@ impl EscrowContract {
         let appeal_succeeded = final_winner != appeal.initial_winner;
 
         // Handle bond slashing logic
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let contract_address = env.current_contract_address();
 
@@ -8698,6 +8765,7 @@ impl EscrowContract {
             .ok_or(EscrowError::NotFound)?;
 
         // Release to initial winner (ruling stands uncontested)
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let payout = Self::compute_payout(&env, record.amount)?;
 
@@ -8821,6 +8889,7 @@ impl EscrowContract {
             return Err(EscrowError::ZeroAmount);
         }
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let payout = Self::compute_payout(&env, remaining)?;
         Self::distribute_fee(&env, &token_client, payout.fee)?;
@@ -8994,6 +9063,7 @@ impl EscrowContract {
             return Err(EscrowError::ZeroAmount);
         }
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let payout = Self::compute_payout(&env, remaining)?;
         Self::distribute_fee(&env, &token_client, payout.fee)?;
@@ -9040,6 +9110,7 @@ impl EscrowContract {
             resolution.refund_amount,
         )?;
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         let contract_address = env.current_contract_address();
         if resolution.refund_amount > 0 {
@@ -9292,6 +9363,9 @@ impl EscrowContract {
         admin.require_auth();
         if !Self::is_admin(env.clone(), admin.clone()) {
             return Err(EscrowError::Unauthorized);
+        }
+        if blend_yield::config(&env, escrow_id).is_some() {
+            return Err(EscrowError::InvalidYieldConfig);
         }
         if apr_bps > 10_000 {
             return Err(EscrowError::InvalidYieldConfig);
@@ -10604,6 +10678,7 @@ impl EscrowContract {
         }
         Self::assert_value_conservation_invariant(&record, total, 0)?;
 
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
 
         let mut total_fee: i128 = 0;
@@ -11342,6 +11417,7 @@ impl EscrowContract {
         env.storage().persistent().set(&escrow_key, &record);
 
         // Transfer funds directly to recovery destination
+        blend_yield::redeem(&env, record.escrow_id);
         let token_client = soroban_sdk::token::Client::new(&env, &record.token);
         token_client.transfer(
             &env.current_contract_address(),
