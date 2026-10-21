@@ -27,6 +27,8 @@ mod blinded_review_test;
 mod fraud_report_test;
 #[cfg(test)]
 mod reputation_reader_test;
+mod oracle_proof;
+pub use oracle_proof::{CarrierProof, CarrierProofVerifiedEvent};
 
 /// Half-life of the reputation decay curve, in ledgers (~30 days at 5s/ledger).
 pub const DECAY_HALF_LIFE_LEDGERS: u32 = 518_400;
@@ -562,6 +564,8 @@ pub enum ReputationError {
     /// Fraud report resolution invalid state.
     InvalidReportStatus = 3020,
     UnverifiedOrder = 3012,
+    /// A carrier proof was submitted by an oracle that is not registered.
+    CarrierOracleNotAuthorized = 3013,
 }
 
 #[cfg(test)]
@@ -584,6 +588,7 @@ mod error_code_allocation {
             ReputationError::NoActiveFlag as u32,
             ReputationError::NotFlagReporter as u32,
             ReputationError::UnverifiedOrder as u32,
+            ReputationError::CarrierOracleNotAuthorized as u32,
         ];
         for code in codes {
             assert!(
@@ -863,6 +868,8 @@ pub enum DataKey {
     /// every later score recomputation keeps subtracting it instead of
     /// washing the slash out with the next recorded transaction.
     FraudPenalty(Address),
+    /// Ed25519 public key registered for a carrier oracle address.
+    CarrierOracle(Address),
 }
 
 /// Maximum basis points value (100.00%), used both for ratings/scores and
@@ -1092,6 +1099,40 @@ impl ReputationContract {
             name: symbol_short!("reput"),
             semver: Symbol::new(&env, env!("CARGO_PKG_VERSION")),
         }
+    }
+
+    /// Register or rotate an authorized carrier oracle's Ed25519 public key.
+    pub fn set_carrier_oracle(
+        env: Env,
+        admin: Address,
+        carrier_oracle: Address,
+        public_key: BytesN<32>,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+        oracle_proof::set_carrier_oracle(&env, &carrier_oracle, &public_key);
+        Ok(())
+    }
+
+    /// Remove a carrier oracle from the authorized verifier registry.
+    pub fn remove_carrier_oracle(
+        env: Env,
+        admin: Address,
+        carrier_oracle: Address,
+    ) -> Result<(), ReputationError> {
+        admin.require_auth();
+        Self::require_caller_is_admin(&env, &admin)?;
+        oracle_proof::remove_carrier_oracle(&env, &carrier_oracle);
+        Ok(())
+    }
+
+    /// Verify a courier-signed delivery/loss proof against the authorized
+    /// carrier oracle registry.
+    pub fn verify_carrier_proof(
+        env: Env,
+        proof: CarrierProof,
+    ) -> Result<(), ReputationError> {
+        oracle_proof::verify_carrier_proof(&env, &proof)
     }
 
     // --- Core Recording ---
