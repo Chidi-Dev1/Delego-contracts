@@ -1236,6 +1236,37 @@ pub struct ReleasePayout {
     pub treasury: Address,
 }
 
+/// Tier-based fee discount for staked merchants (issue #542).
+///
+/// `tier` identifies the merchant's reputation tier (1 = Bronze, 2 = Silver,
+/// 3 = Gold, 4 = Platinum).  `discount_bps` is the percentage reduction
+/// applied to the platform fee in basis points (e.g. 1000 = 10% off the fee).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TierFeeDiscount {
+    /// 1 = Bronze, 2 = Silver, 3 = Gold, 4 = Platinum.
+    pub tier: u32,
+    /// Discount on the platform fee in basis points (e.g. 1000 = 10%).
+    pub discount_bps: u32,
+}
+
+/// Emitted when a fee rebate is applied to a release because the seller is a
+/// staked merchant with a reputation tier discount (issue #542).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FeeRebateAppliedEvent {
+    /// Escrow that was settled.
+    pub escrow_id: u64,
+    /// Merchant (seller) who received the rebate.
+    pub seller: Address,
+    /// Reputation tier that qualified the rebate.
+    pub tier: u32,
+    /// Basis points rebated off the platform fee.
+    pub discount_bps: u32,
+    /// Token amount rebated back to the seller (extra net payout).
+    pub rebate_amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowAmountLimits {
@@ -6864,6 +6895,10 @@ impl EscrowContract {
     /// The platform fee (per `FeeConfig` or the multi-treasury
     /// `FeeDistribution`) is deducted from `release_amount` and transferred to
     /// the treasury(ies); the seller receives the remainder (issue #27).
+    /// When a marketplace contract is configured, the seller's reputation tier
+    /// is queried and the platform fee is discounted accordingly — the treasury
+    /// receives only `base_fee - rebate` and the seller receives the difference
+    /// (issue #542).
     /// `released_amount` tracks the full escrow-amount released, not the net
     /// seller payout.
     ///
@@ -6934,7 +6969,7 @@ impl EscrowContract {
         token_client.transfer(
             &env.current_contract_address(),
             &record.seller,
-            &payout.seller_net,
+            &seller_net,
         );
 
         record.released_amount += total_drawn;

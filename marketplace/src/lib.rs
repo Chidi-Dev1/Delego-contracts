@@ -841,6 +841,25 @@ pub struct ExternalReputationScore {
     pub last_updated: u64,
 }
 
+/// Tier-to-fee-discount mapping for staked merchants.
+///
+/// `tier` is derived from a merchant's reputation score:
+/// - 1 (Bronze):   score 0–249
+/// - 2 (Silver):   score 250–499
+/// - 3 (Gold):     score 500–749
+/// - 4 (Platinum): score ≥ 750
+///
+/// `discount_bps` is the percentage reduction applied to the platform fee,
+/// expressed in basis points (e.g. 1000 = 10% discount).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TierFeeDiscount {
+    /// 1 = Bronze, 2 = Silver, 3 = Gold, 4 = Platinum
+    pub tier: u32,
+    /// Discount on the platform fee, in basis points (e.g. 1000 = 10%).
+    pub discount_bps: u32,
+}
+
 const MAX_COMMISSION_BPS: u32 = 10_000;
 const MAX_REQUIRED_VERIFICATIONS: u32 = 50;
 const DEFAULT_METADATA_COOLDOWN_SECS: u64 = 86_400; // 24 hours
