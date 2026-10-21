@@ -1,4 +1,13 @@
 use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::token::{Token, TokenType};
+use soroban_sdk::types::ContractData;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+put enum AccountCircuitBreakerStatus {
+    Normal,
+    Frozen,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,4 +111,13 @@ impl DelegationState {
         self.allowances.set(idx, record);
         Ok(()
     }
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountCircuitBreaker {
+    pub delegator: Address,
+    pub status: AccountCircuitBreakerStatus,
+    pub frozen_epoch: u32,
+    pub frozen_at: u32,
 }

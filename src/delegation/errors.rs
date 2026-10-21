@@ -23,4 +23,15 @@ pub enum PermissionError {
 
     #[msg("Delegation has expired")]
     DelegationExpired,
+    #[msg("Account is frozen by circuit breaker")]
+    AccountFrozen,
+
+    #[msg("Account is not frozen")]
+    AccountNotFrozen,
+
+    #[msg("Multi-factor confirmation required")]
+    MultiFactorConfirmationRequired,
+
+    #[msg("Master key confirmation required")]
+    MasterKeyConfirmationRequired,
 }
