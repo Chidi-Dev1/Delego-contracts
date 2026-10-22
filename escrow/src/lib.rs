@@ -91,6 +91,10 @@ pub enum EscrowStatus {
     Cancelled,
     /// Initial ruling issued in two-tiered dispute — 48-hour appeal window open (issue #354).
     InitialRuling,
+    /// Escrow was cancelled by mutual agreement of buyer and merchant before
+    /// courier pickup (issue #487). Full deposit is returned to buyer with
+    /// zero platform fees.
+    CancelledByMutualConsent,
 }
 
 #[contracttype]
@@ -552,6 +556,39 @@ pub struct EscrowCancelledEvent {
     pub cancelled_by: Address,
     /// Symbolic reason for cancellation.
     pub reason: Symbol,
+}
+
+/// On-chain record of a mutual cancellation agreement (issue #487).
+///
+/// Stored when both buyer and merchant cooperatively cancel a funded
+/// escrow before courier pickup. The full deposit is returned to the
+/// buyer with zero platform fees.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutualCancellation {
+    /// Unique identifier of the cancelled escrow.
+    pub escrow_id: u64,
+    /// Ledger sequence at which the cancellation was executed.
+    pub cancelled_ledger: u32,
+    /// Short symbolic reason supplied by the initiating party.
+    pub reason_code: Symbol,
+}
+
+/// Emitted when an escrow is cancelled by mutual consent of buyer and
+/// merchant (issue #487).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowMutualCancelledEvent {
+    /// Unique identifier of the cancelled escrow.
+    pub escrow_id: u64,
+    /// Buyer's address — recipient of the full refund.
+    pub buyer: Address,
+    /// Merchant's address.
+    pub merchant: Address,
+    /// Full amount returned to the buyer.
+    pub refunded_amount: i128,
+    /// Short symbolic reason for the cancellation.
+    pub reason_code: Symbol,
 }
 
 /// Emitted when a seller accepts a created order (issue #355).
@@ -1847,35 +1884,9 @@ pub enum DataKey {
     /// Minimum release fee floor, in the token's smallest unit, configurable by
     /// the admin (issue #362).
     MinFeeStroops,
-}
-
-// `export = false` suppresses the generated `contractspecv0` entry for this
-// enum only. The Soroban XDR spec caps `ScSpecUdtErrorEnumV0.cases` at 50
-// entries, and this enum carries more variants than that (the codes are frozen
-// and cannot be pruned to fit). Dropping the spec entry keeps the crate
-// compiling and leaves the runtime ABI untouched: every variant still converts
-// to and from `soroban_sdk::Error` through the `TryFrom`/`From` impls generated
-// below, with the same numeric codes. The registry table in this attribute is
-// the authoritative error catalogue for tooling.
-#[contracterror(export = false)]
-    /// Published delivery Merkle root for a UTC epoch day.
-    MerkleRoot(u64),
-}
-
-    /// Published delivery Merkle root for a UTC epoch day.
-    MerkleRoot(u64),
-    /// Registered line items of a multi-item escrow (issue #363).
-    SubOrderItems(u64),
-    /// Persisted resolution record for a single line item (issue #363).
-    SubItemResolution(u64, Symbol),
-}
-
-    /// Published delivery Merkle root for a UTC epoch day.
-    MerkleRoot(u64),
-    /// Multi-oracle consensus configuration for an escrow (issue #352).
-    MultiOracleConfig(u64),
-    /// Recorded oracle attestations for an escrow (issue #352).
-    EscrowOracleVotes(u64),
+    /// Mutual cancellation record for an escrow cancelled by buyer + merchant
+    /// cooperative agreement before courier pickup (issue #487).
+    MutualCancellation(u64),
 }
 
 // NOTE: `EscrowError` intentionally does not use the `#[contracterror]` derive.
@@ -1883,12 +1894,6 @@ pub enum DataKey {
 // (`VecM<ScSpecUdtErrorEnumCaseV0, 50>`), but this ABI carries more than that.
 // The equivalent conversions are implemented by hand below (without emitting
 // the on-chain spec entry) so every historic code stays representable.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-    /// Daily delivery Merkle tree root for batch delivery verification.
-    MerkleRoot(u64),
-}
-
 // Canonical ABI numbering for `EscrowError`.
 //
 // Error codes are part of the contract ABI. They are frozen for the 0.x
@@ -2276,6 +2281,9 @@ pub enum EscrowError {
     TimelockExtensionPendingApproval = 455,
     /// Requested storage TTL extension is outside the supported bounds.
     InvalidTtlExtension = 450,
+    /// Escrow has already been shipped; mutual cancellation is no longer
+    /// permitted (issue #487).
+    AlreadyShipped = 456,
 }
 
 /// Runs `f` under a re-entrancy lock and returns its result unchanged.
@@ -2435,6 +2443,7 @@ impl_escrow_error_try_from! {
     416 => ExceedsTotalEscrowAmount,
     417 => MerchantCategoryNotAllowed,
     418 => SubItemAlreadyResolved,
+    456 => AlreadyShipped,
 }
 
 impl TryFrom<&soroban_sdk::Error> for EscrowError {
@@ -3023,6 +3032,7 @@ fn check_not_terminal(record: &EscrowRecord) -> Result<(), EscrowError> {
         EscrowStatus::Released => Err(EscrowError::AlreadyReleased),
         EscrowStatus::Refunded => Err(EscrowError::AlreadyRefunded),
         EscrowStatus::Cancelled => Err(EscrowError::AlreadyCancelled),
+        EscrowStatus::CancelledByMutualConsent => Err(EscrowError::AlreadyCancelled),
         _ => Ok(()),
     }
 }
@@ -6298,6 +6308,140 @@ impl EscrowContract {
                 escrow_id,
                 buyer,
                 agreed_at_ledger: env.ledger().sequence(),
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Cancel a funded escrow by mutual consent of buyer and merchant before
+    /// courier pickup (issue #487).
+    ///
+    /// Both the buyer **and** the merchant must authorize this call (Soroban
+    /// calls `require_auth` for both). The full deposited balance is returned
+    /// to the buyer with zero platform fees. The escrow transitions to
+    /// [`EscrowStatus::CancelledByMutualConsent`] and the cancellation record
+    /// is written to persistent storage for audit purposes.
+    ///
+    /// # Preconditions
+    /// * The escrow must exist.
+    /// * The escrow must **not** be in a terminal state (Released, Refunded,
+    ///   Cancelled, or CancelledByMutualConsent).
+    /// * The escrow must **not** be in `Disputed` or `Inspection` status —
+    ///   those paths have dedicated resolution flows.
+    /// * A [`ShipmentProof`] must **not** have been recorded for the escrow;
+    ///   once a courier has picked up the package the order cannot be
+    ///   cooperatively unwound.
+    ///
+    /// # Errors
+    /// * [`EscrowError::NotFound`] — escrow does not exist.
+    /// * [`EscrowError::AlreadyReleased`] — already released to seller.
+    /// * [`EscrowError::AlreadyRefunded`] — already refunded to buyer.
+    /// * [`EscrowError::AlreadyCancelled`] — already cancelled.
+    /// * [`EscrowError::InvalidStatus`] — escrow is Disputed or in Inspection.
+    /// * [`EscrowError::AlreadyShipped`] — a shipment proof has been recorded,
+    ///   meaning the courier has already picked up the package.
+    /// * [`EscrowError::Unauthorized`] — `buyer` or `merchant` do not match
+    ///   the escrow's recorded parties.
+    pub fn cancel_mutual(
+        env: Env,
+        escrow_id: u64,
+        buyer: Address,
+        merchant: Address,
+        reason_code: Symbol,
+    ) -> Result<bool, EscrowError> {
+        // Both parties must sign — Soroban verifies each independently.
+        buyer.require_auth();
+        merchant.require_auth();
+
+        let key = DataKey::Escrow(escrow_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        // Validate caller identities against the escrow record.
+        if buyer != record.buyer {
+            return Err(EscrowError::Unauthorized);
+        }
+        if merchant != record.seller {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        // Reject any terminal state.
+        check_not_terminal(&record)?;
+
+        // Disputed and Inspection statuses have their own resolution paths.
+        if record.status == EscrowStatus::Disputed
+            || record.status == EscrowStatus::InitialRuling
+            || record.status == EscrowStatus::Inspection
+        {
+            return Err(EscrowError::InvalidStatus);
+        }
+
+        // Once a shipment proof exists the courier has the package — no mutual
+        // cancellation is possible.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ShipmentProof(escrow_id))
+        {
+            return Err(EscrowError::AlreadyShipped);
+        }
+
+        // Compute the balance still held in escrow.
+        let remaining = record
+            .amount
+            .checked_sub(record.released_amount)
+            .and_then(|v| v.checked_sub(record.refunded_amount))
+            .ok_or(EscrowError::MathOverflow)?;
+
+        // Redeem any yield position before transferring (no-op when no yield
+        // config is set).
+        blend_yield::redeem(&env, record.escrow_id);
+
+        // Return the full balance to the buyer — zero platform fees.
+        if remaining > 0 {
+            let token_client = soroban_sdk::token::Client::new(&env, &record.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &record.buyer,
+                &remaining,
+            );
+        }
+
+        // Persist the mutual cancellation record for audit / indexing.
+        let cancellation = MutualCancellation {
+            escrow_id,
+            cancelled_ledger: env.ledger().sequence(),
+            reason_code: reason_code.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MutualCancellation(escrow_id), &cancellation);
+
+        // Transition to terminal state.
+        record.refunded_amount = record
+            .refunded_amount
+            .checked_add(remaining)
+            .ok_or(EscrowError::MathOverflow)?;
+        record.status = EscrowStatus::CancelledByMutualConsent;
+        record.updated_at = env.ledger().timestamp();
+        env.storage().persistent().set(&key, &record);
+
+        env.events().publish(
+            (
+                symbol_short!("escrow"),
+                symbol_short!("mut_cncl"),
+                escrow_id,
+            ),
+            EscrowMutualCancelledEvent {
+                escrow_id,
+                buyer: record.buyer,
+                merchant: record.seller,
+                refunded_amount: remaining,
+                reason_code,
             },
         );
 
